@@ -25,6 +25,27 @@ pub enum KeyAlgorithm {
     P256,
 }
 
+impl KeyAlgorithm {
+    /// 磁盘上用 `serde` 的字符串,线上用单字节 —— 线上的编号一旦定下
+    /// **就不能再改**,所以显式写出来,不跟着枚举顺序走。
+    pub fn to_wire(self) -> u8 {
+        match self {
+            Self::Ed25519 => 0x01,
+            Self::P256 => 0x02,
+        }
+    }
+
+    /// 认不出来就是 `None`。**不许蒙一个默认值** —— 把 P-256 的密钥
+    /// 当成 Ed25519 用,后果是签出来的东西验不过,或者更糟。
+    pub fn from_wire(raw: u8) -> Option<Self> {
+        match raw {
+            0x01 => Some(Self::Ed25519),
+            0x02 => Some(Self::P256),
+            _ => None,
+        }
+    }
+}
+
 /// 口令派生的参数。**随信封一起存**,因为解开它必须重现这些参数。
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct KdfParams {

@@ -4,5 +4,6 @@
 //! 它可以是同一个用户下的另一个 agent —— 它拿得到 socket,但它不该拿得到钥匙。
 
 pub mod peer;
+pub mod wire;
 
 pub use peer::{authorize, peer_identity, self_uid, PeerIdentity};
