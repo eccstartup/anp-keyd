@@ -3,6 +3,7 @@
 //! **agent 手里从来没有私钥字节。** 这个 crate 的全部结构都在服务这一句话。
 
 pub mod crypto;
+pub mod did;
 pub mod error;
 pub mod keystore;
 pub mod sign;

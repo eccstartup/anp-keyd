@@ -101,6 +101,7 @@ dependencies = [
  "ed25519-dalek",
  "hkdf",
  "nix",
+ "percent-encoding",
  "rand 0.8.8",
  "serde",
  "serde_json",

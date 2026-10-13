@@ -76,7 +76,7 @@ mod tests {
     use super::*;
     use crate::crypto::kdf::Argon2Config;
     use crate::keystore::record::{KeyAlgorithm, KeyId};
-    use crate::keystore::wrap::{seal, seed_to_public};
+    use crate::keystore::wrap::{seal, seed_to_public, SealRequest};
     use crate::sign::Signer;
 
     const PASS: &[u8] = b"correct horse battery staple";
@@ -99,20 +99,20 @@ mod tests {
         let seed = LockedBytes::fill(|d| *d = seed_bytes).unwrap();
         let (_, multibase) = seed_to_public(&seed);
         let did = format!("did:wba:example.com:user:alice:{did_suffix}");
-        let wrapped = seal(
-            KeyId {
+        let wrapped = seal(SealRequest {
+            id: KeyId {
                 kid: format!("{did}#key-1"),
                 did,
                 thumbprint: did_suffix.to_string(),
             },
-            KeyAlgorithm::Ed25519,
-            multibase,
-            "alice".into(),
-            PASS,
-            &device(7),
-            &seed,
-            fast(),
-        )
+            algorithm: KeyAlgorithm::Ed25519,
+            public_multibase: multibase,
+            label: "alice".into(),
+            passphrase: PASS,
+            device_secret: &device(7),
+            seed: &seed,
+            argon: fast(),
+        })
         .unwrap();
         (wrapped, seed_bytes, seed)
     }

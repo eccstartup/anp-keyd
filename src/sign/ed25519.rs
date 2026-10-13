@@ -39,6 +39,11 @@ impl LockedSigningKey {
         &self.id.did
     }
 
+    /// 公钥。`VerifyingKey` 是 Copy 的,给出去的是值,不是通往 seed 的路。
+    pub fn verifying_key(&self) -> VerifyingKey {
+        self.verifying
+    }
+
     /// anp 的 `PublicKeyMaterial` 需要一把公钥;它**永远拿不到私钥**。
     pub fn anp_public_key(&self) -> anp::PublicKeyMaterial {
         anp::PublicKeyMaterial::Ed25519(self.verifying)

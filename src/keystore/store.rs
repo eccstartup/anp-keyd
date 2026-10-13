@@ -122,7 +122,7 @@ mod tests {
     use crate::crypto::hygiene::LockedBytes;
     use crate::crypto::kdf::Argon2Config;
     use crate::keystore::record::{KeyAlgorithm, KeyId};
-    use crate::keystore::wrap::{seal, seed_to_public};
+    use crate::keystore::wrap::{seal, seed_to_public, SealRequest};
 
     fn fast() -> Argon2Config {
         Argon2Config { m_cost: 1024, t_cost: 1, p_cost: 1 }
@@ -141,16 +141,16 @@ mod tests {
         let (_, multibase) = seed_to_public(&seed);
         let did = format!("did:wba:example.com:user:alice:{thumbprint}");
         let device = LockedBytes::fill(|d| *d = [0x22; 32]).unwrap();
-        seal(
-            KeyId { did: did.clone(), kid: format!("{did}#key-1"), thumbprint: thumbprint.into() },
-            KeyAlgorithm::Ed25519,
-            multibase,
-            "alice".into(),
-            b"pw",
-            &device,
-            &seed,
-            fast(),
-        )
+        seal(SealRequest {
+            id: KeyId { did: did.clone(), kid: format!("{did}#key-1"), thumbprint: thumbprint.into() },
+            algorithm: KeyAlgorithm::Ed25519,
+            public_multibase: multibase,
+            label: "alice".into(),
+            passphrase: b"pw",
+            device_secret: &device,
+            seed: &seed,
+            argon: fast(),
+        })
         .unwrap()
     }
 

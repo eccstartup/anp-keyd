@@ -45,6 +45,7 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
+percent-encoding = "2"
 
 [features]
 default = []

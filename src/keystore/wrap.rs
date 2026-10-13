@@ -19,17 +19,36 @@ use crate::keystore::record::{
     self, AeadParams, KeyAlgorithm, KeyId, KdfParams, WrappedKey, RECORD_VERSION,
 };
 
+/// 封装一个信封所需的全部输入。
+///
+/// 用结构体而不是八个位置参数:这里面有三个 `&[u8; 32]` 形状的秘密,
+/// 位置传参意味着一个手滑就能把 seed 当口令使,而编译器不会有意见。
+#[derive(Debug)]
+pub struct SealRequest<'a> {
+    pub id: KeyId,
+    pub algorithm: KeyAlgorithm,
+    /// `z6Mk...` multibase
+    pub public_multibase: String,
+    pub label: String,
+    pub passphrase: &'a [u8],
+    pub device_secret: &'a LockedBytes,
+    pub seed: &'a LockedBytes,
+    pub argon: Argon2Config,
+}
+
 /// 把一个 seed 封成信封。
-pub fn seal(
-    id: KeyId,
-    algorithm: KeyAlgorithm,
-    public_multibase: String,
-    label: String,
-    passphrase: &[u8],
-    device_secret: &LockedBytes,
-    seed: &LockedBytes,
-    argon: Argon2Config,
-) -> Result<WrappedKey> {
+pub fn seal(req: SealRequest<'_>) -> Result<WrappedKey> {
+    let SealRequest {
+        id,
+        algorithm,
+        public_multibase,
+        label,
+        passphrase,
+        device_secret,
+        seed,
+        argon,
+    } = req;
+
     let mut salt = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut salt);
     let mut nonce = [0u8; NONCE_LEN];
@@ -148,16 +167,16 @@ mod tests {
         let seed = LockedBytes::fill(|d| *d = [0xAB; 32]).unwrap();
         let (_, multibase) = seed_to_public(&seed);
 
-        let w = seal(
-            id(),
-            KeyAlgorithm::Ed25519,
-            multibase,
-            "alice".into(),
-            b"correct horse battery staple",
-            &device(),
-            &seed,
-            fast(),
-        )
+        let w = seal(SealRequest {
+            id: id(),
+            algorithm: KeyAlgorithm::Ed25519,
+            public_multibase: multibase,
+            label: "alice".into(),
+            passphrase: b"correct horse battery staple",
+            device_secret: &device(),
+            seed: &seed,
+            argon: fast(),
+        })
         .unwrap();
 
         let json = serde_json::to_string(&w).unwrap();
@@ -171,16 +190,16 @@ mod tests {
     fn aad_digest_is_populated_and_self_consistent() {
         let seed = LockedBytes::fill(|d| *d = [1u8; 32]).unwrap();
         let (_, multibase) = seed_to_public(&seed);
-        let w = seal(
-            id(),
-            KeyAlgorithm::Ed25519,
-            multibase,
-            "alice".into(),
-            b"pw",
-            &device(),
-            &seed,
-            fast(),
-        )
+        let w = seal(SealRequest {
+            id: id(),
+            algorithm: KeyAlgorithm::Ed25519,
+            public_multibase: multibase,
+            label: "alice".into(),
+            passphrase: b"pw",
+            device_secret: &device(),
+            seed: &seed,
+            argon: fast(),
+        })
         .unwrap();
 
         assert!(w.verify_aad().is_ok());
