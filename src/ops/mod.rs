@@ -30,6 +30,7 @@ pub mod export;
 pub mod identity;
 pub mod import;
 pub mod keys;
+pub mod probe;
 
 use std::path::Path;
 

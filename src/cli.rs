@@ -70,6 +70,13 @@ pub enum Command {
     List,
     /// 列出当前已解锁的钥匙,以及各自解锁了多久。
     Status,
+    /// 体检:这台机器能不能兑现这个工具给出的承诺。
+    ///
+    /// **不打印任何密钥材料。** 计划里这一条是"dump 锁定区",换做法的理由
+    /// 见 `ops::probe` 的模块头 —— 一句话:跨进程读不到(那正是 mlock 在
+    /// 起作用),而进程内自测会把私钥打到 stdout,那个口子 `export-seed`
+    /// 在默认构建里是根本不存在的。
+    Probe(ProbeArgs),
     /// 解锁一把钥匙。
     Unlock(UnlockArgs),
     /// 上锁。
@@ -101,6 +108,28 @@ pub enum Command {
     /// 环境变量会被同 uid 的进程在 `/proc/<pid>/environ` 里读到。
     #[cfg(feature = "seed-export")]
     ExportSeed(ExportSeedArgs),
+    /// 在 stdin/stdout 上跑 MCP 服务 —— **只有带 `mcp` 特性构建的二进制里有**。
+    ///
+    /// 这是给 **MCP 客户端的配置位**用的:配置里那一行 `command` 就指向这个
+    /// 子命令。它自己不开密钥库,只把四个工具转发给守护进程(见 `mcp` 模块)。
+    #[cfg(feature = "mcp")]
+    Mcp(McpArgs),
+}
+
+#[cfg(feature = "mcp")]
+#[derive(Args, Debug)]
+pub struct McpArgs {
+    /// socket 路径(默认按目录布局推导)。
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct ProbeArgs {
+    /// 顺便报一下这个 DID 的信封:kid、thumbprint、磁盘上那份能不能读回来。
+    /// 全是公开信息,不需要口令。
+    #[arg(long)]
+    pub did: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -421,6 +450,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::VerifyDoc(args) => verify_doc(root, args),
         Command::List => list(root),
         Command::Status => status(root),
+        Command::Probe(args) => crate::ops::probe::probe(root, args.did.as_deref()),
         Command::Unlock(args) => unlock(root, args),
         Command::Lock(args) => lock(root, args),
         Command::Sign(args) => sign(root, args),
@@ -483,6 +513,8 @@ pub fn run(cli: Cli) -> Result<()> {
                 },
             },
         ),
+        #[cfg(feature = "mcp")]
+        Command::Mcp(args) => crate::mcp::serve(args.socket),
     }
 }
 

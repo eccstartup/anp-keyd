@@ -12,8 +12,14 @@ license = "Apache-2.0"
 # 一个持有私钥的守护进程不应该有这些。
 anp = { version = "=1.0.6", default-features = false }
 
+# —— MCP:官方 Rust SDK。**可选** —— 不装 MCP 的人不该被拖进它的依赖树。
+# 0.15.0 是计划里pin 住的那一版(2026-02-10)。注意 crates.io 上它已经不是最新的
+# (3.5.1),而且 1.x 之后 API 变过(`#[tool_router(server_handler)]`、
+# `serve_with_lifecycle` 都是 3.x 才有的)—— 所以这里跟着计划钉住,别顺手升。
+rmcp = { version = "0.15", optional = true, features = ["server", "transport-io", "macros", "schemars"] }
+
 # —— 运行时
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "signal", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-std", "macros", "time", "signal", "sync"] }
 
 # —— 内核凭证 / 文件权限
 nix = { version = "0.31", features = ["socket", "user", "fs", "term"] }
@@ -57,3 +63,5 @@ percent-encoding = "2"
 default = []
 # 默认关闭:不带它编译,导出代码在二进制里根本不存在
 seed-export = []
+# MCP 前端(stdin/stdout 上的 4 个工具)。单独开,免得不用 MCP 的人也把 rmcp 拖进来。
+mcp = ["dep:rmcp"]
