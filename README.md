@@ -1,129 +1,184 @@
 # anp-keyd
 
-一台本机上的常驻守护进程。它替你保管 did:wba 的 Ed25519 私钥,并按 RFC 9421
-替你签 HTTP 消息签名。
+一个跑在你自己机器上的守护进程,替 agent 保管 did:wba 的 Ed25519 私钥,
+并按 [RFC 9421] 签 HTTP 消息签名。
 
-**agent 手里从来没有私钥字节。**
+**agent 手里从来没有私钥字节。** agent 通过 Unix socket 说话,请求里可以带
+方法、URL、头、请求体 —— 唯独没有一个字段能装私钥。守护进程自己重建签名基、
+自己决定覆盖面,签完把签名头递回来。
 
-这句话是产品本身,不是形容。agent 通过一个 Unix socket 说话,请求里可以带
-方法、URL、头、请求体,唯独没有一个字段能装私钥;守护进程自己重建签名基、
-自己决定覆盖面、签完把签名头递回去。agent 拿到的是签名,不是钥匙。
+```http
+Signature-Input: sig1=("@method" "@target-uri" "@authority");created=1791913177;expires=1791913477;nonce="xUrKXp6Jcvy5Ha-CywsJKA";keyid="did:wba:example.com:agents:mybot:e1_abc…#key-1"
+Signature: sig1=:VwRcADsdxfIJ5rQAXCXX3ygFsAP3l1ho+gdpNxcHzlZCdx/mef9yKzHgy9P1QzVVHQuxoAyffja4G6CbAaUDCA==:
+```
+
+**什么时候会想要这个:** 你想让一个 agent 替你去访问别人的服务,但你不愿意
+把身份交给它。你给它的是一条"请求签名"的通道,而不是那把钥匙。
+
+[RFC 9421]: https://www.rfc-editor.org/rfc/rfc9421
 
 ---
 
-## 一、它挡什么,不挡什么
+## 状态
 
-先把边界说清楚,因为"安全"这个词单独拿出来是没意义的。
+早期阶段,`0.1.0`。命令行界面还会变;**落盘的两份格式不会** —— 助记词推导
+方案和归档格式已经冻结,因为它们决定了别人手里那份备份打得开还是打不开。
+动这两样东西之前请先读 [docs/DESIGN.md](docs/DESIGN.md) 第三节。
 
-**它挡的:**
+## 安装
 
-- **agent 被注入之后**。这是主要威胁。一个能任意执行代码的 agent,在最坏的
-  情况下也拿不到私钥字节 —— 它最多能让守护进程替它签它被允许签的东西。
-- **同一个 uid 下的另一个进程**。口令从 `/dev/tty` 读,不走 argv、不走环境
-  变量、不走 stdin、不走 socket;钥匙文件是 `0600`,目录是 `0700`。
-- **磁盘被偷**。信封(WrappedKey)一半的熵来自 `device.secret`,另一半来自
-  口令。少了任何一半都打不开,而且两者失败时的报错**一模一样**。
-- **审计日志被事后编辑**。链抓改动,锚抓截断。
+需要 Rust 1.88 或更新,目前只能从源码构建:
 
-**它不挡的:**
-
-- **同一个 uid 下的另一个 agent 冒充你**。uid 是这个授权模型的地基,而它的
-  粒度就是 uid。要再细一层,得靠可执行文件身份(第三层),那条路在 macOS
-  上经 `SecCode` 拿 cdhash —— 它提高门槛,但不是一道墙。
-- **你亲手把 `export-seed` 敲了一遍**。见下面第六节。
-- **归档文件本身的离线爆破**。归档的全部保护就是导出时那个一次性口令。
-
----
-
-## 二、信封 vs 归档:两个不能混的东西
-
-这一对区分是理解整个设计的钥匙,值得单开一节。
-
-| | 信封 `keys/<thumbprint>.json` | 归档 `<thumbprint>.anpkeyd.json` |
-|---|---|---|
-| 熵从哪来 | 口令 **+** `device.secret` | **只有**导出时的那个一次性口令 |
-| 能搬机器吗 | **不能** | 能,这是它唯一的用途 |
-| 口令可以复用吗 | 可以,是日常口令 | **不行**,一次性,强制独立 |
-| 谁生成 | `keygen` / `import-*` | `export-seed`(默认构建里不存在) |
-
-**信封搬不走,这是设计,不是缺陷。** 一半的熵是这台机器的 `device.secret`,
-所以把 `keys/` 整个拷到另一台机器上,那边的 `device.secret` 不一样,信封就
-打不开。反过来说:任何一个能在别的机器上打开的备份,都不可能由 `device.secret`
-保护 —— 它只能靠人给的那个口令。这就是归档。
-
-**归档文件本身就是一份可以被离线暴力破解的口令保护文件。** 它的强度等于那个
-口令的强度乘以 Argon2id 的成本参数,再没有别的了。所以:
-
-- 导出时强制要一个不弱的口令;
-- 导出**不重试** —— 一遍就够,不留循环;
-- 口令必须和日常口令**不同**,而且守护进程在导出前强制先 LOCK。
-
----
-
-## 三、两份冻结的格式
-
-以下两份格式**一旦发布就不能改**。改了的后果不是报错,是**旧的备份打不开** ——
-放在用户手里的那张纸、那个文件,是他仅有的一份。
-
-### 3.1 助记词推导方案(`bip39-entropy-v1`)
-
-```
-24 个词  <──BIP-39──>  32 字节熵  ==  Ed25519 的 seed
+```bash
+cargo install --path .
 ```
 
-**走的是熵的编码/解码,不是 BIP-39 的种子派生。**
+(或者 `cargo build --release`,用 `target/release/anp-keyd`。)
 
-标准 BIP-39 的用法是:
+没有别的依赖:不需要数据库、不需要网络、不需要配置文件。平台是 macOS 和
+Linux。
 
-```
-熵 → 词 → PBKDF2-HMAC-SHA512(词, 可选口令) → 64 字节种子
-                ^^^^^^^^^^^^^^^^^^^^^^^^^^^ 这一层我们没有
-```
+**一条纪律先说一下:** 凡是需要口令的命令,都要求一个**真的控制终端**。
+cron、CI、systemd 的 `ExecStartPre`、被 agent 拉起来的子进程都在这一条外面
+—— 这是设计,不是遗漏。
 
-**这里没有那一层。** 24 个词直接编码那把 32 字节的 Ed25519 seed。没有
-PBKDF2,也没有 BIP-39 的可选 passphrase —— 那是第二个会丢的秘密,所以连
-"默认关闭"都不给,直接不做。
+## 五分钟跑通
 
-**这两种读法会推出两把完全不同的钥匙,而且不会有任何报错。** 拿一个标准的
-BIP-39 工具(`to_seed()`、`to_master_key()`、或者带 passphrase 的命令行工具)
-去处理同一张词,得到的不是错误,是**另一个 DID**:纸上的词还在,打不开的东西
-却不报错。换实现、换语言、换工具时,必须按这一份来。
-
-为什么是 24 个词:32 字节 = 256 位熵 + 8 位校验和 = 264 位 = 24 × 11。收到的
-词数不是 24,不是"能不能凑合",是"这根本不是我写出去的词",直接拒。
-
-`derivation` 字段里写的就是这个版本号 `bip39-entropy-v1`;将来若要引入别的
-方案,它带着自己的版本号并列存在,而不是把这一份改掉。
-
-### 3.2 归档格式(`anp-keyd-archive` v1)
-
-```text
-┌─ 明文 ─────────────────────────────────────────────┐
-│ format / version        这个文件是什么、哪一版       │
-│ derivation              推导方案版本号(见 3.1)      │
-│ did / kid / thumbprint  这把钥匙是谁的               │
-│ created_at / wns_handle 什么时候造的、挂在哪个名字下 │
-│ document                整份 DID 文档(**含 proof**) │
-├─ 密文 ─────────────────────────────────────────────┤
-│ kdf / aead / seed_ciphertext   32 字节 seed,就这样  │
-└────────────────────────────────────────────────────┘
+```bash
+anp-keyd keygen --host example.com --path agents/mybot
 ```
 
-常量:`format = "anp-keyd-archive"`,`version = 1`,`derivation =
-"bip39-entropy-v1"`,`kdf = "argon2id"`,`aead = "xchacha20poly1305"`。
+它会让你**敲两遍口令**(口令从终端读,不走命令行参数、不走环境变量)。
+然后打印出 DID,和一句提示:信封落在哪个文件里。
 
-明文那一半是**故意**明文的:那些信息本来就挂在域名上给所有人看,加密它只是
-让人以为"这里也有秘密"。而且它有个实际好处 —— 一张打不开的备份,至少还能告诉
-人"这是谁的备份"。
+`--host` 是你控制的域名,`--path` 是 `e1_` 段之前的那一段路径。两个都没有
+默认值 —— did:wba **要求**至少有一段路径,而且要求域名是 FQDN 不是 IP。
 
-**AAD 里为什么塞文档摘要:** `did`/`kid`/`thumbprint` 绑住了"这是谁的钥匙",
-但文档是整个搬过来的 —— 有人换掉文档里的公钥、再把 seed 挪过去,单看头是看
-不出来的。所以 AAD 覆盖的是**JCS 规范化后**整份文档的 SHA-256。文档里任何一个
-字节变了(包括与钥匙无关的字段)摘要就对不上,而且这一条**先于解密**发生。
+```bash
+anp-keyd publish --did did:wba:example.com:agents:mybot:e1_abc…
+```
 
----
+再敲一遍口令。它把文档盖上自签 proof,写进 `dids/`,并告诉你这个文件必须被
+放在哪儿:
 
-## 四、磁盘布局
+```
+https://example.com/agents/mybot/e1_abc…/did.json
+```
+
+**这个工具不托管任何东西。** 谁来放这个文件是你的事 —— 那是别人验签时会去
+请求的地址。
+
+```bash
+anp-keyd serve
+```
+
+前台跑着,监听 `~/.anp-keyd/run/keyd.sock`。换个终端,解锁:
+
+```bash
+anp-keyd unlock --did did:wba:example.com:agents:mybot:e1_abc…
+```
+
+口令只在内存里,默认空闲 15 分钟自动上锁(`serve --idle SECS` 可调)。
+然后就能签名了 —— 这一步谁都能做,包括 agent:
+
+```bash
+anp-keyd sign --did did:wba:example.com:agents:mybot:e1_abc… \
+  --method GET \
+  --url https://service.example.net/orders/42
+```
+
+签名头打到 stdout,**原样搬运** —— 不解析、不重排、不补引号。挂到真实请求
+上去就行:多一个字符、少一个字符,签名就验不过。
+
+带请求体的 POST:
+
+```bash
+anp-keyd sign --did … --method POST --url https://… \
+  --header 'content-type: application/json' \
+  --body request.json
+```
+
+给了 `--body`,`content-digest` 一定进覆盖面,而且**由守护进程自己算** ——
+请求里带的同名头会被忽略。
+
+试的时候建议加 `--root DIR`,免得真钥匙和实验钥匙混在一起。
+
+## 命令
+
+分成两组,因为它们的信任关系不一样。
+
+### 走 socket 的(给 agent 用)
+
+连上守护进程,拿签名,**从始至终不碰私钥字节**。
+
+| 命令 | 干什么 |
+|---|---|
+| `sign` | 签一条 RFC 9421 请求,把签名头打到 stdout |
+| `list` | 列出这台机器上的钥匙 |
+| `status` | 列出当前已解锁的钥匙,以及各自解锁了多久 |
+| `unlock` | 解锁一把钥匙(这一步是人做的,要敲口令) |
+| `lock` | 上锁 |
+
+### 不走 socket 的(给人用)
+
+在终端上当场打开信封。它们留在你自己的进程里,agent 够不着。
+
+| 命令 | 干什么 |
+|---|---|
+| `serve` | 常驻:在 Unix socket 上服务签名请求 |
+| `keygen` | 生成一把新的 did:wba 密钥,把信封写进 `keys/` |
+| `publish` | 给文档盖上自签 proof,写出 did.json |
+| `verify-doc` | 校验一份文档确实是它自称的那个 DID 的文档 |
+| `probe` | 体检:这台机器能不能兑现这个工具给出的承诺 |
+| `add-recovery-key` | 给一个 DID 加一把恢复密钥(预授权签一次迁移) |
+| `rotate-hot-key` | 轮换日常签名用的热密钥 |
+| `remove-key` | 从文档里摘掉一把非绑定密钥 |
+| `migrate` | 迁移到一个新 DID:旧文档标记为已注销并指向它 |
+| `deactivate` | 永久注销一个 DID,可以顺手指向一个后继 |
+| `import-mnemonic` | 从 24 个词恢复一把绑定密钥,并重新封进信封 |
+| `import-archive` | 从一个加密归档恢复 |
+
+`--help` 是完整的参数参考。
+
+### 只在特定构建里存在的两个
+
+```bash
+cargo install --path . --features seed-export   # 多出 export-seed
+cargo install --path . --features mcp           # 多出 mcp
+```
+
+`export-seed` 把一把钥匙的种子导出来。默认构建里它**不存在** —— 不是"被
+拒绝",是**没有这段代码**:没有分支、没有环境变量、没有可翻的开关。理由见
+[docs/DESIGN.md](docs/DESIGN.md) 第六节。导入则相反,默认构建里就有。
+
+### 几个不显然的默认值
+
+- **`keygen --path` 没有默认值。** 与其给一个注定会失败的默认值(光秃秃的
+  `did:wba:example.com:e1_...` 不是合法 did:wba DID),不如让命令在解析参数
+  时就把这条规则说出来。
+- **`--host` 拒收 IP 字面量。** did:wba 要求 FQDN。
+- **`serve --idle 0` 是"立刻上锁",不是"永不"。** 想要永不,别用 0。
+- **`sign --raw` 默认关着。** 那是守护进程里唯一一条能给调用方任意签名的路,
+  要用得先 `serve --allow-raw-signing`。
+- **`migrate --allow-different-subject` 默认关。** 默认放行等于让一次打错字
+  的 `--to` 变成一次无人察觉的冒名。
+- **`serve` 不给 `--allow-binary` 时会打一条警告。** 只配了 uid 的"多用户"
+  是假的多用户。
+
+## 它挡什么,不挡什么
+
+**挡的:** agent 被注入之后拿不到私钥字节;同一个 uid 下的另一个进程读不到
+口令;磁盘被偷(信封的熵一半在口令、一半在 `device.secret`);审计日志被
+事后编辑。
+
+**不挡的:** 同一个 uid 下的另一个 agent 冒充你(uid 是授权模型的地基,粒度
+就是 uid,要再细一层得靠可执行文件身份);你亲手把 `export-seed` 敲了一遍;
+归档文件本身的离线爆破。
+
+每一条是怎么成立的、为什么某些做法被**故意**排除,见
+[docs/DESIGN.md](docs/DESIGN.md)。
+
+## 磁盘布局
 
 根目录默认 `~/.anp-keyd`(`--root` 可覆盖;`--system` 下是
 `/var/lib/anp-keyd/users/<uid>`)。
@@ -137,163 +192,135 @@ BIP-39 工具(`to_seed()`、`to_master_key()`、或者带 passphrase 的命令�
 └── run/keyd.sock                    守护进程的 Unix socket
 ```
 
-目录 `0700`,秘密文件 `0600`,公开文件 `0644`。写入一律先写临时文件再
-`rename`(`write_atomic`),这样断电不会留下半个文件。
+目录 `0700`,秘密文件 `0600`,公开文件 `0644`。
 
-文件名里的 `<did>` 是**拍平过**的:DID 里的 `:` 换成 `_`,其余不在白名单的字符
-同样换成 `_`(`did_safe`)。所以
-`did:wba:example.com:agents:bot:e1_abc…` 落在
-`dids/did_wba_example.com_agents_bot_e1_abc….json`。信封那边的 `<thumbprint>` 走
-`is_safe_thumbprint` 单独把关 —— 两个都是外部输入,都必须挡住路径穿越。
+**整份 `~/.anp-keyd/` 拷到另一台机器上是打不开的**,这是设计不是缺陷 ——
+一半的熵是这台机器的 `device.secret`。要在别的机器上用同一把身份,走下面
+那条路。
 
-`device.secret` 值得单说一句:**文件整个不见了**和**它是新生成的**,是两件事,
-而且分开报。`device::load` 在文件缺失时报 `BadDeviceSecret`;而
-`load_or_create` 生成一个新的 —— 新生成的那把打不开旧信封(报 `BadPassphrase`,
-和口令错一模一样)。系统不会"顺手帮你恢复"。放在一起人才能看出自己丢了什么。
+## 出事的时候
 
----
+### 换机器 / 重装系统
 
-## 五、命令行
-
-```
-anp-keyd serve            常驻:在 Unix socket 上服务签名请求
-anp-keyd keygen           生成一把新的 did:wba 密钥,把信封写进 keys/
-anp-keyd publish          给文档盖上自签 proof,写出 did.json
-anp-keyd verify-doc       校验一份文档确实是它自称的那个 DID 的文档
-anp-keyd list             列出这台机器上的钥匙
-anp-keyd status           列出当前已解锁的钥匙,以及各自解锁了多久
-anp-keyd unlock / lock    解锁一把钥匙 / 上锁
-anp-keyd sign             签一条 RFC 9421 请求,把签名头打到 stdout
-anp-keyd add-recovery-key 给一个 DID 加一把恢复密钥(预授权签一次迁移)
-anp-keyd rotate-hot-key   轮换日常签名用的热密钥
-anp-keyd remove-key       从文档里摘掉一把非绑定密钥
-anp-keyd migrate          迁移到一个新 DID:旧文档标记为已注销并指向它
-anp-keyd deactivate       永久注销一个 DID,可以顺手指向一个后继
-anp-keyd import-mnemonic  从 24 个词恢复一把绑定密钥,并重新封进信封
-anp-keyd import-archive   从一个加密归档恢复
-anp-keyd export-seed      导出种子(**只有带 seed-export 的构建里有**)
-```
-
-几个不显然的默认值,它们都是有意选的:
-
-- **`anp-keyd keygen` 的 `--path` 没有默认值。** did:wba **要求**至少有一段
-  路径:光秃秃的 `did:wba:example.com:e1_...` 不是合法的 did:wba DID。与其给
-  一个注定会失败的默认值,不如让 clap 在解析参数时就把这条规则说出来。
-- **`--host` 拒收 IP 字面量。** did:wba 要求 FQDN。
-- **`serve --idle 0` 是"立刻上锁",不是"永不"。** 想要永不,别用 0。
-- **`sign --raw` 默认关着。** 那是守护进程里唯一一条能给调用方任意签名的路,
-  要用得先 `serve --allow-raw-signing` 而且读一遍文档。
-- **`migrate --allow-different-subject` 默认关。** 默认放行等于让一次打错字的
-  `--to` 变成一次无人察觉的冒名。
-
-### socket 协议
-
-```
-frame := u32_be(len) || payload
-```
-
-消息类型只有五种:`LIST_KEYS` `SIGN` `UNLOCK` `LOCK` `STATUS`,回答是 `OK`
-或 `ERR`。**协议里没有任何一条消息能传口令给一个导出操作** —— 这是刻意的:
-导出不是一种 socket 消息,它是一个必须在终端前由人敲的命令。
-
-对端身份拿不到就**拒绝**:没有"取不到就放行"的分支。这一层是整个授权模型的
-地基,uid 是它给的;一旦有降级路径,降级的那条就是"任何人都能连上来签"。
-
----
-
-## 六、编译:导出是缺席的,不是被拒绝的
+先在**旧机器**上把身份导出成归档(需要一个**一次性的、和日常口令不同的**
+导出密码):
 
 ```bash
-cargo build --release                    # 默认:没有导出
-cargo build --release --features seed-export   # 有导出
+cargo install --path . --features seed-export
+anp-keyd export-seed --did did:wba:…
 ```
 
-```toml
-[features]
-default = []
-seed-export = []
-```
-
-默认构建里 `export-seed` **不存在**。不是"被拒绝",是**没有这段代码** ——
-没有分支、没有环境变量、没有可翻的开关。一个能一键把整把身份抽干的接口,是
-agent 被注入之后最想找的那个东西,所以它干脆不在二进制里。
-
-导入则相反,**默认构建里就有**。理由不对称而清楚:恢复自己的身份不该需要一次
-特殊编译;而交出身份应该。
-
-导出这条路本身还有几条约束,都写在代码里:
-
-- **断链,而不是保密。** 关键不是"agent 不知道导出密码",而是**agent 够不到那
-  条通道**。一个被注入的 agent 会做的事,是编一个像样的提示框让人类自己把密码
-  敲进去 —— 所以"他不知道密码"根本挡不住这个。真正成立的性质是:**导出不是
-  socket 上的一个消息类型**(`wire::Request` 里没有导出变体),它只在这个进程
-  自己的 `/dev/tty` 上、由人类本人操作。于是就算人类被骗着把密码敲进了 agent
-  的聊天窗,agent 也**送不到守护进程**。
-- **只接受本进程自己 `open("/dev/tty")` 拿到的终端。** 绝不接受一个经
-  `SCM_RIGHTS` 传进来的 fd —— 那样 agent 可以自己开一个 pty,把从设备 fd 递
-  过来,让守护进程以为自己在跟一个终端说话,于是渲染一个假提示、读走人类敲进去
-  的东西。这一条在这里是**结构上成立**的:导出不是 socket 操作,这条路径从头到
-  尾没有接收过任何 fd,所以守住它的方式是**不加那条代码**,而不是加一个检查。
-- **没有 `--password`。** 口令只从终端读、关回显、读完 zeroize、不进日志。
-  argv 会被 `ps` 看到,环境变量会被同 uid 的进程在 `/proc/<pid>/environ` 里读到。
-- **独立口令、一次性、强制先 LOCK。** 导出密码必须**不是**日常解锁口令,否则
-  "人类解锁了日常签名"就等于"人类授权了导出",能力没有分离。它只能用一次,
-  不落盘、不复用。导出前先 `LOCK` 把正在进行的签名会话全部杀掉 —— 让导出变成
-  一件有破坏性、看得见的动作,这是特性不是缺点。
-- **没有控制终端 = 失败,没有降级路径。** cron、CI、被 agent 拉起来的子进程、
-  systemd 的 `ExecStartPre` 都在这一条外面。
-
-### 导入之后必须说两句话
-
-`import-mnemonic` / `import-archive` 做完之后会打印两条提醒,它们不是客气话:
-
-1. **克隆警告。** 导入出来的这把钥匙,和原来那台机器上的是**同一把**,不是
-   副本意义上的"同一把"。两边都能签,而且验证方分不出来。
-2. **托管提示。** 新信封用**本机新的** `device.secret` 和**本机新的**口令重新
-   封装,seed 用完全程立刻清零,并记一条 `IMPORT` 审计。
-
----
-
-## 七、测试
+会得到 24 个词和/或一个 `.anpkeyd.json` 归档。**把词抄在纸上,不要放在这
+台机器上。** 然后在**新机器**上:
 
 ```bash
-cargo test                                  # 单元 + 集成 + 负例 + 外部向量
-cargo test --all-features                   # 连导出那条路一起
+anp-keyd import-mnemonic --did did:wba:…    # 24 个词
+anp-keyd import-archive --file x.anpkeyd.json
+```
+
+导入之后两件事必须知道:
+
+1. **这是一把克隆,不是副本。** 导入出来的钥匙和旧机器上的是**同一把**,
+   两边都能签,而且验证方分不出来。旧机器上的那一份要处理掉。
+2. **重新封装用的是这台机器的新 `device.secret` 和新口令。** 归档里的那个
+   导出密码从此没用了。
+
+### 装了钥匙的机器坏了,又没有备份
+
+钥匙没了。信封打不开,而且报的错和"口令敲错了"**一模一样** —— 这是刻意的,
+两者可区分等于告诉拿到磁盘的人"你缺的是哪个因子"。
+
+所以:**趁机器活着,把 24 个词抄下来。**
+
+### 怀疑哪里不对劲
+
+```bash
+anp-keyd probe
+anp-keyd probe --did did:wba:…
+```
+
+它报告这台机器能不能兑现这个工具给出的承诺:内存锁定建不建得起来(容器里
+`ulimit -l` 太小、systemd 的 `LimitMEMLOCK` 没调,症状是**启动就失败**,而
+这里能当场说清是哪一条不满足)、一次崩溃会不会把种子写到磁盘上、
+`device.secret` 在不在、模式对不对。
+
+**它一个字节的密钥材料都不打印。** 走 stdout 就是为了让你能放心把输出贴到
+issue 里。
+
+## 接到 agent 上
+
+`mcp` 子命令在 stdin/stdout 上说 MCP,把四个工具(`list_my_keys` /
+`status` / `sign_request` / `unlock`)转发给守护进程。它自己不开密钥库,
+也不碰密码学。
+
+```bash
+cargo install --path . --features mcp
+```
+
+MCP 客户端的配置里,那一行 `command` 就指向这个子命令,参数是 `["mcp"]`:
+
+```json
+{
+  "mcpServers": {
+    "anp-keyd": { "command": "/path/to/anp-keyd", "args": ["mcp"] }
+  }
+}
+```
+
+四个工具里只有 `unlock` 会把口令带过那条通道,而它是个**权衡不是免费的
+东西**:口令只是两个因子之一(`device.secret` 从不经手 MCP),而且它给的
+不是新能力 —— `sign_request` 本来就能签。不想要就别构建这个特性。
+
+### 写给 agent 看的说明
+
+[`skills/anp-keyd/`](skills/anp-keyd/SKILL.md) 是一份 Claude Code skill:
+告诉 agent 怎么查状态、怎么签、怎么把两个头逐字节挂上去、被拒的那些码各自
+什么意思,以及**三件绝不做的事**(不要口令、不替人跑生命周期命令、24 个词
+不许进聊天)。
+
+装上它:
+
+```bash
+cp -r skills/anp-keyd ~/.claude/skills/          # 只给自己用
+cp -r skills/anp-keyd .claude/skills/            # 给这个项目里的会话用
+```
+
+自己写客户端也可以 —— 线上是 `u32_be(len) || payload`,消息类型只有五种
+(`LIST_KEYS` `SIGN` `UNLOCK` `LOCK` `STATUS`)。[`src/client/mod.rs`](src/client/mod.rs)
+就是一份可以直接抄的最小实现。
+
+## 测试
+
+```bash
+cargo test                    # 单元 + 集成 + 负例 + 外部向量
+cargo test --all-features     # 连导出和 MCP 一起
 cargo clippy --all-targets --all-features
 ```
 
-四类测试,失败的含义不一样:
+五类测试,失败的含义不一样:
 
 | 文件 | 回答的问题 | 红了意味着 |
 |---|---|---|
 | `src/**` 的单元测试 | 这个函数在它的假设下对不对 | 代码写错了 |
+| `tests/cli.rs` | 真起一个二进制、真在一个终端上敲命令 | 给人看的那一层坏了 |
 | `tests/signature_end_to_end.rs` | 整条路走通没有 | 接口对不上了 |
 | `tests/negative.rs` | **产品承诺的那十件事今天还成立吗** | **有人把一道墙拆了** |
-| `tests/vectors/` + `tests/vectors.rs` | 外部标准还认不认我们的实现 | 见下 |
+| `tests/vectors/` + `tests/vectors.rs` | 外部标准还认不认我们的实现 | 先怀疑实现,别改向量 |
 
-### 关于 `tests/vectors/`
+另有三个单一命题,每个一个文件:`tests/probe.rs`(体检说的都是真的)、
+`tests/mcp.rs`(MCP 那四个工具就是全部)、`tests/no_key_material_on_disk.rs`
+(走完一遍之后,磁盘上扫不出任何密钥材料)。
 
-`tests/vectors/` 里的 JSON 是**权威文本的抄本**,取自 RFC 8032 §7.1/§7.3、
-RFC 7638 §3.1 与 RFC 8037 附录 A.3、RFC 9421 附录 B.1.4/B.2.6、RFC 8785
-§3.2.2/§3.2.3 与附录 B。每一个文件都带 `_source`,写明它抄自哪一节。
+`tests/vectors/` 里的 JSON 是**权威文本的抄本**,取自 RFC 8032、7638、8037、
+9421、8785,每个文件都带 `_source` 写明抄自哪一节。**如果向量测试红了,先
+怀疑实现** —— 改一个向量让测试变绿,等于把这个文件存在的理由删掉。
 
-**如果向量测试红了,先怀疑实现。** 改一个向量让测试变绿,等于把这个文件存在
-的理由删掉。抄不出逐字节一致结果的用例,我们**不收** —— 宁可少一个用例,也不
-放一个"差不多"的期望值进去。
+## 设计
 
-其中一条最接近生产路径:RFC 8032 TEST 1 的公钥,经过我们自己的 `e1_` 段计算,
-必须等于 RFC 8037 A.3 公布的那个指纹
-`kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k`。两个 RFC,一份实现。
+这份 README 到这儿为止讲的是"怎么用"。[docs/DESIGN.md](docs/DESIGN.md) 讲
+的是"为什么这么做":威胁模型、信封和归档为什么是两种东西、两份冻结的格式
+各自的字节布局、导出为什么是**缺席**而不是被拒绝、以及还没有做的部分。
 
-另外那一对向量是**反例**,而且它俩挨着放才看得出意思:RFC 8032 §7.1 的
-`TEST SHA(abc)` 和 §7.3 的 `TEST abc` **是同一把钥匙**(公钥都是
-`ec172b93…`)。前者把 `SHA-512("abc")` 那 64 字节**当作消息本身**直接签;后者
-是 Ed25519ph —— 对 `"abc"` 做预哈希再签。我们会算前者(它就是普通 Ed25519,
-哈希只是消息内容),**绝不算后者**:ph 出来的签名必须和我们的不一样。我们不做
-预哈希。
+## 许可
 
----
-
-## 八、许可
-
-Apache-2.0。
+Apache-2.0。见 [LICENSE](LICENSE)。
