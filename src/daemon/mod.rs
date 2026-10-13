@@ -6,8 +6,10 @@
 pub mod autolock;
 pub mod handlers;
 pub mod peer;
+pub mod server;
 pub mod state;
 pub mod wire;
 
 pub use handlers::handle;
 pub use peer::{authorize, peer_identity, self_uid, PeerIdentity};
+pub use server::{bind, serve, ServerConfig};

@@ -306,6 +306,23 @@ impl DaemonState {
         self.with_vault(uid, |vault| Ok(vault.lock(did)))
     }
 
+    /// 把所有 uid 的钥匙全放掉。退出前用。
+    ///
+    /// 退出的路径上**不能失败**:进程马上就要没了,这里报错除了让退出码
+    /// 难看之外没有任何用。所以它把能收的都收掉,收不动的写日志,不返回错。
+    pub fn lock_everything(&self) {
+        let mut vaults = match self.vaults.lock() {
+            Ok(vaults) => vaults,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for (uid, vault) in vaults.iter_mut() {
+            let dropped = vault.lock(None);
+            if dropped > 0 {
+                tracing::info!(uid, dropped, "locked on shutdown");
+            }
+        }
+    }
+
     /// 后台清扫:把每个 vault 里空闲太久的钥匙放掉。
     ///
     /// 返回被放掉的总数,纯粹是为了让测试和日志看得见。

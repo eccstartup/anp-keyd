@@ -53,7 +53,9 @@ pub enum Event {
     /// 这一条尤其重要：拒绝是安静发生的，没有它，一次跨 uid 的探测在
     /// 日志里和"什么都没发生"完全一样。
     Denied {
-        uid: u32,
+        /// 拿不到对端凭证时是 `None` —— 而"拿不到凭证"本身正是要记下来的
+        /// 那件事,所以它不能用一个假的 uid 顶替。
+        uid: Option<u32>,
         pid: Option<i32>,
         reason: String,
     },
@@ -506,7 +508,7 @@ mod tests {
     #[test]
     fn every_event_has_a_stable_tag_and_its_own_fields() {
         let events = [
-            Event::Denied { uid: 1, pid: Some(2), reason: "cross-uid".into() },
+            Event::Denied { uid: Some(1), pid: Some(2), reason: "cross-uid".into() },
             Event::Unlocked { uid: 1, did: "d".into() },
             Event::Locked { uid: 1, did: None, dropped: 2 },
             Event::Signed {

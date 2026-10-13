@@ -154,7 +154,7 @@ fn record_denial(state: &DaemonState, peer: &PeerIdentity, error: &KeydError) ->
     // 连接层的拒绝（对端身份不认）还没走到 vault 那一步，所以这里写的是
     // 服务方自己的那一份日志 —— 被拒的 uid 的目录我们多半根本写不进去。
     let event = Event::Denied {
-        uid: peer.uid,
+        uid: Some(peer.uid),
         pid: peer.pid,
         reason: error.wire_message(),
     };
