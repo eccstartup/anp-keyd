@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::daemon::wire::ErrorCode;
+
 /// Every failure mode the daemon can produce.
 ///
 /// Several variants are deliberately coarse: the wire protocol must not leak
@@ -49,6 +51,19 @@ pub enum KeydError {
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+
+    // —— 客户端 ——
+    /// 守护进程拒绝了这条请求,这是**协议层告诉我们的那一件事**。
+    ///
+    /// 为什么客户端不把它还原成 `BadPassphrase` 之类:因为它还原不出来,
+    /// 而假装还原得出来就是在撒谎。协议刻意把"口令错"和"device.secret
+    /// 不对"合并成了一个码 —— 分得细就是给爆破的人送信息。客户端手上
+    /// 只有那个粗码,所以它只报粗码,并且保留服务端给的那一句话。
+    ///
+    /// 想要细粒度的错误,办法是**别跨这条边界**:同一台机器上直接调
+    /// `keystore`,那里分得清。
+    #[error("the daemon refused the request")]
+    Refused { code: ErrorCode, message: String },
 }
 
 pub type Result<T> = std::result::Result<T, KeydError>;

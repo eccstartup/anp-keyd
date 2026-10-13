@@ -106,6 +106,10 @@ impl KeydError {
             Protocol(_) => ErrorCode::Protocol,
             Did(_) => ErrorCode::Did,
             Crypto(_) | Upstream(_) | Io(_) | Json(_) => ErrorCode::Internal,
+            // 客户端把收到的粗码原样带回来。环是这样闭合的:服务端
+            // `BadPassphrase → BadCredential`,客户端 `BadCredential →
+            // Refused{code}`,再发出去还是 `BadCredential`。
+            Refused { code, .. } => *code,
         }
     }
 
@@ -121,6 +125,9 @@ impl KeydError {
             KeydError::BadPassphrase | KeydError::BadDeviceSecret => {
                 "the credential was refused".to_string()
             }
+            // `Refused` 已经是协议层的话,不再套一层 —— 否则消息会随着
+            // 每一次转发越长,而最里面那一句才是真正有用的那一句。
+            KeydError::Refused { message, .. } => message.clone(),
             other => other.to_string(),
         }
     }

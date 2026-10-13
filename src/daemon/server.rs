@@ -353,11 +353,12 @@ mod tests {
 
     // —— 端到端:真的起一个监听、真的连上去 ——
 
+    use crate::client::Client;
     use crate::crypto::kdf::Argon2Config;
     use crate::daemon::peer::BinaryIdentity;
     use crate::daemon::state::Roots;
-    use crate::daemon::wire::Response;
     use crate::did::DidDocumentSpec;
+    use crate::error::KeydError;
     use crate::keystore::layout::{KeydLayout, SECRET_FILE_MODE};
     use crate::keystore::{create, store};
 
@@ -423,19 +424,19 @@ mod tests {
 
         /// 在**阻塞线程池**上跑一段客户端会话。
         ///
-        /// 这层包装不是洁癖。`wire::round_trip` 是同步阻塞 I/O,而默认的
-        /// `#[tokio::test]` 是单线程 runtime —— 直接在测试的 async 体里调它,
+        /// 这层包装不是洁癖。客户端是同步阻塞 I/O,而默认的
+        /// `#[tokio::test]` 是单线程 runtime —— 直接在测试的 async 体里跑它,
         /// 就是在守护进程要用来应答的那唯一一条线程上等待守护进程应答。
         /// 自己把自己锁死,而且看上去像"守护进程没反应"。
         async fn session<T, F>(&self, f: F) -> T
         where
             T: Send + 'static,
-            F: FnOnce(&mut std::os::unix::net::UnixStream) -> T + Send + 'static,
+            F: FnOnce(&mut Client) -> T + Send + 'static,
         {
             let sock = self.sock.clone();
             tokio::task::spawn_blocking(move || {
-                let mut stream = std::os::unix::net::UnixStream::connect(&sock).unwrap();
-                f(&mut stream)
+                let mut client = Client::connect(&sock).unwrap();
+                f(&mut client)
             })
             .await
             .unwrap()
@@ -466,49 +467,38 @@ mod tests {
         let running = Running::start(PeerPolicy::default()).await;
         let did = running.did.clone();
 
-        // 整场会话在**同一条连接**上跑完 —— 这也顺带证明了帧协议是
+        // 整场会话在**同一个客户端**上跑完 —— 这也顺带证明了帧协议是
         // 有状态的:认人只在连接建立时做一次,后面几条请求都沿用。
+        //
+        // 走的是 `Client`,也就是 CLI 会走的那条路。用裸 `round_trip` 测
+        // 会漏掉客户端把应答翻译回 `Result` 的那一段,而客户端同时也是
+        // "别人照着接 keyd"的参考实现 —— 它错了,错的是两份。
         let outcome = running
             .session(move |client| {
-                let listed = wire::round_trip(client, &wire::Request::ListKeys).unwrap();
+                let listed = client.list_keys();
 
                 // 锁着的时候签不出来。
-                let locked = wire::round_trip(
-                    client,
-                    &wire::Request::Sign(wire::SignRequest::Structured {
-                        did: did.clone(),
-                        method: "POST".into(),
-                        target_uri: "https://example.com/api".into(),
-                        headers: Default::default(),
-                        body: Some(b"{}".to_vec()),
-                        covered: Vec::new(),
-                    }),
-                )
-                .unwrap();
+                let locked = client.sign(wire::SignRequest::Structured {
+                    did: did.clone(),
+                    method: "POST".into(),
+                    target_uri: "https://example.com/api".into(),
+                    headers: Default::default(),
+                    body: Some(b"{}".to_vec()),
+                    covered: Vec::new(),
+                });
 
-                // 解锁。口令就是从这条 socket 上传过去的 —— 这是 v1 的
+                // 解锁。口令就是从这个 socket 上传过去的 —— 这是 v1 的
                 // 解锁仪式,它成立的前提是这条 socket 的另一头一定是我们自己。
-                let unlocked = wire::round_trip(
-                    client,
-                    &wire::Request::Unlock {
-                        did: did.clone(),
-                        passphrase: PASSPHRASE.into(),
-                    },
-                )
-                .unwrap();
+                let unlocked = client.unlock(&did, PASSPHRASE);
 
-                let signed = wire::round_trip(
-                    client,
-                    &wire::Request::Sign(wire::SignRequest::Structured {
-                        did: did.clone(),
-                        method: "POST".into(),
-                        target_uri: "https://example.com/api".into(),
-                        headers: Default::default(),
-                        body: Some(b"{}".to_vec()),
-                        covered: Vec::new(),
-                    }),
-                )
-                .unwrap();
+                let signed = client.sign(wire::SignRequest::Structured {
+                    did: did.clone(),
+                    method: "POST".into(),
+                    target_uri: "https://example.com/api".into(),
+                    headers: Default::default(),
+                    body: Some(b"{}".to_vec()),
+                    covered: Vec::new(),
+                });
 
                 (listed, locked, unlocked, signed)
             })
@@ -516,27 +506,28 @@ mod tests {
 
         let (listed, locked, unlocked, signed) = outcome;
 
-        let Response::ListKeys(keys) = listed else {
-            panic!("expected a key list, got {listed:?}");
-        };
+        let keys = listed.expect("listing keys needs no unlock");
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].did, running.did);
 
-        assert_eq!(
-            locked,
-            Response::Error {
-                code: wire::ErrorCode::Locked,
-                message: "key is locked".into(),
-            }
+        // 锁着的时候,客户端拿到的是**粗码**,而且它不做任何还原。
+        let error = locked.expect_err("a locked key must not sign");
+        assert!(
+            matches!(
+                error,
+                KeydError::Refused { code: wire::ErrorCode::Locked, .. }
+            ),
+            "{error:?}"
         );
-        assert_eq!(unlocked, Response::Ok);
 
-        let Response::Signature(bytes) = signed else {
-            panic!("expected a signature, got {signed:?}");
-        };
-        let text = String::from_utf8(bytes).unwrap();
-        assert!(text.contains("Signature-Input: "), "{text}");
-        assert!(text.contains("Content-Digest: "), "{text}");
+        unlocked.expect("the right passphrase unlocks");
+
+        let bytes = signed.expect("an unlocked key signs");
+        let headers = crate::client::parse_signed_headers(&bytes).unwrap();
+        assert!(headers.contains_key("Signature-Input"), "{headers:?}");
+        assert!(headers.contains_key("Signature"), "{headers:?}");
+        // 有 body,就有 content-digest —— 而且是守护进程自己算的。
+        assert!(headers.contains_key("Content-Digest"), "{headers:?}");
 
         // 整条路走完了,而且全程留了痕。
         let audit = running.audit_text();
@@ -560,18 +551,19 @@ mod tests {
         .await;
 
         // 拒绝发生在读帧**之前** —— 所以这条连接上我们连一条请求都发不
-        // 进去,发出去的东西没有任何人在读。直接把连接丢掉才对。
+        // 进去,发出去的东西没有任何人在读。客户端要么读到那条 ERR,
+        // 要么因为对端已经关门而断在写/读上,两种都算拒绝。
         let response = running
-            .session(|client| wire::round_trip(client, &wire::Request::Status))
+            .session(|client| client.status())
             .await;
 
         match response {
-            Ok(Response::Error { code, .. }) => {
+            Err(KeydError::Refused { code, .. }) => {
                 assert_eq!(code, wire::ErrorCode::Permission);
             }
             // 拒绝之后立刻关门也是对的:对端可能连应答都没读到就断了。
             Err(_) => {}
-            other => panic!("a refused peer must not get a status, got {other:?}"),
+            Ok(status) => panic!("a refused peer must not get a status: {status:?}"),
         }
 
         // 这一条是关键:拒绝是安静发生的,没有这行审计,一次探测在事后
