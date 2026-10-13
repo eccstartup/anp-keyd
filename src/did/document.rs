@@ -116,6 +116,40 @@ pub fn sign_document(
         .map_err(|e| KeydError::Upstream(format!("completing the DID document proof failed: {e}")))
 }
 
+/// 从 DID 字符串 + 公钥**重建**出那份文档。
+///
+/// 签名路径需要文档,但签名路径手里只有磁盘上的信封(它存了 DID 和公钥),
+/// 没有当初构造文档时的那些参数。好在 DID 本身就是那些参数的编码 ——
+/// 域名、端口、路径段全在里面。
+///
+/// 重建之后**必须**和原来的 DID 逐字节相等,否则拒。这一条保证了
+/// 「我们手上的 DID」和「我们重建出的文档」说的是同一件事;不相等就说明
+/// 这个 DID 不是规范形式(比如被额外百分号编码过),那就别猜,直接失败。
+pub fn rebuild(did: &str, root: &ed25519_dalek::VerifyingKey) -> Result<Value> {
+    let parts = parse_did_wba(did)?;
+    let mut path_segments = parts.path_segments.clone();
+    let last = path_segments
+        .pop()
+        .ok_or_else(|| KeydError::Did(format!("{did} has no e1_ binding segment")))?;
+    if !last.starts_with("e1_") {
+        return Err(KeydError::Did(format!("{did} has no e1_ binding segment")));
+    }
+
+    let spec = DidDocumentSpec {
+        host: parts.host,
+        port: parts.port,
+        path_segments,
+        fragment: ROOT_FRAGMENT.to_string(),
+    };
+    let (rebuilt, document) = build_unsigned(&spec, root)?;
+    if rebuilt != did {
+        return Err(KeydError::Did(format!(
+            "{did} is not in the canonical form this build produces (got {rebuilt})"
+        )));
+    }
+    Ok(document)
+}
+
 /// 校验一份文档确实是它自称的那个 DID 的文档。
 ///
 /// 三道,缺一不可:
@@ -166,21 +200,15 @@ pub fn verify_path_binding(did: &str, document: &Value) -> Result<()> {
 /// 找回一份文档里被 `authentication` 授权的那把验证方法。
 fn authentication_method(document: &Value) -> Option<Value> {
     let authorized = document.get("authentication")?.as_array()?;
-    let methods = document.get("verificationMethod")?.as_array()?;
-
     authorized.iter().find_map(|entry| {
         // `authentication` 里可能是内联对象,也可能是一个引用字符串。
         let id = entry
             .as_str()
             .or_else(|| entry.get("id").and_then(Value::as_str))?;
-        let found = methods
-            .iter()
-            .find(|m| m.get("id").and_then(Value::as_str) == Some(id))?;
-        if found.get("publicKeyMultibase").is_some() {
-            Some(found.clone())
-        } else {
-            None
+        if !anp::authentication::is_authentication_authorized(document, id) {
+            return None;
         }
+        anp::authentication::find_verification_method(document, id)
     })
 }
 
