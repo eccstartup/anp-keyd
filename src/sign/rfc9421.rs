@@ -7,7 +7,9 @@
 //!
 //! 所以这里的规矩是:
 //!
-//! 1. **覆盖面由 [`required_components`] 决定,不接受调用方输入。**
+//! 1. **覆盖面有一个下限,由 [`required_components`] 决定,不接受调用方输入。**
+//!    调用方可以要求**多**覆盖几个分量(有些 API 就要求签名里带上
+//!    `content-type`),但**不可能少覆盖任何一个** —— 见 [`SignRequest::covered`]。
 //! 2. 请求里凡是会进入签名基的东西(方法、URL、头值)先过一遍边界校验 ——
 //!    签名基是**按行**拼的,一个带 `\n` 的头值能凭空插进一行
 //!    `"@authority": evil.com`,那就等于把覆盖面让给了调用方。
@@ -23,7 +25,7 @@ use crate::error::{KeydError, Result};
 use crate::sign::{LockedSigningKey, Signer};
 
 /// 一条待签的 HTTP 请求。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SignRequest {
     /// HTTP 方法,如 `POST`、`GET`。
     pub method: String,
@@ -32,6 +34,16 @@ pub struct SignRequest {
     pub headers: BTreeMap<String, String>,
     /// 请求体。给了就一定会覆盖 `content-digest`。
     pub body: Option<Vec<u8>>,
+    /// 调用方**额外**要求覆盖的分量,小写。
+    ///
+    /// 这个字段只会让覆盖面**变大**。有些服务端要求签名里必须带上
+    /// `content-type`,或者要求覆盖某个自定义头,那时调用方需要能说
+    /// "请把这个也签上"。
+    ///
+    /// 但它**减不掉** [`required_components`] 里的任何一个 —— 那里的四个是
+    /// 下限,谁说话都不好使。所以这里不是一个"调用方决定覆盖面"的口子,
+    /// 只是"调用方可以请求得更严"。
+    pub covered: Vec<String>,
 }
 
 /// 签完之后的产物。
@@ -72,6 +84,16 @@ impl SignRequest {
         for (name, value) in &self.headers {
             validate_header_name(name)?;
             validate_header_value(name, value)?;
+        }
+        for component in &self.covered {
+            validate_covered_component(component)?;
+            // 要求覆盖一个请求里根本没有的头,是调用方的错,不该等到上游
+            // 报一句 "Invalid signature input" 才知道。
+            if !self.headers.keys().any(|name| name.eq_ignore_ascii_case(component)) {
+                return Err(KeydError::CoveredSetRejected(format!(
+                    "{component:?} was asked for but the request carries no such header"
+                )));
+            }
         }
         self.validate_content_digest()
     }
@@ -121,6 +143,14 @@ pub fn sign_request(
     req.validate()?;
     let required = required_components(req);
 
+    // 下限 ∪ 调用方要求的。顺序是先下限,调用方只能往后加。
+    let mut wanted = required.clone();
+    for component in &req.covered {
+        if !wanted.iter().any(|w| w.eq_ignore_ascii_case(component)) {
+            wanted.push(component.clone());
+        }
+    }
+
     // 把调用方的 `Content-Digest` 摘掉,让上游按**我们自己**看到的 body 重新算。
     // 上面已经校验过它和 body 一致,所以摘掉不会改变结果 —— 但它从此不再可能
     // 是一条由调用方选定的值。
@@ -138,8 +168,9 @@ pub fn sign_request(
             nonce: None,
             created: None,
             expires: None,
-            // 这里就是"守护进程决定"落到实处的地方 —— 这个值不是调用方给的。
-            covered_components: Some(required.clone()),
+            // 这里就是"守护进程决定"落到实处的地方 —— 这个值不是调用方给的,
+            // 调用方最多只能让它变大。
+            covered_components: Some(wanted.clone()),
         },
     )
     .map_err(|e| KeydError::Upstream(format!("preparing the HTTP signature failed: {e}")))?;
@@ -148,8 +179,9 @@ pub fn sign_request(
     let signature_base_text = std::str::from_utf8(signature_base)
         .map_err(|_| KeydError::Protocol("the signature base is not valid UTF-8".into()))?;
 
-    // 在签名**之前**核对:签名基里真正被覆盖的,必须包含我们要的那一组。
-    let covered = verify_covered_set(signature_base_text, &required)?;
+    // 在签名**之前**核对:签名基里真正被覆盖的,必须包含我们要的那一组
+    // (含调用方额外要求的那几个 —— 要求了却没覆盖上,宁可现在失败)。
+    let covered = verify_covered_set(signature_base_text, &wanted)?;
     let signature_base_digest = sha256(signature_base);
 
     let signature = key.sign(signature_base)?;
@@ -378,6 +410,38 @@ fn validate_header_value(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// 调用方额外要求覆盖的分量,只能是这个形状。
+///
+/// 收得这么紧是因为这个字符串会**原样进入 `@signature-params` 那一行的括号里**。
+/// 那里是个结构化字段列表:引号、逗号、分号、括号、空白都是它的结构字符。
+/// 放一个这样的字符进来,就等于让调用方去改写那条列表 —— 而那条列表正是
+/// 覆盖面的权威声明。参数(`;sf` 之类)也因此一并拒绝:支持它得先有一个
+/// 真正解析结构化字段的解析器,而不是把字符串拼进去。
+///
+/// **只能加字段分量(头名),不能加派生分量。** 需要参数的派生分量
+/// (`@query-param";name="x"`)在我们这里没有参数可给,而不需要参数的那三个
+/// (`@method`/`@target-uri`/`@authority`)本来就在下限里,加了也是重复。
+fn validate_covered_component(component: &str) -> Result<()> {
+    if component.starts_with('@') {
+        return Err(KeydError::CoveredSetRejected(format!(
+            "{component:?}: derived components cannot be requested by the caller; the ones that \
+             matter are already mandatory, and the rest need parameters this protocol does not carry"
+        )));
+    }
+
+    if component.is_empty()
+        || !component
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err(KeydError::CoveredSetRejected(format!(
+            "{component:?} is not a plain lowercase component name; parameters and quoting are \
+             not accepted here"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,6 +493,7 @@ mod tests {
             url: "https://example.com/api/agents/alice".into(),
             headers,
             body: body.map(|b| b.to_vec()),
+            covered: Vec::new(),
         }
     }
 
@@ -694,5 +759,117 @@ mod tests {
             signed.covered,
             ["@method", "@target-uri", "@authority", "content-digest"]
         );
+    }
+
+    /// 调用方**可以**要求多覆盖几个分量 —— 有的服务端就要求签名里带上
+    /// `content-type`。这一条确认那个请求真的落到了签名基里。
+    #[test]
+    fn a_caller_may_ask_for_extra_components() {
+        let (key, doc) = fixture(28);
+        let mut req = request(Some(b"body"));
+        req.covered = vec!["content-type".into()];
+
+        let signed = sign_request(&doc, &key, &req).unwrap();
+        assert!(
+            signed.covered.iter().any(|c| c == "content-type"),
+            "{:?}",
+            signed.covered
+        );
+        // 而且四个下限一个不少。
+        for required in ["@method", "@target-uri", "@authority", "content-digest"] {
+            assert!(signed.covered.iter().any(|c| c == required), "{required}");
+        }
+
+        // 加进去之后仍然是有效签名 —— 不是只在字符串上像。
+        let mut headers = req.headers.clone();
+        for (name, value) in &signed.headers {
+            headers.insert(name.clone(), value.clone());
+        }
+        let metadata = anp::authentication::verify_http_message_signature(
+            &doc,
+            &req.method,
+            &req.url,
+            &headers,
+            req.body.as_deref(),
+        )
+        .expect("a signature with an extra component must still verify");
+        assert!(metadata.components.iter().any(|c| c == "content-type"));
+    }
+
+    /// 但**减不掉**下限。
+    ///
+    /// 这是整个模块存在的理由:被 prompt injection 的 agent 最想干的事,
+    /// 就是让签名只覆盖一个无关紧要的分量,然后拿去配别的 body 和 URL。
+    /// 这里把所有能写进 `covered` 的花样都试一遍 —— 要么被直接拒,
+    /// 要么签出来的东西四个下限一个不少。**没有第三种结果。**
+    #[test]
+    fn nothing_a_caller_writes_can_lower_the_covered_set() {
+        let (key, doc) = fixture(29);
+
+        for attempt in [
+            vec!["@method".to_string()],
+            vec!["@method".to_string(), "@authority".to_string()],
+            vec!["x-absent".to_string()],
+            vec!["content-digest".to_string()],
+            vec!["\"@method\"".to_string()],
+            vec!["x-custom".to_string()],
+            Vec::new(),
+        ] {
+            let mut req = request(Some(b"body"));
+            req.headers.insert("x-custom".into(), "v".into());
+            req.covered = attempt.clone();
+
+            let Ok(signed) = sign_request(&doc, &key, &req) else {
+                continue;
+            };
+            for required in ["@method", "@target-uri", "@authority", "content-digest"] {
+                assert!(
+                    signed.covered.iter().any(|c| c == required),
+                    "asking for {attempt:?} dropped {required}; got {:?}",
+                    signed.covered
+                );
+            }
+        }
+    }
+
+    /// 分量名会原样进入 `@signature-params` 的括号里,那里是结构化字段列表。
+    /// 引号、逗号、分号、括号、空格都是它的结构字符 —— 一个都不能放进来。
+    #[test]
+    fn a_component_name_that_could_rewrite_the_covered_set_is_refused() {
+        let (key, doc) = fixture(30);
+
+        for bad in [
+            "\"@method\"",
+            "@method, \"@authority\"",
+            "@method\"",
+            "content-digest;sf",
+            "@query-param",
+            "Content-Type",
+            "x y",
+            "",
+            "@",
+        ] {
+            let mut req = request(None);
+            req.covered = vec![bad.into()];
+            let err = sign_request(&doc, &key, &req).unwrap_err();
+            assert!(
+                matches!(err, KeydError::CoveredSetRejected(_)),
+                "{bad:?} must be refused, got {err:?}"
+            );
+        }
+
+        // 要求覆盖一个请求里没带的头,也是调用方的错 —— 但要给一句能看懂的话。
+        let mut req = request(None);
+        req.covered = vec!["x-absent".into()];
+        let err = sign_request(&doc, &key, &req).unwrap_err();
+        assert!(matches!(err, KeydError::CoveredSetRejected(_)), "{err}");
+
+        // 而正规的形状照过。
+        for good in ["content-type", "x-custom-header", "x.y_z-1"] {
+            let mut req = request(None);
+            req.headers.insert(good.to_string(), "v".into());
+            req.covered = vec![good.into()];
+            assert!(sign_request(&doc, &key, &req).is_ok(), "{good:?}");
+        }
     }
 }
