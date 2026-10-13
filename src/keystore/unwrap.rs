@@ -28,7 +28,7 @@ pub fn unlock(
     passphrase: &[u8],
     device_secret: &LockedBytes,
 ) -> Result<LockedSigningKey> {
-    let seed = open_seed(wrapped, passphrase, device_secret)?;
+    let seed = seed_of(wrapped, passphrase, device_secret)?;
     let key = LockedSigningKey::from_seed(wrapped.id.clone(), seed)?;
 
     // ⑤ 信封上写的公钥必须就是这把 seed 的公钥。
@@ -45,20 +45,13 @@ pub fn unlock(
     Ok(key)
 }
 
-/// 只把 seed 解出来,不造签名密钥。
+/// 解出 seed —— **内部的**那一条。
 ///
-/// 导出路径要的是**那 32 个字节本身** —— 它要能原样再封回一个信封、能写成
-/// 24 个词、能被搬去另一台机器。这些东西一把 `LockedSigningKey` 都给不了,
-/// 而为了它们去给 `LockedSigningKey` 开一个"吐 seed"的口子,等于让签名层
-/// 也变成一条导出通道 —— 那正是这一整块要避免的事。
-///
-/// 所以分成两条:能签名的那条([`unlock`])对外,能拿到材料的那条只给导出
-/// 用,而且只在 `seed-export` 构建里被调用。
-pub fn open_seed(
-    wrapped: &WrappedKey,
-    passphrase: &[u8],
-    device_secret: &LockedBytes,
-) -> Result<LockedBytes> {
+/// [`unlock`] 要它来造签名密钥;导出要的是那 32 个字节本身。两件事在
+/// 密码学上是同一段代码,在**能拿到什么**上完全不同:前者拿到的是一把只会
+/// 签名的东西,后者拿到的是种子。所以这个函数不对外 —— 对外的那个口子
+/// (`open_seed`)只在带 `seed-export` 的构建里存在。
+fn seed_of(wrapped: &WrappedKey, passphrase: &[u8], device_secret: &LockedBytes) -> Result<LockedBytes> {
     wrapped.validate()?;
 
     // ① 重算 AAD 摘要并比对。先于任何密码学。
@@ -85,6 +78,28 @@ pub fn open_seed(
     // ④ DEK 解出 seed。
     let sk_ciphertext = record::decode_b64(&wrapped.sk_ciphertext)?;
     exact32(dek.expose(|d| aead::open(d, &nonce, &aad, &sk_ciphertext))?)
+}
+
+/// 把 seed 解出来给导出用 —— **默认构建里没有这个函数。**
+///
+/// 导出路径要的是**那 32 个字节本身**:它要能原样再封回一个信封、能写成
+/// 24 个词、能被搬去另一台机器。这些东西一把 `LockedSigningKey` 都给不了,
+/// 而为了它们去给 `LockedSigningKey` 开一个"吐 seed"的口子,等于让签名层
+/// 也变成一条导出通道 —— 那正是这一整块要避免的事。
+///
+/// # 这个 `#[cfg]` 不是装饰
+///
+/// 计划要的是"导出在默认构建里根本不存在"。`export-seed` 子命令和
+/// `ops::export` 都在特性后面,但那只挡住了**命令**:一个 `pub` 的解种子
+/// 函数不开特性也一样编进库里,谁链接这个库都能调它换出一把 seed。
+/// 够不到的导出路径才是"不存在"的导出路径。
+#[cfg(feature = "seed-export")]
+pub fn open_seed(
+    wrapped: &WrappedKey,
+    passphrase: &[u8],
+    device_secret: &LockedBytes,
+) -> Result<LockedBytes> {
+    seed_of(wrapped, passphrase, device_secret)
 }
 
 #[cfg(test)]
