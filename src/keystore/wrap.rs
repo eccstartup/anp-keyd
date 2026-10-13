@@ -1,0 +1,189 @@
+//! 信封封装:把一把 seed 变成磁盘上的 `WrappedKey`。
+//!
+//! ```text
+//! KEK ──XChaCha20-Poly1305(nonce, aad)──> DEK  (存密文)
+//! DEK ──XChaCha20-Poly1305(nonce, aad)──> seed (存密文)
+//! ```
+//!
+//! 两层不是装饰。DEK 那一层就是**给硬件留的位置**:将来 SE/TPM 里的 P-256
+//! 密钥可以改去包 KEK,而 seed 那一层的结构一个字都不用动(计划 §2.4)。
+
+use rand::RngCore;
+use zeroize::Zeroize;
+
+use crate::crypto::aead::{self, NONCE_LEN};
+use crate::crypto::hygiene::LockedBytes;
+use crate::crypto::kdf::{self, Argon2Config};
+use crate::error::{KeydError, Result};
+use crate::keystore::record::{
+    self, AeadParams, KeyAlgorithm, KeyId, KdfParams, WrappedKey, RECORD_VERSION,
+};
+
+/// 把一个 seed 封成信封。
+pub fn seal(
+    id: KeyId,
+    algorithm: KeyAlgorithm,
+    public_multibase: String,
+    label: String,
+    passphrase: &[u8],
+    device_secret: &LockedBytes,
+    seed: &LockedBytes,
+    argon: Argon2Config,
+) -> Result<WrappedKey> {
+    let mut salt = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+    let mut nonce = [0u8; NONCE_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+
+    // 先搭出信封骨架 —— 它的头字段就是 AAD 的全部输入。
+    // 走和 `unlock` **同一个** `aad_digest()`,所以两边不可能算岔。
+    let mut wrapped = WrappedKey {
+        version: RECORD_VERSION,
+        id,
+        algorithm,
+        public_multibase,
+        label,
+        kdf: KdfParams {
+            alg: "argon2id".into(),
+            salt: record::encode_b64(&salt),
+            m_cost: argon.m_cost,
+            t_cost: argon.t_cost,
+            p_cost: argon.p_cost,
+        },
+        aead: AeadParams {
+            alg: "xchacha20poly1305".into(),
+            nonce: record::encode_b64(&nonce),
+            aad_digest: String::new(),
+        },
+        dek_ciphertext: String::new(),
+        sk_ciphertext: String::new(),
+        created_at: now_rfc3339(),
+        hardware: None,
+    };
+
+    let aad = wrapped.aad_digest()?;
+    wrapped.aead.aad_digest = record::encode_b64(&aad);
+
+    // 口令派生物用完立刻擦掉,绝不带出这个函数。
+    let mut pass_key = kdf::argon2id(passphrase, &salt, argon.m_cost, argon.t_cost, argon.p_cost)?;
+    let kek = kdf::derive_kek(&pass_key, device_secret, &salt);
+    pass_key.zeroize();
+
+    // 每把 key 一把自己的 DEK,随机生成、不落盘。
+    let dek = LockedBytes::generate()?;
+
+    let dek_ciphertext = dek.expose(|dek_bytes| aead::seal(&kek, &nonce, &aad, dek_bytes))?;
+    wrapped.dek_ciphertext = record::encode_b64(&dek_ciphertext);
+
+    let sk_ciphertext = dek.expose(|dek_bytes| {
+        seed.expose(|seed_bytes| aead::seal(dek_bytes, &nonce, &aad, seed_bytes))
+    })?;
+    wrapped.sk_ciphertext = record::encode_b64(&sk_ciphertext);
+
+    // dek 随 `LockedBytes` 的 Drop 擦除并 munlock。
+    wrapped.validate()?;
+    Ok(wrapped)
+}
+
+fn now_rfc3339() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into())
+}
+
+/// 从 32 字节 seed 构造指纹所需的一切 —— 生成与导入共用的那一步。
+pub fn seed_to_public(seed: &LockedBytes) -> (ed25519_dalek::VerifyingKey, String) {
+    let verifying = seed.expose(|bytes| {
+        ed25519_dalek::SigningKey::from_bytes(bytes).verifying_key()
+    });
+    let multibase = crate::crypto::thumbprint::ed25519_multibase(&verifying);
+    (verifying, multibase)
+}
+
+/// 信封里解出来的负载必须是正好 32 字节。
+///
+/// 这一步在 AEAD 认证**之后** —— 所以走到这里长度还不对,意味着信封本身
+/// 是被人构造出来的,不是口令错。
+pub(crate) fn exact32(mut raw: Vec<u8>) -> Result<LockedBytes> {
+    if raw.len() != 32 {
+        raw.zeroize();
+        return Err(KeydError::Protocol(format!(
+            "envelope payload is {} bytes, expected 32",
+            raw.len()
+        )));
+    }
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(&raw);
+    raw.zeroize();
+    LockedBytes::new(&mut buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::kdf::Argon2Config;
+
+    fn fast() -> Argon2Config {
+        Argon2Config {
+            m_cost: 1024,
+            t_cost: 1,
+            p_cost: 1,
+        }
+    }
+
+    fn id() -> KeyId {
+        KeyId {
+            did: "did:wba:example.com:user:alice:e1_x".into(),
+            kid: "did:wba:example.com:user:alice:e1_x#key-1".into(),
+            thumbprint: "e1_x".into(),
+        }
+    }
+
+    fn device() -> LockedBytes {
+        LockedBytes::fill(|d| *d = [5u8; 32]).unwrap()
+    }
+
+    #[test]
+    fn sealed_envelope_carries_no_plaintext_seed() {
+        let seed = LockedBytes::fill(|d| *d = [0xAB; 32]).unwrap();
+        let (_, multibase) = seed_to_public(&seed);
+
+        let w = seal(
+            id(),
+            KeyAlgorithm::Ed25519,
+            multibase,
+            "alice".into(),
+            b"correct horse battery staple",
+            &device(),
+            &seed,
+            fast(),
+        )
+        .unwrap();
+
+        let json = serde_json::to_string(&w).unwrap();
+        // 磁盘上的 JSON 里不能出现 seed 的十六进制、base64 或十进制形式。
+        assert!(!json.contains("abababab"), "hex seed leaked: {json}");
+        assert!(!json.contains(&record::encode_b64(&[0xAB; 32])));
+        assert!(!json.contains("171"));
+    }
+
+    #[test]
+    fn aad_digest_is_populated_and_self_consistent() {
+        let seed = LockedBytes::fill(|d| *d = [1u8; 32]).unwrap();
+        let (_, multibase) = seed_to_public(&seed);
+        let w = seal(
+            id(),
+            KeyAlgorithm::Ed25519,
+            multibase,
+            "alice".into(),
+            b"pw",
+            &device(),
+            &seed,
+            fast(),
+        )
+        .unwrap();
+
+        assert!(w.verify_aad().is_ok());
+        assert!(!w.aead.aad_digest.is_empty());
+    }
+}

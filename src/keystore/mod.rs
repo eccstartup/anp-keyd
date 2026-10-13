@@ -1,0 +1,13 @@
+//! 密钥库:信封的生成、封装、解开,以及磁盘布局。
+
+pub mod device;
+pub mod layout;
+pub mod record;
+pub mod store;
+pub mod unwrap;
+pub mod wrap;
+
+pub use layout::KeydLayout;
+pub use record::{KeyAlgorithm, KeyId, WrappedKey};
+pub use unwrap::unlock;
+pub use wrap::seal;

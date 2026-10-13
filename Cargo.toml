@@ -1,0 +1,52 @@
+[package]
+name = "anp-keyd"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Local daemon that holds did:wba Ed25519 private keys and signs RFC 9421 HTTP messages on behalf of agents"
+license = "Apache-2.0"
+
+[dependencies]
+# —— 上游接口:did:wba 文档 + supplied-public-key E1 builder + 两阶段签名
+# default-features = false 是关键:默认会拉进 mls(openmls/rusqlite)与 network(reqwest),
+# 一个持有私钥的守护进程不应该有这些。
+anp = { version = "=1.0.6", default-features = false }
+
+# —— 运行时
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "signal", "sync"] }
+
+# —— 内核凭证 / 文件权限
+nix = { version = "0.31", features = ["socket", "user", "fs"] }
+
+# —— 密码学(版本对齐 anp 1.0.6,避免同一 crate 出现两份)
+ed25519-dalek = { version = "=2.1.1", features = ["zeroize", "rand_core"] }
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+subtle = "2"
+
+# —— 内存卫生
+zeroize = { version = "1", features = ["derive"] }
+shrouded = "0.2"
+
+# —— 编码 / 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+bs58 = "0.5"
+# RFC 8785 JSON 规范化:thumbprint 与 AAD 的输入。上游计划写的 `jcs` 在 crates.io 上不存在。
+serde_json_canonicalizer = "0.3"
+time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+
+# —— CLI / 日志
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+
+[features]
+default = []
+# 默认关闭:不带它编译,导出代码在二进制里根本不存在
+seed-export = []
