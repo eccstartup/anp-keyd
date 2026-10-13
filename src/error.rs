@@ -62,7 +62,11 @@ pub enum KeydError {
     ///
     /// 想要细粒度的错误,办法是**别跨这条边界**:同一台机器上直接调
     /// `keystore`,那里分得清。
-    #[error("the daemon refused the request")]
+    ///
+    /// `Display` 把粗码和那一句话都打出来。这不是泄露:两者本来就躺在
+    /// 协议消息里,客户端手上就有 —— 藏起来只会让坐在终端前面的人看到
+    /// 一句"被拒绝了",然后分不清是没解锁、口令错、还是根本没权限。
+    #[error("the daemon refused the request ({code}): {message}")]
     Refused { code: ErrorCode, message: String },
 }
 

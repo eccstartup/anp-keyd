@@ -24,6 +24,13 @@ use crate::daemon::state::DaemonState;
 use crate::daemon::{handlers, wire};
 use crate::error::{KeydError, Result};
 
+/// socket 路径的长度上限,**含结尾的 NUL**。
+///
+/// `sockaddr_un.sun_path` 是定长数组:Linux 上 108,BSD(含 macOS)上
+/// 104。取小的那个,这样这条检查在两种系统上都成立,而不会在 macOS 上
+/// 放过去、到内核那儿才炸。
+const SUN_PATH_MAX: usize = 104;
+
 /// 监听什么、认谁。
 pub struct ServerConfig {
     pub sock_path: PathBuf,
@@ -230,6 +237,19 @@ fn sweep_period(idle: std::time::Duration) -> std::time::Duration {
 /// 也不应该要求一个 runtime 在场。转换是下一步的事。
 pub fn bind(sock_path: &Path) -> Result<std::os::unix::net::UnixListener> {
     use std::os::unix::fs::PermissionsExt;
+
+    // `sockaddr_un.sun_path` 是一个定长数组(BSD 上 104 字节,含结尾的
+    // NUL),所以 socket 路径有硬上限。超了的话,内核回的是
+    // "path must be shorter than SUN_LEN" —— 既不说是哪条路径,也不说是
+    // 多少,而人手上能做的调整只有"把 --root 挪浅一点"。这里把那句话补全。
+    let length = sock_path.as_os_str().as_encoded_bytes().len();
+    if length >= SUN_PATH_MAX {
+        return Err(KeydError::Protocol(format!(
+            "the socket path {} is {length} bytes, and the kernel's limit for one is \
+             {SUN_PATH_MAX} (including the terminator) — move --root somewhere shallower",
+            sock_path.display()
+        )));
+    }
 
     if let Some(parent) = sock_path.parent() {
         std::fs::create_dir_all(parent)?;

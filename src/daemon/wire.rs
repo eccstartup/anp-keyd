@@ -66,6 +66,29 @@ pub enum ErrorCode {
     Internal = 0x00FF,
 }
 
+impl std::fmt::Display for ErrorCode {
+    /// 给坐在终端前面的人看的短名。
+    ///
+    /// 这些码**本来就是线上的字节**,客户端一定拿得到 —— 把它们印出来
+    /// 不泄露任何协议没说过的信息,而不印出来就只剩一句"被拒绝了",
+    /// 人分不清是没解锁、口令错、还是没权限。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ErrorCode::BadCredential => "bad credential",
+            ErrorCode::AadMismatch => "aad mismatch",
+            ErrorCode::KeyNotFound => "key not found",
+            ErrorCode::KeyExists => "key exists",
+            ErrorCode::Locked => "locked",
+            ErrorCode::Permission => "permission",
+            ErrorCode::RawDisabled => "raw signing disabled",
+            ErrorCode::CoveredSetRejected => "covered set rejected",
+            ErrorCode::Protocol => "protocol",
+            ErrorCode::Did => "did",
+            ErrorCode::Internal => "internal",
+        })
+    }
+}
+
 impl ErrorCode {
     pub fn as_u16(self) -> u16 {
         self as u16
