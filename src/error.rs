@@ -21,8 +21,12 @@ pub enum KeydError {
     Locked,
 
     // —— 身份 / peer ——
-    #[error("peer credential could not be read")]
-    PeerCredentialUnavailable,
+    ///
+    /// 这一条**带**细节,和上面的口令类错误不一样:拿不到对端凭证是本地
+    /// syscall 失败,errno 里没有秘密,丢掉它只会让"平台不支持"看起来
+    /// 像"权限被拒"。
+    #[error("peer credential could not be read: {0}")]
+    PeerCredentialUnavailable(String),
     #[error("peer is not permitted to use key {0}")]
     Permission(String),
 

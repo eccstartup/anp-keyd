@@ -18,6 +18,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macro
 # —— 内核凭证 / 文件权限
 nix = { version = "0.31", features = ["socket", "user", "fs"] }
 
+# —— 第三层:可执行文件身份。macOS 上要经 CoreFoundation 调 Security.framework
+# 的 SecCode API,把对端的 audit token 换成 cdhash。
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+core-foundation-sys = "0.8"
+
 # —— 密码学(版本对齐 anp 1.0.6,避免同一 crate 出现两份)
 ed25519-dalek = { version = "=2.1.1", features = ["zeroize", "rand_core"] }
 argon2 = "0.5"
