@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
+use crate::audit::{AuditLog, Event};
 use crate::daemon::autolock::Autolock;
 use crate::daemon::peer::PeerPolicy;
 use crate::daemon::wire::{KeySummary, UnlockedKey};
@@ -48,6 +49,17 @@ impl Roots {
         match self {
             Roots::Single(layout) => Ok(KeydLayout::at(layout.root().to_path_buf())),
             Roots::PerUid => KeydLayout::system(uid),
+        }
+    }
+
+    /// 服务方自己的审计目录。
+    ///
+    /// 被拒的连接记到这里,而不是被拒那位自己的目录:多数情况下我们根本
+    /// 写不进去,而且往别人家里写日志也不是这个进程该做的事。
+    pub fn service_audit_dir(&self) -> std::path::PathBuf {
+        match self {
+            Roots::Single(layout) => layout.audit_dir(),
+            Roots::PerUid => std::path::PathBuf::from("/var/lib/anp-keyd/audit"),
         }
     }
 }
@@ -185,11 +197,58 @@ pub struct DaemonState {
     /// `--allow-raw-signing`。默认 false,打开之后每次原始签名都留痕。
     raw_signing: bool,
     vaults: Mutex<BTreeMap<u32, Vault>>,
+    /// **一个目录一个 [`AuditLog`]**,按路径索引。
+    ///
+    /// 不能每个 vault 自己攥一个:同一个文件上放两个 `AuditLog`,它们各自
+    /// 记着不同的 `seq` 和 `tail`,写出来的行接不上,链当场就断了 ——
+    /// 而链断了恰恰是我们用来发现篡改的那个信号,自己造一个假阳性最糟。
+    audits: Mutex<BTreeMap<std::path::PathBuf, AuditLog>>,
 }
 
 impl DaemonState {
     pub fn new(roots: Roots, policy: PeerPolicy, autolock: Autolock, raw_signing: bool) -> Self {
-        Self { roots, policy, autolock, raw_signing, vaults: Mutex::new(BTreeMap::new()) }
+        Self {
+            roots,
+            policy,
+            autolock,
+            raw_signing,
+            vaults: Mutex::new(BTreeMap::new()),
+            audits: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// 往某个目录的审计日志里追加一条。
+    ///
+    /// 日志按需打开,而打开会把整条链验一遍 —— 所以"审计被人动过"会在
+    /// **第一次要写它的时候**就炸出来,而不是等到某天有人去查。
+    fn append_audit(&self, dir: &std::path::Path, event: &Event) -> Result<()> {
+        let mut audits = self
+            .audits
+            .lock()
+            .map_err(|_| KeydError::Protocol("the audit lock was poisoned".into()))?;
+
+        if !audits.contains_key(dir) {
+            audits.insert(dir.to_path_buf(), AuditLog::open(dir)?);
+        }
+        let log = audits
+            .get_mut(dir)
+            .ok_or_else(|| KeydError::Protocol("the audit log vanished mid-append".into()))?;
+        log.append(event)
+    }
+
+    /// 记一件发生在某个 uid 命名空间里的事。
+    pub fn record(&self, uid: u32, event: &Event) -> Result<()> {
+        let dir = self.layout_for(uid)?.audit_dir();
+        self.append_audit(&dir, event)
+    }
+
+    /// 记一件服务方自己的事(被拒的连接)。
+    ///
+    /// 拒绝发生在"这个 uid 是谁"还没确定或者确定下来是**别人**的时候,
+    /// 所以它不能记到对方的目录里去。
+    pub fn record_service(&self, event: &Event) -> Result<()> {
+        let dir = self.roots.service_audit_dir();
+        self.append_audit(&dir, event)
     }
 
     pub fn policy(&self) -> &PeerPolicy {
@@ -250,22 +309,40 @@ impl DaemonState {
     /// 后台清扫:把每个 vault 里空闲太久的钥匙放掉。
     ///
     /// 返回被放掉的总数,纯粹是为了让测试和日志看得见。
+    ///
+    /// 每次真的收走东西都留痕 —— "钥匙在我不知道的时候没了"和"它超时了"
+    /// 必须是能分开的两件事,否则用户看到签名突然要求重新解锁会无从判断。
     pub fn sweep_all(&self, now: Instant) -> usize {
         let autolock = self.autolock;
-        let mut vaults = match self.vaults.lock() {
-            Ok(vaults) => vaults,
-            // 毒化的锁说明别的线程在改状态时 panic 了。清扫不是要紧事,
-            // 跳过它 —— 但**不**去 unwrap,那会把一个已经在恢复的进程再炸一次。
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut dropped_per_uid = Vec::new();
 
-        let mut dropped = 0;
-        for vault in vaults.values_mut() {
-            let before = vault.unlocked.len();
-            vault.sweep(autolock, now);
-            dropped += before - vault.unlocked.len();
+        {
+            let mut vaults = match self.vaults.lock() {
+                Ok(vaults) => vaults,
+                // 毒化的锁说明别的线程在改状态时 panic 了。清扫不是要紧事,
+                // 跳过它 —— 但**不**去 unwrap,那会把一个已经在恢复的进程再炸一次。
+                Err(poisoned) => poisoned.into_inner(),
+            };
+
+            for (uid, vault) in vaults.iter_mut() {
+                let before = vault.unlocked.len();
+                vault.sweep(autolock, now);
+                let dropped = before - vault.unlocked.len();
+                if dropped > 0 {
+                    dropped_per_uid.push((*uid, dropped));
+                }
+            }
         }
-        dropped
+
+        let mut total = 0;
+        for (uid, dropped) in dropped_per_uid {
+            total += dropped;
+            // 记不进去不该让清扫失败 —— 钥匙已经收了,那才是要紧的事。
+            if let Err(error) = self.record(uid, &Event::Swept { dropped }) {
+                tracing::error!(uid, "the sweep could not be recorded: {error}");
+            }
+        }
+        total
     }
 
     /// 结构化签名 —— 签名基由 [`rfc9421::sign_request`] 重建,覆盖面由它决定。

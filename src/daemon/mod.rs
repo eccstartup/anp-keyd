@@ -4,8 +4,10 @@
 //! 它可以是同一个用户下的另一个 agent —— 它拿得到 socket,但它不该拿得到钥匙。
 
 pub mod autolock;
+pub mod handlers;
 pub mod peer;
 pub mod state;
 pub mod wire;
 
+pub use handlers::handle;
 pub use peer::{authorize, peer_identity, self_uid, PeerIdentity};

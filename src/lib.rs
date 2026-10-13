@@ -2,6 +2,7 @@
 //!
 //! **agent 手里从来没有私钥字节。** 这个 crate 的全部结构都在服务这一句话。
 
+pub mod audit;
 pub mod crypto;
 pub mod daemon;
 pub mod did;
