@@ -19,7 +19,7 @@ use tokio::net::UnixListener;
 use tokio::sync::watch;
 
 use crate::audit::Event;
-use crate::daemon::peer::{peer_identity, self_uid, PeerPolicy};
+use crate::daemon::peer::{binary_identity, peer_identity, self_uid, PeerPolicy};
 use crate::daemon::state::DaemonState;
 use crate::daemon::{handlers, wire};
 use crate::error::{KeydError, Result};
@@ -40,8 +40,25 @@ pub struct ServerConfig {
 /// 跑起来,直到收到停机信号。
 ///
 /// 返回时 socket 文件已经删掉、内存里的钥匙已经全部放掉。
-pub async fn serve(state: Arc<DaemonState>, config: ServerConfig, mut stop: watch::Receiver<bool>) -> Result<()> {
-    let listener = as_tokio(bind(&config.sock_path)?)?;
+pub async fn serve(state: Arc<DaemonState>, config: ServerConfig, stop: watch::Receiver<bool>) -> Result<()> {
+    let listener = bind(&config.sock_path)?;
+    serve_on(state, config, stop, listener).await
+}
+
+/// 用**已经绑好的** listener 跑起来。
+///
+/// 和 [`serve`] 分开,是为了让 `serve` 那条路能把"绑定"插在"写 pid 文件"
+/// 前面:绑定成功才是这个 socket 的守护进程,所以"我在这个 pid 上"这句话
+/// 只有绑上了才配写下来。顺序反过来的话,一个注定失败的第二个 `serve`
+/// 会先覆盖**正在跑的那个**的 pid 文件,再在退出时把它删掉 —— 于是 `stop`
+/// 会对着一个活得好好的守护进程说"nothing is running"。
+pub async fn serve_on(
+    state: Arc<DaemonState>,
+    config: ServerConfig,
+    mut stop: watch::Receiver<bool>,
+    listener: std::os::unix::net::UnixListener,
+) -> Result<()> {
+    let listener = as_tokio(listener)?;
     tracing::info!(sock = %config.sock_path.display(), "listening");
 
     let sweeper = {
@@ -188,9 +205,54 @@ fn refuse(
         tracing::error!("a refused connection could not be recorded: {audit_error}");
     }
 
+    // 被拒的这一刻,是对端 pin **唯一的出处**。
+    //
+    // `--system` 下没给 `--allow-binary` 就直接拒绝启动,所以人要配第三层
+    // 就得先拿到那个值;而那个值只能从"跑一次、被拒一次"里来。日志里这
+    // 一行是可以直接抄进命令行的。
+    //
+    // 不写进上面的审计事件:那个结构的形状和哈希链绑在一起,而 pin 是
+    // 给人看的东西 —— 两件事没必要用同一条通道。
+    log_the_pin_we_would_need(stream, error);
+
     // 应答能不能写出去不影响拒绝本身 —— 对端可能在拒绝的这一刻已经走了。
     let _ = wire::write_response(stream, &wire::Response::from_error(error));
     Ok(())
+}
+
+/// 把"要给这个对端放行,该往 `--allow-binary` 里写什么"打进日志。
+///
+/// 三件事分开说,因为它们**要人做的事不一样**:能 pin 的给出那一行;
+/// 没有代码签名的明确说 pin 不了(免得人对着日志找不存在的值);
+/// 问不到说问不到。
+fn log_the_pin_we_would_need(stream: &std::os::unix::net::UnixStream, error: &KeydError) {
+    let Ok(peer) = peer_identity(stream) else {
+        tracing::warn!(denied = %error.wire_message(), "refused a connection, and its uid could not be read");
+        return;
+    };
+
+    match binary_identity(stream, &peer) {
+        Ok(Some(identity)) => {
+            let (kind, digest) = identity.pin();
+            let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+            tracing::warn!(
+                denied = %error.wire_message(),
+                peer = %identity.audit_label(),
+                "refused a connection; to admit this binary, give the daemon: --allow-binary {kind}:{hex}"
+            );
+        }
+        Ok(None) => tracing::warn!(
+            denied = %error.wire_message(),
+            peer = %peer.audit_label(),
+            "refused a connection; this binary carries no code signature, so it cannot be pinned \
+             with --allow-binary at all"
+        ),
+        Err(identity_error) => tracing::warn!(
+            denied = %error.wire_message(),
+            peer = %peer.audit_label(),
+            "refused a connection, and its binary identity could not be read: {identity_error}"
+        ),
+    }
 }
 
 /// 定期把空闲太久的钥匙放掉。
@@ -244,7 +306,7 @@ pub fn bind(sock_path: &Path) -> Result<std::os::unix::net::UnixListener> {
     // 多少,而人手上能做的调整只有"把 --root 挪浅一点"。这里把那句话补全。
     let length = sock_path.as_os_str().as_encoded_bytes().len();
     if length >= SUN_PATH_MAX {
-        return Err(KeydError::Protocol(format!(
+        return Err(KeydError::Misuse(format!(
             "the socket path {} is {length} bytes, and the kernel's limit for one is \
              {SUN_PATH_MAX} (including the terminator) — move --root somewhere shallower",
             sock_path.display()
@@ -261,7 +323,7 @@ pub fn bind(sock_path: &Path) -> Result<std::os::unix::net::UnixListener> {
         // 和"上次崩溃留下的死文件" —— 只看文件在不在是分不出来的。
         match std::os::unix::net::UnixStream::connect(sock_path) {
             Ok(_) => {
-                return Err(KeydError::Protocol(format!(
+                return Err(KeydError::Misuse(format!(
                     "{} is already served by another anp-keyd; refusing to start a second one",
                     sock_path.display()
                 )))

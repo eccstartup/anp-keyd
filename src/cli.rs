@@ -44,12 +44,14 @@ const DEFAULT_IDLE_SECS: u64 = 900;
 #[command(
     name = "anp-keyd",
     version,
-    about = "持有 did:wba Ed25519 私钥、替 agent 签 RFC 9421 消息签名的本地守护进程",
-    long_about = "agent 手里从来没有私钥字节:私钥只住在守护进程的内存里,agent 通过 Unix \
-                  socket 请求签名,而签名基由守护进程自己重建。"
+    about = "Local daemon that holds did:wba Ed25519 private keys and signs RFC 9421 messages for agents",
+    long_about = "An agent never holds private key bytes: the keys live only in the daemon's memory, \
+                  the agent asks for signatures over a Unix socket, and the daemon rebuilds the \
+                  signature base itself.",
+    help_template = help_template()
 )]
 pub struct Cli {
-    /// 覆盖密钥目录(默认 `~/.anp-keyd`)。
+    /// Override the key directory (default `~/.anp-keyd`).
     #[arg(long, global = true, value_name = "DIR")]
     pub root: Option<PathBuf>,
 
@@ -57,69 +59,159 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// `--help` 的模板。
+///
+/// clap 4 的 help 生成器只支持整个子命令列表**一个**标题
+/// (`Command::subcommand_help_heading`),没法把一个列表切成几节。所以这里
+/// 不用 `{subcommands}`,按信任关系手写几节。代价是**加子命令时这里要跟着
+/// 改**,`every_subcommand_is_listed_in_the_help_template` 那条测试就是盯这个的。
+///
+/// 分节的依据是模块头那条分界线:`serve` 是守护进程本体;`sign` / `list` /
+/// `status` / `lock` 走 socket 且不要口令,agent 够得着;`unlock` 也走 socket
+/// 但口令只从终端读,单独一节;其余的在人的进程里开信封,agent 够不着。
+///
+/// 特性门控的两条只在对应构建里存在,所以按 `#[cfg]` 追加,不能写死进来 ——
+/// 默认构建的 help 里出现一条敲了也没用的命令,比不列更糟。
+fn help_template() -> String {
+    let mut text = String::from(
+        "{before-help}{about-with-newline}\n\
+         {usage-heading} {usage}\n\
+         \n\
+         Commands:\n\
+         \n\
+         \x20 serve               Run the daemon: answer signing requests over a Unix socket.\n\
+         \x20 stop                Stop the daemon `serve` left running in the background.\n\
+         \n\
+         For agents — over the socket, no passphrase:\n\
+         \x20 sign                Sign one RFC 9421 request, print the signature headers to stdout.\n\
+         \x20 list                List the keys on this machine.\n\
+         \x20 status              List the unlocked keys and how long they have been unlocked.\n\
+         \x20 lock                Lock.\n\
+         \n\
+         Sets the passphrase — do this yourself, in your own terminal:\n\
+         \x20 unlock              Unlock a key.\n\
+         \n\
+         Identity and documents — in your own terminal:\n\
+         \x20 spec                Write a document spec file (a template to edit).\n\
+         \x20 keygen              Generate a new did:wba key, write the envelope into `keys/`.\n\
+         \x20 publish             Build the document from the spec, self-sign a proof, write did.json.\n\
+         \x20 verify-doc          Check that a document really belongs to the DID it claims.\n\
+         \x20 probe               Check whether this machine can keep the tool's promises.\n\
+         \n\
+         Keys and DID lifecycle:\n\
+         \x20 add-recovery-key    Add a recovery key to a DID (pre-authorize one migration).\n\
+         \x20 rotate-hot-key      Rotate the hot key used for everyday signing.\n\
+         \x20 remove-key          Remove a non-binding key from the document.\n\
+         \x20 migrate             Migrate to a new DID: the old document is deactivated and points at it.\n\
+         \x20 deactivate          Permanently deactivate a DID, optionally naming a successor.\n\
+         \n\
+         Backup and restore:\n\
+         \x20 import-mnemonic     Restore a binding key from 24 words, re-wrap it for this machine.\n\
+         \x20 import-archive      Restore from an encrypted archive.\n",
+    );
+
+    // 特性门控的那两行单独列 —— 默认构建里它们不该出现在 help 里,一条敲了
+    // 也没用的命令比不列更糟。用数组 + `#[cfg]` 而不是往 String 上 push,
+    // 是为了两个特性都关掉时不出现 `unused_mut`。
+    const GATED: &[&str] = &[
+        #[cfg(feature = "seed-export")]
+        "\x20 export-seed         Export a key's seed (the 24 words and/or an archive).\n",
+        #[cfg(feature = "mcp")]
+        "\x20 mcp                 Speak MCP on stdin/stdout, for an MCP client to launch.\n",
+    ];
+    if !GATED.is_empty() {
+        text.push_str("\nOnly in builds with a feature flag:\n");
+        for line in GATED {
+            text.push_str(line);
+        }
+    }
+
+    // 「Options:」这个标题得自己写:`{options}` 只把参数打出来,带标题的那个
+    // 是 `{all-args}`,而 `{all-args}` 会连带打出 clap 自己那份**没分节**的
+    // 子命令列表 —— 正是上面要避开的那一样。
+    text.push_str("\nOptions:\n\n{options}{after-help}");
+    text
+}
+
+/// 变体的顺序要跟 `help_template()` 里那几节对得上。
+///
+/// (枚举本身的文档注释**不会**进 help —— clap 只把变体上的注释当作命令
+/// 说明。所以这里可以继续用中文记理由,用户看不到。)
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// 常驻:在 Unix socket 上服务签名请求。
+    /// Run the daemon: answer signing requests over a Unix socket.
     Serve(ServeArgs),
-    /// 生成一把新的 did:wba 密钥,把信封写进 `keys/`。
-    Keygen(KeygenArgs),
-    /// 写一份**文档规格文件** —— 从一份模板开始,之后就归你改。
-    ///
-    /// 规格文件是"这份文档该有什么"的唯一来源(域名、路径、service 声明),
-    /// 而 `keygen` / `publish` 读它、不猜它。这条命令只是给手写减负:
-    /// 坐标的几条规则(域名不能是 IP、路径段必须 URL 安全)在这里当场查,
-    /// 而不是等到钥匙都生成出来了才在别处报错。
-    Spec(SpecArgs),
-    /// 给文档盖上自签 proof,写出 did.json。
-    Publish(PublishArgs),
-    /// 校验一份文档确实是它自称的那个 DID 的文档。
-    VerifyDoc(VerifyDocArgs),
-    /// 列出这台机器上的钥匙。
-    List,
-    /// 列出当前已解锁的钥匙,以及各自解锁了多久。
-    Status,
-    /// 体检:这台机器能不能兑现这个工具给出的承诺。
-    ///
-    /// **不打印任何密钥材料。** 计划里这一条是"dump 锁定区",换做法的理由
-    /// 见 `ops::probe` 的模块头 —— 一句话:跨进程读不到(那正是 mlock 在
-    /// 起作用),而进程内自测会把私钥打到 stdout,那个口子 `export-seed`
-    /// 在默认构建里是根本不存在的。
-    Probe(ProbeArgs),
-    /// 解锁一把钥匙。
-    Unlock(UnlockArgs),
-    /// 上锁。
-    Lock(LockArgs),
-    /// 签一条 RFC 9421 请求,把签名头打到 stdout。
+    /// Stop the daemon that `serve` left running in the background.
+    Stop,
+
+    /// Sign one RFC 9421 request, print the signature headers to stdout.
     Sign(SignArgs),
-    /// 给一个 DID 加一把恢复密钥(预授权签一次迁移)。
+    /// List the keys on this machine.
+    List,
+    /// List the unlocked keys and how long they have been unlocked.
+    Status,
+    /// Lock.
+    Lock(LockArgs),
+
+    // 也走 socket,但和上面四条不同:口令只从终端读,所以这一步是人做的,
+    // agent 做不了也不该做。
+    /// Unlock a key (reads the passphrase from the terminal).
+    Unlock(UnlockArgs),
+
+    // 规格文件是"这份文档该有什么"的唯一来源(域名、路径、service 声明),
+    // 而 `keygen` / `publish` 读它、不猜它。这条命令只是给手写减负:坐标的
+    // 几条规则(域名不能是 IP、路径段必须 URL 安全)在这里当场查,而不是等到
+    // 钥匙都生成出来了才在别处报错。
+    /// Write a **document spec file** — start from a template, edit it from there.
+    Spec(SpecArgs),
+    /// Generate a new did:wba key, write the envelope into `keys/`.
+    Keygen(KeygenArgs),
+    /// Build the document from the spec, self-sign a proof, write did.json.
+    Publish(PublishArgs),
+    /// Check that a document really belongs to the DID it claims.
+    VerifyDoc(VerifyDocArgs),
+    // 计划里这一条是"dump 锁定区",换做法的理由见 `ops::probe` 的模块头 ——
+    // 一句话:跨进程读不到(那正是 mlock 在起作用),而进程内自测会把私钥打到
+    // stdout,那个口子 `export-seed` 在默认构建里是根本不存在的。
+    /// Check whether this machine can keep the promises the tool makes.
+    ///
+    /// Prints no key material at all — safe to paste the output into an issue.
+    Probe(ProbeArgs),
+
+    /// Add a recovery key to a DID (pre-authorize one migration).
     AddRecoveryKey(AddRecoveryKeyArgs),
-    /// 轮换日常签名用的热密钥。
+    /// Rotate the hot key used for everyday signing.
     RotateHotKey(RotateHotKeyArgs),
-    /// 从文档里摘掉一把非绑定密钥。
+    /// Remove a non-binding key from the document.
     RemoveKey(RemoveKeyArgs),
-    /// 迁移到一个新 DID:旧文档标记为已注销并指向它。
+    /// Migrate to a new DID: the old document is deactivated and points at it.
     Migrate(MigrateArgs),
-    /// 永久注销一个 DID,可以顺手指向一个后继。
+    /// Permanently deactivate a DID, optionally naming a successor.
     Deactivate(DeactivateArgs),
-    /// 从 24 个词恢复一把绑定密钥,并把它重新封进这台机器的信封。
+
+    /// Restore a binding key from 24 words, re-wrap it for this machine.
     ImportMnemonic(ImportMnemonicArgs),
-    /// 从一个加密归档恢复。
+    /// Restore from an encrypted archive.
     ImportArchive(ImportArchiveArgs),
-    /// 把一把钥匙的种子导出来 —— **只有带 `seed-export` 特性构建的二进制里
-    /// 有这条命令**。
+
+    // 默认构建里它不存在,不是"被拒绝",是**没有这段代码**:没有分支、没有
+    // 环境变量、没有可翻的开关。简言之,一个能一键把整把身份抽干的接口,是
+    // agent 被注入之后最想找的那个东西。
+    //
+    // 这条命令**没有** `--password`:口令只从终端读。argv 会被 `ps` 看到,
+    // 环境变量会被同 uid 的进程在 `/proc/<pid>/environ` 里读到。
+    /// Export a key's seed — **only in a build with the `seed-export` feature**.
     ///
-    /// 默认构建里它不存在,不是"被拒绝",是**没有这段代码**:没有分支、
-    /// 没有环境变量、没有可翻的开关。理由见模块头 —— 简言之,一个能一键
-    /// 把整把身份抽干的接口,是 agent 被注入之后最想找的那个东西。
-    ///
-    /// 这条命令**没有** `--password`:口令只从终端读。argv 会被 `ps` 看到,
-    /// 环境变量会被同 uid 的进程在 `/proc/<pid>/environ` 里读到。
+    /// Not in the default build: not "refused", absent — no branch, no
+    /// environment variable, no switch to flip.
     #[cfg(feature = "seed-export")]
     ExportSeed(ExportSeedArgs),
-    /// 在 stdin/stdout 上跑 MCP 服务 —— **只有带 `mcp` 特性构建的二进制里有**。
+    // 这是给 **MCP 客户端的配置位**用的:配置里那一行 `command` 就指向这个
+    // 子命令。它自己不开密钥库,只把四个工具转发给守护进程(见 `mcp` 模块)。
+    /// Speak MCP on stdin/stdout — **only in a build with the `mcp` feature**.
     ///
-    /// 这是给 **MCP 客户端的配置位**用的:配置里那一行 `command` 就指向这个
-    /// 子命令。它自己不开密钥库,只把四个工具转发给守护进程(见 `mcp` 模块)。
+    /// This is what an MCP client's config points at. It opens no keystore of
+    /// its own; it forwards four tools to the daemon.
     #[cfg(feature = "mcp")]
     Mcp(McpArgs),
 }
@@ -127,45 +219,59 @@ pub enum Command {
 #[cfg(feature = "mcp")]
 #[derive(Args, Debug)]
 pub struct McpArgs {
-    /// socket 路径(默认按目录布局推导)。
+    /// Socket path (derived from the directory layout by default).
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
 pub struct ProbeArgs {
-    /// 顺便报一下这个 DID 的信封:kid、thumbprint、磁盘上那份能不能读回来。
-    /// 全是公开信息,不需要口令。
+    /// Also report this DID's envelope: kid, thumbprint, and whether the copy on
+    /// disk reads back. All of it is public — no passphrase needed.
     #[arg(long)]
     pub did: Option<String>,
 }
 
 #[derive(Args, Debug)]
 pub struct ServeArgs {
-    /// socket 路径(默认按目录布局推导)。
+    /// Socket path (derived from the directory layout by default).
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
 
-    /// 多用户系统服务:每个 uid 一个命名空间,根在 `/var/lib/anp-keyd/users/<uid>`。
+    /// Multi-user system service: one namespace per uid, rooted at
+    /// `/var/lib/anp-keyd/users/<uid>`.
     #[arg(long)]
     pub system: bool,
 
-    /// 空闲多少秒后自动上锁。`0` 是**立刻**上锁,不是"永不"。
+    /// Stay in this terminal instead of going to the background.
+    ///
+    /// Without it the command hands the terminal straight back and the daemon
+    /// keeps running. Service managers (launchd, systemd) need this flag — they
+    /// supervise a process, they do not want one that forks away from them.
+    #[arg(long)]
+    pub foreground: bool,
+
+    /// Lock everything after this many idle seconds. `0` means lock
+    /// **immediately**, not "never".
     #[arg(long, default_value_t = DEFAULT_IDLE_SECS, value_name = "SECS")]
     pub idle: u64,
 
-    /// 打开原始字节签名那条路。默认关着 —— 打开之前请先读文档。
+    /// Open the raw-bytes signing path. Off by default — read the docs before
+    /// turning it on.
     #[arg(long)]
     pub allow_raw_signing: bool,
 
-    /// 除本进程的 uid 之外,还允许哪些 uid 连上来(可重复)。
+    /// Besides this process's own uid, which uids may connect (repeatable).
     #[arg(long = "allow-uid", value_name = "UID")]
     pub allow_uids: Vec<u32>,
 
-    /// 允许的可执行文件身份,`cdhash:<hex>` 或 `sha256:<hex>`(可重复)。
+    /// Allowed executable identities, `cdhash:<hex>` or `sha256:<hex>`
+    /// (repeatable).
     ///
-    /// 不给就是**不启用第三层**。多用户部署里这一条不能省:同一个 uid 下
-    /// 还可能有别的 agent,而它们正是"防同 uid"要防的对象。
+    /// Required with `--system`: a system daemon serves several uids, and the
+    /// uid alone does not say which program is asking. Do not know the value
+    /// yet? Start it once without this flag, then read the `--allow-binary` line
+    /// the daemon writes into its log for every connection it refuses.
     #[arg(long = "allow-binary", value_name = "PIN")]
     pub allow_binaries: Vec<String>,
 }
@@ -182,141 +288,171 @@ impl ServeArgs {
 
 #[derive(Args, Debug)]
 pub struct KeygenArgs {
-    /// 文档规格文件(JSON)。坐标和 service 声明都从它来。
+    /// The document spec file (JSON). Coordinates and service declarations come
+    /// from it.
     ///
-    /// 没有它就没法生成:DID 是"坐标 + 公钥"算出来的,而坐标必须是**你
-    /// 写在文件里的**那几个,不能由工具替你挑。要一份起步的模板用
-    /// `anp-keyd spec --help`。
+    /// Without it there is nothing to generate: a DID is "coordinates + public
+    /// key", and the coordinates have to be the ones **you** wrote down, not the
+    /// ones the tool picked for you. For a starter template, see
+    /// `anp-keyd spec --help`.
     #[arg(long, value_name = "FILE")]
     pub spec: PathBuf,
 
-    /// 人读的标签。它进 AAD,所以改它要重封,不是改个注释。
+    /// A human-readable label. It goes into the AAD, so changing it means
+    /// re-wrapping — it is not a comment.
     #[arg(long, default_value = "default", value_name = "LABEL")]
     pub label: String,
 }
 
 #[derive(Args, Debug)]
 pub struct SpecArgs {
-    /// 你控制的域名。IP 字面量会被拒 —— did:wba 要求 FQDN。
+    /// The domain you control. IP literals are refused — did:wba requires an
+    /// FQDN.
     #[arg(long, value_name = "HOST")]
     pub host: String,
 
-    /// `e1_` 段之前的路径,用 `/` 分隔(如 `agents/mybot`)。
+    /// The path before the `e1_` segment, `/`-separated (e.g. `agents/mybot`).
     #[arg(long, value_name = "A/B")]
     pub path: String,
 
-    /// 非默认端口。
+    /// A non-default port.
     #[arg(long, value_name = "PORT")]
     pub port: Option<u16>,
 
-    /// 文档要声明的 agent description 地址。
+    /// The agent description URL the document should declare.
     #[arg(long, value_name = "URL")]
     pub agent_description_url: Option<String>,
 
-    /// 写到哪里。不给就打到 stdout。
+    /// Where to write it. Without it, stdout.
     #[arg(long, value_name = "FILE")]
     pub out: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
 pub struct PublishArgs {
+    /// The DID to publish.
     #[arg(long, value_name = "DID")]
     pub did: String,
 
-    /// 文档规格文件。**不给就沿用本地那份文档里的声明** —— 重发文档不该
-    /// 顺手把 service 条目清掉,那是不报错的丢东西。
+    // 不给就是**沿用本地那份文档里的声明** —— 重发文档不该顺手把 service
+    // 条目清掉,那是不报错的丢东西。
+    //
+    // 给了的话,它的坐标必须和 `--did` 说的一致(对不上直接拒,而不是挑一个
+    // 信):拿一个 DID 去签另一个地方的文档,是这里最贵的一种错。
+    /// The document spec file.
     ///
-    /// 给了的话,它的坐标必须和 `--did` 说的一致(对不上直接拒,而不是
-    /// 挑一个信):拿一个 DID 去签另一个地方的文档,是这里最贵的一种错。
+    /// **Without it, the declarations already in the local document are reused** —
+    /// republishing should not quietly drop service entries, which is losing data
+    /// without an error. If given, its coordinates must match `--did`: a mismatch
+    /// is refused rather than guessed, because signing another site's document
+    /// with this DID is the most expensive mistake available here.
     #[arg(long, value_name = "FILE")]
     pub spec: Option<PathBuf>,
 
-    /// 写到哪里。不给就写进本地 `dids/`。
+    /// Where to write it. Without it, the local `dids/`.
     #[arg(long, value_name = "DIR")]
     pub out: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
 pub struct VerifyDocArgs {
+    /// The DID to check.
     #[arg(long, value_name = "DID")]
     pub did: String,
 
-    /// 要验的文档。不给就验本地那一份。
+    /// The document to verify. Without it, the local copy.
     #[arg(long, value_name = "PATH")]
     pub file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
 pub struct UnlockArgs {
+    /// The DID to unlock.
     #[arg(long, value_name = "DID")]
     pub did: String,
 
-    /// 只解这一把,写 fragment(`key-2`、`recovery-1`……)。
+    // 不给就是 `--did` 名下默认那把,也就是**绑定密钥** —— 一个 DID 上后来
+    // 挂的热密钥不会让老调用方不知不觉换了把钥匙签名。
+    /// Unlock only this one, by fragment (`key-2`, `recovery-1`, ...).
     ///
-    /// 不给就是 `--did` 名下默认那把,也就是**绑定密钥** —— 一个 DID 上
-    /// 后来挂的热密钥不会让老调用方不知不觉换了把钥匙签名。
+    /// Without it, the default key under `--did` — the **binding key**. So a hot
+    /// key added to a DID later never silently changes which key an existing
+    /// caller signs with.
     #[arg(long, value_name = "FRAGMENT")]
     pub kid: Option<String>,
 
-    /// socket 路径(默认按目录布局推导)。
+    /// Socket path (derived from the directory layout by default).
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
 pub struct LockArgs {
-    /// 只锁这一个 DID 名下的。不给就全锁。
+    /// Lock only the keys under this DID. Without it, lock everything.
     #[arg(long, value_name = "DID")]
     pub did: Option<String>,
 
-    /// 再加 `--did` 就精确到一把。单独给没意义(clap 会拦住)。
+    /// Together with `--did`, narrows it to one key. Alone it means nothing
+    /// (clap refuses).
     #[arg(long, value_name = "FRAGMENT", requires = "did")]
     pub kid: Option<String>,
 
+    /// Socket path (derived from the directory layout by default).
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
 pub struct SignArgs {
+    /// The DID to sign as.
     #[arg(long, value_name = "DID")]
     pub did: String,
 
-    /// 用哪把钥匙签,写 fragment(`key-2`、`recovery-1`……)。
+    /// Which key to sign with, by fragment (`key-2`, `recovery-1`, ...).
     ///
-    /// 不给就是 `--did` 名下默认那把(绑定密钥)。
+    /// Without it, the default key under `--did` (the binding key).
     #[arg(long, value_name = "FRAGMENT")]
     pub kid: Option<String>,
 
+    /// The HTTP method.
     #[arg(long, default_value = "GET")]
     pub method: String,
 
-    /// 完整的请求 URI —— RFC 9421 的 `@target-uri` 就是它。
+    /// The full request URI — this is RFC 9421's `@target-uri`.
     ///
-    /// 只有 `--raw` 那条路不需要它,所以它只在 `--raw` 不出现时才是必填。
+    /// Only the `--raw` path does not need it, so it is required unless `--raw`
+    /// is present.
     #[arg(long, value_name = "URL", required_unless_present = "raw")]
     pub url: Option<String>,
 
-    /// 请求里已有的头,`名字: 值`(可重复)。名字会转成小写。
+    /// Headers already on the request, `name: value` (repeatable). Names are
+    /// lowercased.
     #[arg(long = "header", value_name = "NAME: VALUE")]
     pub headers: Vec<String>,
 
-    /// 请求体所在的文件。给了它,`content-digest` 一定进覆盖面,而且由
-    /// 守护进程自己算 —— 请求里带的同名头会被忽略。
+    /// The file holding the request body. If given, `content-digest` definitely
+    /// goes into the covered set, and the daemon computes it itself — a header
+    /// of the same name in the request is ignored.
     #[arg(long, value_name = "PATH")]
     pub body: Option<PathBuf>,
 
-    /// 额外要求覆盖的分量(可重复)。**只能加,不能减。**
+    /// Extra components to require covering (repeatable). **Can only add, never
+    /// remove.**
     #[arg(long = "cover", value_name = "NAME")]
     pub cover: Vec<String>,
 
-    /// 原始字节签名:直接签这个文件的内容,输出 base64。需要守护进程开着
-    /// `--allow-raw-signing`,而且每一次都会留审计。
+    // 它和结构化那一套参数**互相排除**。不是洁癖:如果 `--raw` 能和
+    // `--body`/`--cover` 一起给,调用方就会以为那些东西也进了覆盖面,而实际上
+    // 原始签名的输入只有那个文件 —— 这正是"悄悄降级"的形状。要么给一套,
+    // 要么给另一套,让 clap 把话说清楚。
+    /// Raw-bytes signing: sign exactly the contents of this file, print base64.
     ///
-    /// 它和结构化那一套参数**互相排除**。不是洁癖:如果 `--raw` 能和
-    /// `--body`/`--cover` 一起给,调用方就会以为那些东西也进了覆盖面,而
-    /// 实际上原始签名的输入只有那个文件 —— 这正是"悄悄降级"的形状。
-    /// 要么给一套,要么给另一套,让 clap 把话说清楚。
+    /// Needs the daemon running with `--allow-raw-signing`, and leaves an audit
+    /// record every time. **Mutually exclusive** with the structured flags: if
+    /// `--raw` could be combined with `--body`/`--cover`, a caller would think
+    /// those went into the covered set when the raw path's only input is that
+    /// file — the shape of a silent downgrade. One set or the other, so clap can
+    /// say so.
     #[arg(
         long,
         value_name = "PATH",
@@ -324,106 +460,124 @@ pub struct SignArgs {
     )]
     pub raw: Option<PathBuf>,
 
+    /// Socket path (derived from the directory layout by default).
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
 pub struct AddRecoveryKeyArgs {
+    /// The DID to add a recovery key to.
     #[arg(long, value_name = "DID")]
     pub did: String,
 
-    /// 人读的标签。它进 AAD,所以改它要重封,不是改个注释。
+    /// A human-readable label. It goes into the AAD, so changing it means
+    /// re-wrapping — it is not a comment.
     #[arg(long, default_value = "recovery", value_name = "LABEL")]
     pub label: String,
 }
 
 #[derive(Args, Debug)]
 pub struct RotateHotKeyArgs {
+    /// The DID whose hot key to rotate.
     #[arg(long, value_name = "DID")]
     pub did: String,
 
+    /// A human-readable label for the new key.
     #[arg(long, default_value = "hot", value_name = "LABEL")]
     pub label: String,
 
-    /// 把旧的那把留在文档里。默认不留 —— 轮换的意思是"不再用它"。
+    /// Leave the old key in the document. By default it is dropped — rotating
+    /// means "stop using it".
     #[arg(long)]
     pub keep_old: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct RemoveKeyArgs {
+    /// The DID to remove a key from.
     #[arg(long, value_name = "DID")]
     pub did: String,
 
-    /// 要摘掉的那个 fragment(`key-2`、`recovery-1`……),不是完整的
-    /// `did#key-2`。绑定密钥摘不掉 —— 它的指纹就是 DID,摘了文档就不再
-    /// 绑定它自己了。
+    /// The fragment to remove (`key-2`, `recovery-1`, ...), not the full
+    /// `did#key-2`.
+    ///
+    /// The binding key cannot be removed — its thumbprint is the DID, so removing
+    /// it would leave the document no longer binding itself.
     #[arg(long, value_name = "FRAGMENT")]
     pub kid: String,
 }
 
 #[derive(Args, Debug)]
 pub struct MigrateArgs {
-    /// 旧的 DID。它的文档会被改写,不会被删除。
+    /// The old DID. Its document is rewritten, not deleted.
     #[arg(long, value_name = "DID")]
     pub did: String,
 
-    /// 新的 DID。
+    /// The new DID.
     #[arg(long, value_name = "DID")]
     pub to: String,
 
-    /// 允许后继的 stable subject path 和旧的不一样(也就是换域名)。
+    // 默认拒,因为默认放行等于让一次打错字的 `--to` 变成一次无人察觉的
+    // 冒名:验证方认"同一个 stable subject path"是同一个主体,path 一变,
+    // 这条边就只能靠域名自己作证了。
+    /// Allow the successor's stable subject path to differ from the old one
+    /// (i.e. change domains).
     ///
-    /// 默认拒,因为默认放行等于让一次打错字的 `--to` 变成一次无人察觉的
-    /// 冒名:验证方认"同一个 stable subject path"是同一个主体,path 一变,
-    /// 这条边就只能靠域名自己作证了。
+    /// Refused by default, because allowing it by default would turn a typo in
+    /// `--to` into an unnoticed impersonation: verifiers treat "the same stable
+    /// subject path" as the same principal, and once the path changes that edge
+    /// rests on the domain alone.
     #[arg(long)]
     pub allow_different_subject: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct DeactivateArgs {
+    /// The DID to deactivate.
     #[arg(long, value_name = "DID")]
     pub did: String,
 
-    /// 注销并指向这个后继。不给就是彻底到头。
+    /// Deactivate and point at this successor. Without it, this is the end of
+    /// the line.
     ///
-    /// 这条路**不做**环检测,也不查 stable subject path —— 要那两样就用
-    /// `migrate`。
+    /// This path does **not** check for cycles and does not check the stable
+    /// subject path — use `migrate` for those.
     #[arg(long, value_name = "DID")]
     pub to: Option<String>,
 }
 
 #[derive(Args, Debug)]
 pub struct ImportMnemonicArgs {
-    /// 这个 DID。
+    /// The DID.
     ///
-    /// 词里推不出它:路径段是人选的,公钥只决定最后那一段 `e1_`。所以必须
-    /// 由人给出,而给错会**当场**被指纹对上 —— 不匹配就是拒,不是"打不开"。
+    /// It cannot be derived from the words: the path segments are chosen by a
+    /// person, and only the public key picks the final `e1_` segment. So a person
+    /// has to supply it, and a wrong one is caught **immediately** by the
+    /// thumbprint — a mismatch is refused, not "cannot open".
     #[arg(long, value_name = "DID")]
     pub did: String,
 
-    /// 新信封的标签。
+    /// The new envelope's label.
     #[arg(long, default_value = "imported", value_name = "LABEL")]
     pub label: String,
 
-    /// 本地已经有同一把钥匙时也照做。
+    /// Do it anyway when this machine already has the same key.
     #[arg(long)]
     pub force: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct ImportArchiveArgs {
-    /// 归档文件。
+    /// The archive file.
     #[arg(long, value_name = "PATH")]
     pub file: PathBuf,
 
-    /// 新信封的标签。
+    /// The new envelope's label.
     #[arg(long, default_value = "imported", value_name = "LABEL")]
     pub label: String,
 
-    /// 本地已经有同一把钥匙时也照做。
+    /// Do it anyway when this machine already has the same key.
     #[arg(long)]
     pub force: bool,
 
@@ -435,26 +589,27 @@ pub struct ImportArchiveArgs {
 #[cfg(feature = "seed-export")]
 #[derive(Args, Debug)]
 pub struct ExportSeedArgs {
+    /// The DID to export from.
     #[arg(long, value_name = "DID")]
     pub did: String,
 
-    /// 导出哪一把。不给就是绑定密钥。
+    /// Which key. Without it, the binding key.
     #[arg(long, value_name = "FRAGMENT")]
     pub kid: Option<String>,
 
-    /// 归档写到哪个目录。
+    /// The directory to write the archive into.
     #[arg(long, value_name = "DIR")]
     pub out: Option<PathBuf>,
 
-    /// 输出文件已存在时也照写。
+    /// Write even if the output file already exists.
     #[arg(long)]
     pub force: bool,
 
-    /// 只要 24 个词,不写归档。
+    /// Only the 24 words, no archive.
     #[arg(long, conflicts_with = "archive_only")]
     pub words_only: bool,
 
-    /// 只要归档,不打那 24 个词。
+    /// Only the archive, do not print the 24 words.
     #[arg(long)]
     pub archive_only: bool,
 
@@ -472,6 +627,7 @@ pub fn run(cli: Cli) -> Result<()> {
     let root = root.as_deref();
     match command {
         Command::Serve(args) => serve(root, args),
+        Command::Stop => stop(root),
         Command::Keygen(args) => keygen(root, args),
         Command::Spec(args) => write_spec(root, args),
         Command::Publish(args) => publish(root, args),
@@ -569,7 +725,73 @@ fn connect(root: Option<&Path>, socket: Option<&Path>) -> Result<Client> {
 // serve
 // ————————————————————————————————————————————————————————————————————————
 
+/// 起守护进程。
+///
+/// **默认是后台的。** 它不需要终端(口令那条纪律不适用于它 —— 它从不读
+/// 口令),而占着一个窗口等人来读它的输出,是让一个终端白费掉。所以除非
+/// `--foreground`,这条命令把终端还回去,自己走后台。
 fn serve(root: Option<&Path>, args: ServeArgs) -> Result<()> {
+    let layout = service_layout(root, &args)?;
+    let sock_path = socket_of(&layout, &args);
+
+    // 多用户下的第三层:**不给 pin 就不启动。**
+    //
+    // 这一条放在最前面,在任何文件系统操作之前 —— `--system` 的目录要 root
+    // 才建得出来,放到后面就变成"非 root 先因为权限失败",而真正的原因
+    // (配置不对)反而看不见。也正因为如此,这条检查在没有 root 的机器上
+    // 也是可测的。
+    //
+    // 单用户不打这条警告:那边的粒度**就是** uid,README 里也是这么写的
+    // ("同一个 uid 下的另一个 agent"列在不挡的那一栏)。一条多数时候可以
+    // 无视的警告,会教人无视下一條真正要紧的。
+    if args.system && args.allow_binaries.is_empty() {
+        return Err(KeydError::Misuse(format!(
+            "--system serves more than one uid from a single daemon, and a uid does not say which \
+             program is asking. Without --allow-binary, every process running as uid {} can connect \
+             and ask for signatures.\n\
+             Give it at least one pin. Do not know the value yet? Start it once with a pin that \
+             matches nothing, and the daemon writes the --allow-binary line to copy into {} for \
+             every connection it refuses.",
+            daemon::self_uid(),
+            layout.log_path().display()
+        )));
+    }
+
+    if args.foreground {
+        return serve_here(&layout, args, sock_path);
+    }
+
+    layout.ensure()?;
+    crate::daemon::service::detach(&layout.log_path(), &sock_path)
+}
+
+/// 单用户 → `--root` 指哪儿是哪儿;系统服务 → `/var/lib/anp-keyd/users/<uid>`。
+///
+/// 日志和 pid 文件都跟着这个走,所以 `--system` 下的日志自然也落在
+/// `/var/lib/anp-keyd/users/<uid>/log/`,不用另开一套路径规则。
+fn service_layout(root: Option<&Path>, args: &ServeArgs) -> Result<KeydLayout> {
+    if args.system {
+        KeydLayout::system(daemon::self_uid())
+    } else {
+        layout(root)
+    }
+}
+
+fn socket_of(layout: &KeydLayout, args: &ServeArgs) -> PathBuf {
+    match (&args.socket, args.system) {
+        (Some(path), _) => path.clone(),
+        // 系统服务的 socket 不属于任何单个 uid,所以它不能放在某个人的
+        // 家目录里 —— 那个人一退出登录目录就没了,而服务还在跑。
+        (None, true) => PathBuf::from("/var/run/anp-keyd.sock"),
+        (None, false) => layout.sock_path(),
+    }
+}
+
+/// 守护进程本体 —— 前台跑、后台跑、被服务管理器拉起来,走的都是这里。
+fn serve_here(layout: &KeydLayout, args: ServeArgs, sock_path: PathBuf) -> Result<()> {
+    layout.ensure()?;
+    crate::daemon::service::install_logging()?;
+
     let policy = args.policy()?;
 
     // 上次导出过就在启动时说一句。
@@ -577,33 +799,26 @@ fn serve(root: Option<&Path>, args: ServeArgs) -> Result<()> {
     // "家用路由器显示上次登录"那种东西,而这个比它重要:导出是把整把身份
     // 抽出来,抽出来之后**没有任何办法撤销**。守护进程是那个会被 agent
     // 够到的东西,所以它每一次被拉起来的时候都该把这件事说清楚 —— 哪怕
-    // 大多数时候它只是进了服务管理器的日志,而人不会去看。
+    // 大多数时候它只是进了日志,而人不会去看。
     //
     // 真正会被人看到的那一次在 `ops::Session::open` 里:导出这件事最后一定
     // 是被某个坐在终端前的人做掉的,而那里正是那个人眼前。
-    if let Some(line) = crate::audit::log::export_tripwire(&layout(root)?.audit_dir()) {
-        eprintln!("{line}");
+    if let Some(line) = crate::audit::log::export_tripwire(&layout.audit_dir()) {
+        tracing::warn!("{line}");
     }
 
-    if policy.allowed_binaries.is_empty() {
-        // 这一条不能悄悄放过。只配了 uid 的"多用户"是**假的多用户**:
-        // 同一个 uid 下的另一个 agent 照样连得上,而那正是要防的对象。
-        eprintln!(
-            "warning: no --allow-binary pin given, so any process running as uid {} can connect \
-             and ask for signatures; the executable-identity layer is off",
-            daemon::self_uid()
-        );
-    }
-
-    let roots = if args.system { Roots::PerUid } else { Roots::Single(layout(root)?) };
-
-    let sock_path = match (args.socket, args.system) {
-        (Some(path), _) => path,
-        // 系统服务的 socket 不属于任何单个 uid,所以它不能放在某个人的
-        // 家目录里 —— 那个人一退出登录目录就没了,而服务还在跑。
-        (None, true) => PathBuf::from("/var/run/anp-keyd.sock"),
-        (None, false) => layout(root)?.sock_path(),
+    let roots = if args.system {
+        Roots::PerUid
+    } else {
+        Roots::Single(KeydLayout::at(layout.root().to_path_buf()))
     };
+
+    // **先绑定,后写 pid 文件。** 绑定成功才是这个 socket 的守护进程;写在
+    // 前面的话,一个注定要失败的第二个 `serve`(比如 socket 已经被占了)
+    // 会先覆盖正在跑的那个的 pid 文件,再在退出时把它删掉 —— `stop` 之后
+    // 就只能对着一个活着的守护进程说 "nothing is running"。
+    let listener = server::bind(&sock_path)?;
+    let _pid_file = crate::daemon::service::PidFile::write(layout.pid_path())?;
 
     let state = std::sync::Arc::new(DaemonState::new(
         roots,
@@ -615,7 +830,7 @@ fn serve(root: Option<&Path>, args: ServeArgs) -> Result<()> {
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
 
-    runtime.block_on(async move {
+    let outcome = runtime.block_on(async move {
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
         tokio::spawn(async move {
@@ -623,8 +838,94 @@ fn serve(root: Option<&Path>, args: ServeArgs) -> Result<()> {
             let _ = stop_tx.send(true);
         });
 
-        server::serve(state, config, stop_rx).await
-    })
+        server::serve_on(state, config, stop_rx, listener).await
+    });
+
+    // 走到这儿 socket 已经删了(server 里那段);pid 文件由 guard 在返回时
+    // 删,包括出错这条路。
+    outcome
+}
+
+// ————————————————————————————————————————————————————————————————————————
+// stop
+// ————————————————————————————————————————————————————————————————————————
+
+/// 把 `serve` 放到后台去的那个守护进程停下来。
+///
+/// **不是一种 socket 消息。** 线上只有五种消息类型,是 README 明写的契约;
+/// 为了让一条"给人用的"命令跑通去动那个契约,是拿 agent 那侧的稳定性换
+/// 一点便利。
+///
+/// 于是走 pid 文件。而 pid 文件里那个数字**不足以**授权一次 `kill` ——
+/// pid 会被内核回收,所以下面要先核对占用它的进程跑的是不是这个二进制。
+fn stop(root: Option<&Path>) -> Result<()> {
+    let layout = layout(root)?;
+    let pid_path = layout.pid_path();
+
+    let recorded = match std::fs::read_to_string(&pid_path) {
+        Ok(text) => text,
+        // 没在跑,和"已经停过了"是同一件事。`stop` 是幂等的:脚本里
+        // `stop` 之后接一句 `stop` 不该报错。
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!("nothing is running");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let pid: i32 = recorded.trim().parse().map_err(|_| {
+        KeydError::Misuse(format!("{} does not hold a pid", pid_path.display()))
+    })?;
+
+    if !crate::daemon::process::is_alive(pid) {
+        // 陈旧的 pid 文件:进程早就没了。清掉,免得下一次还要再判一遍。
+        let _ = std::fs::remove_file(&pid_path);
+        println!("nothing is running");
+        return Ok(());
+    }
+
+    // **这里是 `stop` 唯一有分量的地方。**
+    //
+    // pid 会被回收:守护进程死掉之后,同一个号码可能落到任何一个新进程头
+    // 上。少了这一句核对,一个陈旧的 pid 文件就能让 `stop` 去打一个无辜的
+    // 进程 —— 而且打的是 SIGTERM,对方多半直接死。
+    //
+    // 对不上就**什么都不做**:不杀、也不删 pid 文件。文件还留着,因为它
+    // 可能记着一件我们没看懂的事,而看不懂的时候动手是最坏的选择。
+    let me = std::env::current_exe()?;
+    if !crate::daemon::process::is_same_executable(&me, pid) {
+        let other = crate::daemon::process::executable_of(pid)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "an executable I could not read".into());
+        return Err(KeydError::Misuse(format!(
+            "{} says pid {pid}, but that pid is running {other}, not this binary. Refusing to \
+             signal it. If the daemon really is gone, remove {} yourself.",
+            pid_path.display(),
+            pid_path.display()
+        )));
+    }
+
+    if unsafe { nix::libc::kill(pid, nix::libc::SIGTERM) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    // 发出去的是一个**请求**,不是保证。等它真的走,别把"我发过信号了"
+    // 说成"它停了"。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while crate::daemon::process::is_alive(pid) {
+        if std::time::Instant::now() >= deadline {
+            return Err(KeydError::Misuse(format!(
+                "pid {pid} was asked to stop but is still there after 5s"
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // 正常情况下它自己删了(guard 在返回时删)。进程被 SIGKILL 打死之类
+    // 的情况下不会,所以这里补一下。
+    let _ = std::fs::remove_file(&pid_path);
+    println!("pid {pid} stopped");
+    Ok(())
 }
 
 /// 等 SIGINT 或 SIGTERM。
@@ -999,6 +1300,7 @@ fn base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use clap::Parser;
     use clap::error::ErrorKind;
 
@@ -1006,6 +1308,46 @@ mod tests {
         let mut full = vec!["anp-keyd"];
         full.extend_from_slice(argv);
         Cli::try_parse_from(full)
+    }
+
+    /// **每一条子命令都得在 `--help` 里出现。**
+    ///
+    /// `help_template()` 里那份分节清单是手写的(理由见那个函数的文档注释),
+    /// 手写的东西会漂:加了子命令忘了改模板,help 里就少一条 —— 而 help 是
+    /// 多数人唯一会读的那份文档。这条测试就是模板注释里承诺的那一条。
+    ///
+    /// 按**空白分隔的整词**匹配,不是子串:`lock` 是 `unlock` 的一个子串,
+    /// 子串匹配下真把 `lock` 那行删了也测不出来。
+    #[test]
+    fn every_subcommand_is_listed_in_the_help_template() {
+        let mut command = Cli::command();
+        let help = command.render_long_help().to_string();
+        let listed: Vec<&str> = help.split_whitespace().collect();
+
+        let names: Vec<&str> = command
+            .get_subcommands()
+            .map(|sub| sub.get_name())
+            // clap 自己补的那条 `help` 不算 —— 清单里列它没有信息量。
+            .filter(|name| *name != "help")
+            .collect();
+
+        // 免得这条测试空转:`get_subcommands()` 要是返回空,下面那个 `missing`
+        // 永远为空,而空列表同样是"通过"。
+        assert!(
+            names.len() > 10,
+            "只拿到 {} 条子命令,这个数不对,先怀疑测试本身: {names:?}",
+            names.len()
+        );
+
+        let missing: Vec<&str> = names
+            .into_iter()
+            .filter(|name| !listed.contains(name))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "这些子命令在 `--help` 里找不到,`help_template()` 的分节清单要跟着改: {missing:?}"
+        );
     }
 
     /// **导出这条命令在默认构建里不存在 —— 不是被拒,是没有。**
@@ -1187,6 +1529,7 @@ mod tests {
         let error = ServeArgs {
             socket: None,
             system: false,
+            foreground: false,
             idle: DEFAULT_IDLE_SECS,
             allow_raw_signing: false,
             allow_uids: vec![],

@@ -675,9 +675,13 @@ struct Daemon {
 }
 
 impl Daemon {
+    /// `--foreground` 是必须的:不给的话 `serve` 会把守护进程放进它自己的
+    /// 会话里跑,而那个进程不是这个孩子的孩子 —— `Drop` 里的 `kill` 够不着
+    /// 它,于是每跑一次测试就在机器上留一个守护进程。
     fn start(dir: &TempDir) -> Self {
         let mut child = Command::new(BIN)
             .arg("serve")
+            .arg("--foreground")
             .arg("--root")
             .arg(dir.path())
             .stdout(Stdio::null())
@@ -705,6 +709,50 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// 一个**真的进了后台**的守护进程。
+///
+/// 和上面的 `Daemon` 不一样:那个是测试的孩子,这个不是 —— `setsid` 之后
+/// 它属于自己的会话,`Child::kill` 够不着。所以收尸只能走 `stop`,而且必须
+/// 在析构里做:断言一失败就走不到测试末尾,漏掉的话机器上会留下一个没人
+/// 记得的守护进程,它占着的 socket 会让**下一次**跑测试红在一个毫不相干的
+/// 地方。
+struct Background {
+    root: PathBuf,
+}
+
+impl Background {
+    /// 起一个,**并确认命令真的回来了**。
+    ///
+    /// `run` 用的是 `Command::output()`,它会一直读到子进程的 stdout/stderr
+    /// 关上 —— 也就是说,守护进程要是继承了那两根管道,这一条会挂在那儿
+    /// 不动,而不是"稍微慢一点"。挂住本身就是那个 bug 的样子。
+    fn start(root: &Path) -> (Self, String) {
+        Self::start_with(root, &[])
+    }
+
+    /// 同上,但给 `serve` 多带几个参数。
+    fn start_with(root: &Path, extra: &[&str]) -> (Self, String) {
+        let mut args = vec!["serve"];
+        args.extend_from_slice(extra);
+        let output = run(root, &args).expect_ok().to_string();
+        (Self { root: root.to_path_buf() }, output)
+    }
+
+    fn pid(&self) -> i32 {
+        std::fs::read_to_string(self.root.join("run").join("keyd.pid"))
+            .expect("a daemon in the background writes its pid")
+            .trim()
+            .parse()
+            .expect("the pid file holds a pid")
+    }
+}
+
+impl Drop for Background {
+    fn drop(&mut self) {
+        let _ = run(&self.root, &["stop"]);
     }
 }
 
@@ -1230,3 +1278,238 @@ fn a_caller_can_add_coverage_but_the_daemon_keeps_its_own() {
         "and the components the daemon always covers stay:\n{extra_input}"
     );
 }
+
+// ========================================================================
+// 六、守护进程的进程管理:后台、停止、拒绝
+// ========================================================================
+//
+// 这一节测的是**进程怎么活着**,不是它怎么应答 —— 后者在第四节。两边的
+// 失败方式完全不同:那边失败是"协议里少了一个字段",这边失败是"终端上
+// 多了一个命令没回来",或者更糟:"命令说成功了,而它说的话不是真的"。
+
+/// 敲完 `serve` 就该回到提示符,而且回来时守护进程真的在跑。
+#[test]
+fn serve_hands_the_terminal_back_and_leaves_a_working_daemon() {
+    let dir = TempDir::new("background");
+    let (daemon, output) = Background::start(dir.path());
+    let pid = daemon.pid();
+
+    assert!(
+        output.contains("listening on") && output.contains(&pid.to_string()),
+        "the command reports where it listens and which pid to thank for it:\n{output}"
+    );
+    assert!(
+        output.contains("anp-keyd stop"),
+        "and it says how to get rid of it:\n{output}"
+    );
+
+    // 回来的这几句话不是嘴上说说:后台那个进程真的在应答。
+    run(dir.path(), &["status"]).expect_ok();
+}
+
+/// `stop` 停掉它,而且**再停一次不算错** —— 脚本里常见连着两句。
+#[test]
+fn stop_stops_it_and_a_second_stop_is_not_an_error() {
+    let dir = TempDir::new("stop");
+    let (daemon, _) = Background::start(dir.path());
+    let pid = daemon.pid();
+
+    let stopped = run(dir.path(), &["stop"]);
+    assert!(
+        stopped.expect_ok().contains(&pid.to_string()),
+        "it must say **which** pid it stopped:\n{}",
+        stopped.text()
+    );
+
+    // 进程走干净了,它留下的两样东西也一起没了。socket 不走 `stop` 的手
+    // (守护进程自己在停机路径上删),所以检查它等于在检查那段路径跑过。
+    assert!(
+        !dir.path().join("run").join("keyd.pid").exists(),
+        "the pid file belongs to the process that wrote it"
+    );
+    assert!(
+        !dir.path().join("run").join("keyd.sock").exists(),
+        "and the daemon removes its own socket on the way out"
+    );
+
+    let again = run(dir.path(), &["stop"]);
+    assert!(
+        again.expect_ok().contains("nothing is running"),
+        "stopping twice is stopping an already-stopped daemon:\n{}",
+        again.text()
+    );
+}
+
+/// 第二个 `serve` 必须失败,**并且不许碰第一个**。
+///
+/// 这条测试的第二个断言比第一个要紧。`serve` 起后台进程是"先派一个孩子出去
+/// 探路":孩子失败、父进程照实报错,这条路其实挺容易写对。难的是那个孩子的
+/// 副作用 —— 它写过 pid 文件没有?覆盖掉了正在跑的那个没有?而这些副作用
+/// 一旦发生,症状出现在**下一句**命令上(`stop` 说 nothing is running,而
+/// 守护进程正听着),离这儿很远。
+#[test]
+fn a_second_serve_refuses_and_leaves_the_first_one_alone() {
+    let dir = TempDir::new("double");
+    let (daemon, _) = Background::start(dir.path());
+    let pid = daemon.pid();
+
+    let refused = run(dir.path(), &["serve"]);
+    let text = refused.expect_failure();
+    assert!(
+        text.contains("already served"),
+        "the reason must be the socket, in words a person can act on:\n{text}"
+    );
+
+    let recorded = std::fs::read_to_string(dir.path().join("run").join("keyd.pid"))
+        .expect("the running daemon's pid file must survive a failed second start");
+    assert_eq!(
+        recorded.trim(),
+        pid.to_string(),
+        "the failed attempt must not overwrite the running daemon's pid file"
+    );
+    run(dir.path(), &["status"]).expect_ok();
+}
+
+/// pid 文件里那个数字**不足以**授权一次 `kill`。
+///
+/// pid 会被内核回收:一个陈旧的 pid 文件指向的完全可能是一个无辜的进程,
+/// 而 `stop` 发的是 SIGTERM —— 对方多半直接死。这里拿一个真的活着的
+/// 别的进程当诱饵,确认 `stop` 拒绝、并且**连 pid 文件都不删**(看不懂的
+/// 时候动手是最坏的选择)。
+#[test]
+fn stop_refuses_a_pid_that_is_not_this_binary() {
+    let dir = TempDir::new("foreign-pid");
+    std::fs::create_dir_all(dir.path().join("run")).expect("create run/");
+
+    let mut decoy = Command::new("sleep").arg("300").spawn().expect("spawn the decoy");
+    std::fs::write(
+        dir.path().join("run").join("keyd.pid"),
+        format!("{}\n", decoy.id()),
+    )
+    .expect("write the pid file");
+
+    let refused = run(dir.path(), &["stop"]);
+    let text = refused.expect_failure();
+    assert!(
+        text.contains("Refusing to signal"),
+        "it has to say that it did nothing, not just fail:\n{text}"
+    );
+    assert!(
+        text.contains("sleep"),
+        "and name what that pid actually is, so a person can check:\n{text}"
+    );
+
+    assert!(
+        decoy.try_wait().expect("ask about the decoy").is_none(),
+        "the decoy must still be running — that is the whole point"
+    );
+    assert!(
+        dir.path().join("run").join("keyd.pid").exists(),
+        "and the pid file stays: we did not understand it, so we do not touch it"
+    );
+
+    let _ = decoy.kill();
+    let _ = decoy.wait();
+}
+
+/// `--system` 是一个守护进程服务所有 uid,所以 uid 不再是承诺的粒度 ——
+/// 不给第三层就**拒绝启动**,而不是打一条没人看的警告。
+///
+/// 顺带确认这条拒绝发生在**任何文件系统操作之前**:`--system` 的目录在
+/// 没有 root 的机器上根本建不出来,要是先建目录再检查,这条测试就会红在
+/// "权限不够"上,而真正的原因(配置不对)看不见。
+#[test]
+fn serve_system_without_a_pin_refuses_before_anything_else() {
+    let dir = TempDir::new("system-refusal");
+    let refused = run(dir.path(), &["serve", "--system"]);
+    let text = refused.expect_failure();
+
+    assert!(
+        text.contains("--allow-binary") && text.contains("uid"),
+        "the refusal has to name the flag and the reason:\n{text}"
+    );
+    assert!(
+        !dir.path().join("run").exists(),
+        "and nothing may have been created on the way to it"
+    );
+}
+
+/// 后台跑的守护进程把话写进文件,而且那个文件**只有它的主人看得见**。
+///
+/// 日志里有 uid、pid、路径、被拒的 pin —— 不是秘密本身,但也没有理由让
+/// 同一个系统上的其他人读。
+#[test]
+fn the_serve_log_records_the_start_and_is_not_world_readable() {
+    let dir = TempDir::new("serve-log");
+    let (daemon, _) = Background::start(dir.path());
+
+    let log = dir.path().join("log").join("serve.log");
+    // 父进程返回时守护进程刚答应过话,而"写进日志"是它自己那一侧的下一步
+    // —— 差的是几个微秒,但那是真的会输的赛跑,所以等一等。
+    let text = wait_for_text(&log, "listening");
+
+    assert!(
+        text.contains(&daemon.pid().to_string()) || text.contains("keyd.sock"),
+        "the first line should say where it is listening:\n{text}"
+    );
+
+    let mode = std::fs::metadata(&log)
+        .expect("the log exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode,
+        anp_keyd::keystore::layout::SECRET_FILE_MODE,
+        "the serve log must not be world readable"
+    );
+}
+
+/// 等到一个文件里出现某段文字,或者超时。返回文件内容(超时就是超时那一次
+/// 读到的内容,让调用方的断言去说为什么不对)。
+fn wait_for_text(path: &Path, needle: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if text.contains(needle) || Instant::now() >= deadline {
+            return text;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 开了第三层,启动**不该**留下一条拒绝。
+///
+/// 后台化之后父进程要确认孩子起来了,而"连一下 socket"是当时最自然的做法。
+/// 但那条探测是一条连上就走的空连接:第三层开着时它过不了 `admit`(内核给
+/// 不出一个已经走掉的对端的凭证),于是**每一次启动都给自己记一条 `DENIED`
+/// 审计事件**。审计是防哈希链篡改的证据,不该混进工具自己的噪声 —— 一条
+/// 每次启动都有的 DENIED,会让人学会无视那本日志。
+#[test]
+fn turning_on_the_third_layer_does_not_make_startup_a_denial() {
+    let dir = TempDir::new("self-denial");
+    let pin = format!("sha256:{}", "00".repeat(32));
+    let (_daemon, _) = Background::start_with(dir.path(), &["--allow-binary", &pin]);
+
+    // 真连一次:这一条该被拒(白名单里那个摘要不可能是任何东西)。
+    run(dir.path(), &["status"]).expect_failure();
+
+    let log = dir.path().join("log").join("serve.log");
+    let text = wait_for_text(&log, "refused a connection");
+    assert_eq!(
+        text.matches("refused a connection").count(),
+        1,
+        "只有上面那一条真连接该被拒 —— 多出来的那条是启动时的探测:\n{text}"
+    );
+
+    let audit: String = std::fs::read_dir(dir.path().join("audit"))
+        .expect("the audit directory exists")
+        .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
+        .collect();
+    assert_eq!(
+        audit.matches("\"DENIED\"").count(),
+        1,
+        "审计里也只该有一条,而且它是**那一条真连接**的:\n{audit}"
+    );
+}
+

@@ -65,10 +65,14 @@ anp-keyd sign --did … --method POST --url … --header 'content-type: applicat
 | `bad credential` | 口令错,或 `device.secret` 不对 —— 守护进程**不区分**这两者,这是刻意的 | 让用户重试;别试图分类 |
 | `covered set rejected` | 你要覆盖的分量守护进程不签 | 去掉那个 `--cover` |
 | `permission` | 连上来的进程身份不被接受 | 报告给用户,别重试 |
-| 连不上 socket | 守护进程没在跑 | `anp-keyd serve` 是**前台**命令,得由用户自己开一个终端 |
+| 连不上 socket | 守护进程没在跑 | 请用户跑 `anp-keyd serve`(它默认进后台,敲完就回提示符),**别替他起** —— 见下面那句 |
 
 解锁这件事没有捷径:**口令只从用户自己的终端读**,命令行参数、环境变量、
 stdin、socket 都不接受。你替不了他,这是设计。
+
+**守护进程也不该由你起**(`serve` / `stop` 都不该)。今天它不是"占着终端"
+那个理由了 —— 它默认进后台 —— 但"这台机器上要不要常驻一个守护进程、用哪个
+`--root`、开不开 `--allow-raw-signing`"是用户的决定,不是你顺手做掉的事。
 
 ## 如果接了 MCP
 

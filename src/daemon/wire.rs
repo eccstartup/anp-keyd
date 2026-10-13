@@ -142,7 +142,9 @@ impl KeydError {
             CoveredSetRejected(_) => ErrorCode::CoveredSetRejected,
             Protocol(_) => ErrorCode::Protocol,
             Did(_) => ErrorCode::Did,
-            Crypto(_) | Upstream(_) | Io(_) | Json(_) => ErrorCode::Internal,
+            // `Misuse` 到不了线上:它只由 `serve` / `stop` 这些本地命令产生。
+            // 真要到了,那就是我们自己的 bug,所以是 `Internal`。
+            Crypto(_) | Upstream(_) | Io(_) | Json(_) | Misuse(_) => ErrorCode::Internal,
             // 客户端把收到的粗码原样带回来。环是这样闭合的:服务端
             // `BadPassphrase → BadCredential`,客户端 `BadCredential →
             // Refused{code}`,再发出去还是 `BadCredential`。

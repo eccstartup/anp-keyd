@@ -6,7 +6,9 @@
 pub mod autolock;
 pub mod handlers;
 pub mod peer;
+pub mod process;
 pub mod server;
+pub mod service;
 pub mod state;
 pub mod wire;
 

@@ -100,7 +100,19 @@ https://example.com/agents/mybot/e1_abc…/did.json
 anp-keyd serve
 ```
 
-前台跑着,监听 `~/.anp-keyd/run/keyd.sock`。换个终端,解锁:
+敲完**就回到提示符**,守护进程在后台听着 `~/.anp-keyd/run/keyd.sock`。
+中途那几行话会告诉你它听着哪儿、pid 是多少:
+
+```
+listening on /Users/you/.anp-keyd/run/keyd.sock (pid 12345)
+to stop it: anp-keyd stop
+```
+
+不想要后台就在后面加 `--foreground`,那样它会占着这个终端 —— 服务管理器
+(launchd、systemd)拉起来的时候**要**加这个:它们管的是一个进程,不想要
+一个从它们手里跑掉的东西。
+
+换个终端,解锁:
 
 ```bash
 anp-keyd unlock --did did:wba:example.com:agents:mybot:e1_abc…
@@ -153,7 +165,8 @@ anp-keyd sign --did … --method POST --url https://… \
 
 | 命令 | 干什么 |
 |---|---|
-| `serve` | 常驻:在 Unix socket 上服务签名请求 |
+| `serve` | 常驻(默认进后台):在 Unix socket 上服务签名请求 |
+| `stop` | 把后台那个守护进程停下来(没在跑也不报错) |
 | `spec` | 写一份文档规格文件(模板),`keygen` / `publish` 读的就是它 |
 | `keygen` | 生成一把新的 did:wba 密钥,把信封写进 `keys/` |
 | `publish` | 按规格构造文档、盖上自签 proof,写出 did.json |
@@ -195,12 +208,18 @@ cargo install --path . --features mcp           # 多出 mcp
 - **`publish --spec` 的坐标必须和 `--did` 说的一致。** 对不上直接拒,而不是
   挑一个信:拿一个 DID 去签另一个地方的文档,是这里最贵的一种错。
 - **`serve --idle 0` 是"立刻上锁",不是"永不"。** 想要永不,别用 0。
+- **`serve` 默认进后台,`stop` 靠 pid 文件找到它。** pid 文件会被核对:
+  里面那个号码现在跑的**不是这个二进制**就拒绝动手(pid 会被回收,而
+  `stop` 发的是 SIGTERM)。对不上时它不杀、也不删那个文件。
 - **`sign --raw` 默认关着。** 那是守护进程里唯一一条能给调用方任意签名的路,
   要用得先 `serve --allow-raw-signing`。
 - **`migrate --allow-different-subject` 默认关。** 默认放行等于让一次打错字
   的 `--to` 变成一次无人察觉的冒名。
-- **`serve` 不给 `--allow-binary` 时会打一条警告。** 只配了 uid 的"多用户"
-  是假的多用户。
+- **`serve --system` 不给 `--allow-binary` 就拒绝启动。** 一个守护进程服务
+  多个 uid 时,uid 已经不是承诺的粒度了 —— 只配了 uid 的"多用户"是假的
+  多用户,那就不过。**不知道值该填什么?** 先拿一个匹配不上的 pin 起一次,
+  守护进程会把每一条被拒的连接连同**可以直接抄进命令行**的那个 pin 写进
+  `log/serve.log`。
 
 ## 它挡什么,不挡什么
 
@@ -226,10 +245,16 @@ cargo install --path . --features mcp           # 多出 mcp
 ├── keys/<thumbprint>.json     0600  信封,一把一个
 ├── dids/<did>.json            0644  已发布的文档(含自签 proof),给外面看
 ├── audit/YYYY-MM.jsonl        0600  审计日志。按月分片,链 + 锚
-└── run/keyd.sock                    守护进程的 Unix socket
+├── log/serve.log              0600  守护进程的日志,给人排查用
+└── run/
+    ├── keyd.sock                    守护进程的 Unix socket
+    └── keyd.pid               0600  它的 pid(`stop` 读这个)
 ```
 
 目录 `0700`,秘密文件 `0600`,公开文件 `0644`。
+
+`log/` 和 `audit/` 是两件事,别混:审计是哈希链加锚,是对外的证据;serve
+日志是给人看的运行记录,随时可以删。
 
 **整份 `~/.anp-keyd/` 拷到另一台机器上是打不开的**,这是设计不是缺陷 ——
 一半的熵是这台机器的 `device.secret`。要在别的机器上用同一把身份,走下面

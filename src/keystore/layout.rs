@@ -7,6 +7,8 @@
 //!   dids/<did-safe>.json             0644  可公开的 did:wba 文档
 //!   audit/2026-10.jsonl              0600  append-only
 //!   run/keyd.sock                    0600
+//!   run/keyd.pid                     0600  守护进程的 pid,`stop` 读它
+//!   log/serve.log                    0600  给人排查用的,和 audit/ 不是一回事
 //! ```
 
 use std::fs::{self, OpenOptions};
@@ -58,6 +60,7 @@ impl KeydLayout {
             self.dids_dir(),
             self.audit_dir(),
             self.run_dir(),
+            self.log_dir(),
         ] {
             fs::create_dir_all(&dir)?;
             fs::set_permissions(&dir, fs::Permissions::from_mode(DIR_MODE))?;
@@ -132,6 +135,27 @@ impl KeydLayout {
 
     pub fn sock_path(&self) -> PathBuf {
         self.run_dir().join("keyd.sock")
+    }
+
+    /// 守护进程写自己 pid 的地方。`stop` 读它。
+    ///
+    /// 放在 `run/` 里:它和 socket 一样是**运行时状态**,进程一没就该没。
+    pub fn pid_path(&self) -> PathBuf {
+        self.run_dir().join("keyd.pid")
+    }
+
+    /// 守护进程的日志目录。
+    ///
+    /// **和 `audit/` 严格分开。** 审计那边是哈希链加锚,是防篡改的证据;
+    /// 这边是给人和 agent 排查用的流水。两样东西写进同一个文件,等于让
+    /// "日志里有这一条"和"这件事发生过"重新变成一回事 —— 那正是审计
+    /// 存在的理由的反面。
+    pub fn log_dir(&self) -> PathBuf {
+        self.root.join("log")
+    }
+
+    pub fn log_path(&self) -> PathBuf {
+        self.log_dir().join("serve.log")
     }
 
     /// 扫出磁盘上所有信封。损坏的文件不跳过 —— 静默忽略一个读不懂的

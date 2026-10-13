@@ -38,6 +38,16 @@ pub enum KeydError {
     #[error("caller asked for a covered component the daemon will not sign: {0}")]
     CoveredSetRejected(String),
 
+    // —— 调用方式 ——
+    /// 工具拒绝照做,而理由和 wire 无关:参数这么配起来不行、磁盘上的状态
+    /// 不是它以为的那样、或者那个 pid 已经不是我们的进程了。
+    ///
+    /// 单开一个变体只为了终端上那一行 —— `Protocol` 的前缀是
+    /// "protocol error:",这些消息挂在它后面会把人往"协议坏了"的方向带,
+    /// 而真实原因就在那句话说的事情本身。
+    #[error("{0}")]
+    Misuse(String),
+
     // —— 其他 ——
     #[error("protocol error: {0}")]
     Protocol(String),
