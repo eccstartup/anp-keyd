@@ -95,6 +95,32 @@ impl KeydLayout {
         self.root.join("audit")
     }
 
+    /// 迁移/注销时用来串行化"读→比→写"的那把锁。
+    ///
+    /// **不是锁文档本身。** `write_atomic` 是 rename,锁住旧 inode 一点用
+    /// 都没有:另一个进程照样能在旧 inode 上拿锁,然后 rename 覆盖掉我们刚
+    /// 写的东西。锁必须是一把谁都不动的文件。
+    pub fn did_lock_path(&self, did: &str) -> PathBuf {
+        self.dids_dir().join(format!("{}.lock", did_safe(did)))
+    }
+
+    /// 扫出磁盘上所有 DID 文档。迁移的环检测靠它 —— 只知道旧文档是不够的。
+    pub fn list_did_paths(&self) -> Result<Vec<PathBuf>> {
+        let dir = self.dids_dir();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "json") {
+                out.push(path);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     /// `year_month` 形如 `2026-10`。
     pub fn audit_path(&self, year_month: &str) -> PathBuf {
         self.audit_dir().join(format!("{year_month}.jsonl"))

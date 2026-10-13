@@ -40,6 +40,51 @@ impl ExtraKey {
     }
 }
 
+/// [`ExtraKey::relationships`] → 上游要的那个 `role`。
+///
+/// 上游把这两者定成了**一对一**:每个角色在 `validate_supplied_key` 里对应
+/// 恰好一组关系,多一个少一个都直接 `InvalidDidDocument`。而 role 本身
+/// **不写进文档** —— 落盘的只有关系数组。所以关系是权威,role 是从它推出来
+/// 的:谁想给一把 Ed25519 附加密钥,就只能选这三种组合之一。
+///
+/// | 关系 | role | 用途 |
+/// |---|---|---|
+/// | `authentication` | `RequestSigning` | 热密钥:日常签名 |
+/// | `assertionMethod` | `E2eeSigning` | 恢复密钥:预授权签一次迁移 |
+/// | 两者都有 | `DeviceSigning` | 既是热密钥又预授权 |
+///
+/// `KeyAgreement` 那一档是 X25519 的,Ed25519 挂不上去 —— 本工具不做
+/// 密钥协商,所以直接报出来而不是让上游用一句 `UnsupportedProfile` 打发。
+fn role_for(
+    relationships: &[anp::authentication::DidVerificationRelationship],
+) -> Result<anp::authentication::DidKeyRole> {
+    use anp::authentication::{DidKeyRole, DidVerificationRelationship as R};
+
+    let mut set = relationships.to_vec();
+    set.sort_by_key(|r| *r as u8);
+    let before = set.len();
+    set.dedup();
+    if set.len() != before {
+        return Err(KeydError::Did(
+            "an extra key lists the same relationship twice".into(),
+        ));
+    }
+
+    match set.as_slice() {
+        [R::Authentication] => Ok(DidKeyRole::RequestSigning),
+        [R::AssertionMethod] => Ok(DidKeyRole::E2eeSigning),
+        [R::Authentication, R::AssertionMethod] => Ok(DidKeyRole::DeviceSigning),
+        [R::KeyAgreement] => Err(KeydError::Did(
+            "a `keyAgreement` key has to be X25519, and this build only makes Ed25519 keys".into(),
+        )),
+        _ => Err(KeydError::Did(
+            "an extra key has no relationships at all, so no document would list it — \
+             a verification method nobody refers to is not a key anyone can use"
+                .into(),
+        )),
+    }
+}
+
 /// 一个 did:wba 的"坐标" —— 文档挂在哪、路径是什么。
 #[derive(Debug, Clone)]
 pub struct DidDocumentSpec {
@@ -91,16 +136,20 @@ pub fn build_unsigned_with(
 ) -> Result<(String, Value)> {
     let additional_keys = extra
         .into_iter()
-        .map(|key| anp::authentication::SuppliedDidKey {
-            fragment: key.fragment,
+        .map(|key| {
             // 上游拒收 role 为 `RootControl` 的附加密钥(index > 0 时直接
             // `InvalidDidDocument`)。这不是我们可以绕的:一个 DID 只能有
-            // 一个根,其余的都得是别的角色。
-            role: anp::authentication::DidKeyRole::RequestSigning,
-            public_key: anp::PublicKeyMaterial::Ed25519(key.public_key),
-            relationships: key.relationships,
+            // 一个根,其余的都得是别的角色 —— 而具体是哪个角色,由它
+            // 挂在哪些关系下决定(见 [`role_for`])。
+            let role = role_for(&key.relationships)?;
+            Ok(anp::authentication::SuppliedDidKey {
+                fragment: key.fragment,
+                role,
+                public_key: anp::PublicKeyMaterial::Ed25519(key.public_key),
+                relationships: key.relationships,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     let options = anp::authentication::SuppliedE1DidDocumentOptions {
         port: spec.port,

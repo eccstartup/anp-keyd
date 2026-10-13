@@ -2,6 +2,7 @@
 
 pub mod document;
 pub mod lifecycle;
+pub mod migrate;
 pub mod parse;
 
 pub use document::{

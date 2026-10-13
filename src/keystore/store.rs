@@ -111,6 +111,10 @@ pub fn envelopes_for_did(layout: &KeydLayout, did: &str) -> Result<Vec<WrappedKe
 /// 剩下"好几把、还都不是绑定密钥"的情况**报错**,列出候选。挑一把最近的、
 /// 最小的或者随便哪一把都是在替调用方决定"用哪把钥匙签名",而签名用的是
 /// 哪把钥匙决定了签名能被谁验过 —— 这种事不许靠猜。
+///
+/// `kid` 是**一个 fragment**(`key-2`、`recovery-1`),不是完整的
+/// `did#fragment`。磁盘上的 `KeyId.kid` 是完整的那个,这里拼一次再比 ——
+/// 拼接发生在**一个地方**,而不是散在每一个调用点。
 pub fn resolve(layout: &KeydLayout, did: &str, kid: Option<&str>) -> Result<WrappedKey> {
     let candidates = envelopes_for_did(layout, did)?;
     if candidates.is_empty() {
@@ -118,11 +122,14 @@ pub fn resolve(layout: &KeydLayout, did: &str, kid: Option<&str>) -> Result<Wrap
     }
 
     if let Some(kid) = kid {
+        let wanted = format!("{did}#{kid}");
         return candidates
             .into_iter()
-            .find(|wrapped| wrapped.id.kid == kid)
+            .find(|wrapped| wrapped.id.kid == wanted)
             .ok_or_else(|| {
-                KeydError::KeyNotFound(format!("{did} has no key with fragment {kid:?}"))
+                KeydError::KeyNotFound(format!(
+                    "{did} has no key named {kid:?}; the ones it has are listed by `anp-keyd list`"
+                ))
             });
     }
 
@@ -212,12 +219,17 @@ mod tests {
     }
 
     fn envelope(thumbprint: &str) -> WrappedKey {
+        let did = format!("did:wba:example.com:user:alice:{thumbprint}");
+        envelope_for(&did, &format!("{did}#key-1"), thumbprint)
+    }
+
+    /// 同一个 DID 上的第 N 把钥匙。
+    fn envelope_for(did: &str, kid: &str, thumbprint: &str) -> WrappedKey {
         let seed = LockedBytes::fill(|d| *d = [0x11; 32]).unwrap();
         let (_, multibase) = seed_to_public(&seed);
-        let did = format!("did:wba:example.com:user:alice:{thumbprint}");
         let device = LockedBytes::fill(|d| *d = [0x22; 32]).unwrap();
         seal(SealRequest {
-            id: KeyId { did: did.clone(), kid: format!("{did}#key-1"), thumbprint: thumbprint.into() },
+            id: KeyId { did: did.to_string(), kid: kid.to_string(), thumbprint: thumbprint.into() },
             algorithm: KeyAlgorithm::Ed25519,
             public_multibase: multibase,
             label: "alice".into(),
@@ -308,6 +320,92 @@ mod tests {
     }
 
     use std::os::unix::fs::PermissionsExt;
+
+    // ————————————————————————————————————————————————————————————————————
+    // 一个 DID 上不止一把钥匙之后,`resolve` 就是"用哪把签名"的答案。
+    // 每一条规则都对应一种**会静默签错钥匙**的失败方式。
+    // ————————————————————————————————————————————————————————————————————
+
+    const DID: &str = "did:wba:example.com:user:alice:e1_bind";
+
+    /// 只给 DID:选**绑定密钥**,而不是碰巧也在的那把热密钥。
+    ///
+    /// 挂上热密钥之后,老调用方手里还是只有那个 DID。这时候要是按
+    /// "钥匙数量"之类的规则去挑,他们的签名就会在某一天悄悄换成另一把钥匙
+    /// 签的 —— 而验签方那边只会看到一个"验不过"。
+    #[test]
+    fn the_binding_key_is_the_default_even_when_a_hot_key_is_present() {
+        let l = layout("resolve-default");
+        save_new(&l, &envelope_for(DID, &format!("{DID}#key-1"), "e1_bind")).unwrap();
+        save_new(&l, &envelope_for(DID, &format!("{DID}#key-2"), "e1_hot")).unwrap();
+
+        let picked = resolve(&l, DID, None).unwrap();
+        assert_eq!(picked.id.kid, format!("{DID}#key-1"));
+        assert_eq!(picked.id.thumbprint, "e1_bind");
+
+        let _ = fs::remove_dir_all(l.root());
+    }
+
+    /// 给了 fragment:**就**是那一把,不许退回绑定密钥。
+    #[test]
+    fn an_explicit_fragment_selects_exactly_that_key() {
+        let l = layout("resolve-explicit");
+        save_new(&l, &envelope_for(DID, &format!("{DID}#key-1"), "e1_bind")).unwrap();
+        save_new(&l, &envelope_for(DID, &format!("{DID}#key-2"), "e1_hot")).unwrap();
+
+        let picked = resolve(&l, DID, Some("key-2")).unwrap();
+        assert_eq!(picked.id.thumbprint, "e1_hot");
+
+        // 不存在的那一个:找不到就是找不到,而不是"那用默认的吧"。
+        let e = resolve(&l, DID, Some("key-9")).unwrap_err();
+        assert!(matches!(e, KeydError::KeyNotFound(_)), "{e}");
+
+        let _ = fs::remove_dir_all(l.root());
+    }
+
+    /// 绑定密钥不在本机、又有好几把备选:**报错**,不替调用方挑。
+    ///
+    /// 这是唯一一处必须失败的地方 —— 挑错钥匙等于把一个签名挂到另一把
+    /// 验证密钥名下,而验签方没有义务接受。
+    #[test]
+    fn two_candidates_and_no_binding_key_is_an_error_not_a_guess() {
+        let l = layout("resolve-ambiguous");
+        save_new(&l, &envelope_for(DID, &format!("{DID}#key-2"), "e1_hot")).unwrap();
+        save_new(&l, &envelope_for(DID, &format!("{DID}#key-3"), "e1_warm")).unwrap();
+
+        let error = resolve(&l, DID, None).unwrap_err().to_string();
+        assert!(error.contains("key-2"), "{error} must name the candidates");
+        assert!(error.contains("key-3"), "{error} must name the candidates");
+
+        // 但指到具体那一个就没问题。
+        assert!(resolve(&l, DID, Some("key-3")).is_ok());
+
+        let _ = fs::remove_dir_all(l.root());
+    }
+
+    /// 只有一把、又不是绑定密钥:用它。这里没有可挑的余地,报错只是折腾人。
+    #[test]
+    fn a_single_non_binding_key_is_used() {
+        let l = layout("resolve-single");
+        save_new(&l, &envelope_for(DID, &format!("{DID}#key-2"), "e1_hot")).unwrap();
+        assert_eq!(resolve(&l, DID, None).unwrap().id.kid, format!("{DID}#key-2"));
+        let _ = fs::remove_dir_all(l.root());
+    }
+
+    /// `envelopes_for_did` 不能只看文件名 —— 热密钥的文件名是它**自己的**
+    /// 公钥指纹,和 DID 最后一段对不上。
+    #[test]
+    fn envelopes_for_a_did_finds_keys_whose_filename_is_not_the_did() {
+        let l = layout("resolve-siblings");
+        save_new(&l, &envelope_for(DID, &format!("{DID}#key-1"), "e1_bind")).unwrap();
+        save_new(&l, &envelope_for(DID, &format!("{DID}#key-2"), "e1_hot")).unwrap();
+        save_new(&l, &envelope("e1_other")).unwrap();
+
+        let found = envelopes_for_did(&l, DID).unwrap();
+        assert_eq!(found.len(), 2, "the hot key's file is named after its own thumbprint");
+
+        let _ = fs::remove_dir_all(l.root());
+    }
 
     #[test]
     fn did_documents_land_world_readable() {

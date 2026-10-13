@@ -90,6 +90,61 @@ pub enum Event {
     Swept {
         dropped: usize,
     },
+    /// 换了一把热密钥。**新旧的 fragment 都要记** —— 只说"轮换过"回答不了
+    /// "哪把钥匙从什么时候起不再被信任",而那正是事后要看的东西。
+    RotateHot {
+        did: String,
+        retired_kid: Option<String>,
+        new_kid: String,
+        /// 轮换之后那份文档的指纹。文档改了,记下来才能和线上那一份对上。
+        document_digest: String,
+    },
+    /// 加了一把恢复密钥(预授权,存在 `assertionMethod` 里)。
+    AddRecoveryKey {
+        did: String,
+        kid: String,
+        document_digest: String,
+    },
+    /// 摘掉一把非绑定密钥。
+    RemoveKey {
+        did: String,
+        kid: String,
+        document_digest: String,
+    },
+    /// 迁移:旧文档被标成已注销并指向后继。
+    Migrate {
+        did: String,
+        successor: String,
+        document_digest: String,
+        /// 两个 DID 的 stable subject path 是否相同 —— 不同就是一次换域名,
+        /// 那条边的可信度低一档,事后要看得出区别。
+        same_subject: bool,
+    },
+    /// 永久注销(或注销并指向后继 —— 那其实是迁移,这里记的是没有后继的那种)。
+    Deactivate {
+        did: String,
+        successor: Option<String>,
+        document_digest: String,
+    },
+    /// 导出种子。**编译期不在默认构建里**(`seed-export` 特性),但审计格式
+    /// 留着:一个开着导出的构建写出来的日志,默认构建也得读得懂。
+    ExportSeed {
+        did: String,
+        /// 导出物是"24 个词"还是"归档"。
+        form: String,
+    },
+    /// 把一把身份导入这台机器 —— 可能是克隆,所以 `source` 要记清楚。
+    ///
+    /// **导入的后果是"这台机器从此也持着这把身份"**,而密钥不可撤销:
+    /// 旧设备那份拷贝还活着。事后查"这台机器上什么时候多出来一把身份"
+    /// 靠的就是这一条。
+    Import {
+        did: String,
+        kid: String,
+        /// `mnemonic` 或 `archive`。
+        source: String,
+        document_digest: String,
+    },
 }
 
 /// `.anchor` 的内容。

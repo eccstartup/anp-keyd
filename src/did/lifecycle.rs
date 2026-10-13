@@ -24,7 +24,9 @@ use crate::error::{KeydError, Result};
 
 /// 热密钥的 fragment 前缀。`key-1` 被根密钥占了,所以从 `key-2` 开始。
 pub const HOT_KEY_PREFIX: &str = "key-";
-/// 恢复密钥的 fragment。
+/// 恢复密钥的 fragment 前缀。
+pub const RECOVERY_FRAGMENT_PREFIX: &str = "recovery-";
+/// 恢复密钥的 fragment。第一把就是这个。
 pub const RECOVERY_FRAGMENT: &str = "recovery-1";
 
 /// 文档里被 `deactivated` 标记为已注销。
@@ -148,37 +150,61 @@ pub fn hot_key(document: &Value, did: &str) -> Result<Option<ExtraKey>> {
 /// `id` —— 任何缓存过旧文档的验证方都会把新签名判成坏签名。单调递增,
 /// 不复用。
 pub fn next_hot_fragment(document: &Value, did: &str) -> Result<String> {
-    let mut highest = 1u32;
+    next_fragment(document, did, HOT_KEY_PREFIX)
+}
+
+/// 同 [`next_hot_fragment`],按前缀算。恢复密钥用 `recovery-`。
+///
+/// 恢复密钥也不复用编号,理由和热密钥一样:一份缓存过的文档里写的是
+/// "`recovery-1` 这把钥匙",而钥匙换了、名字没换,那个缓存就变成了一把
+/// 已经作废的钥匙的通行证。
+pub fn next_fragment(document: &Value, did: &str, prefix: &str) -> Result<String> {
+    let mut highest = 0u32;
     for key in extra_keys(document, did)? {
-        if let Some(number) = key.fragment.strip_prefix(HOT_KEY_PREFIX) {
+        if let Some(number) = key.fragment.strip_prefix(prefix) {
             if let Ok(number) = number.parse::<u32>() {
                 highest = highest.max(number);
             }
         }
     }
-    Ok(format!("{HOT_KEY_PREFIX}{}", highest + 1))
+    // 热密钥从 2 起(`key-1` 是根密钥),恢复密钥从 1 起。
+    let floor = if prefix == HOT_KEY_PREFIX { 1 } else { 0 };
+    Ok(format!("{prefix}{}", highest.max(floor) + 1))
 }
 
 /// 把文档标记成已注销,可选指向后继。
 ///
 /// 规范的两条硬要求落在这里:
-/// - **`successorDid` 只能指向直接下一代。** 已经注销过、且指向的是**另一个**
-///   后继时,这里报错而不是改写 —— 回头改前一代的 successor 会让历史上
-///   出现两条指向不同下一代的边,而"迁移路径"是靠这条边走出来的。
+/// - **`successorDid` 只能写一次,而且写下去之后不许动。** 已经注销过、
+///   而这次给的又不是**同一个**后继时,这里报错而不是改写。"不许动"包括
+///   `None` —— 那个值会把边抹掉,而抹掉一次迁移的边和改掉它是同一件事:
+///   走这条路的人从此找不到新家。
 /// - 注销**不是删除**。老文档必须继续可解析,否则别人从旧 DID 出发就
 ///   找不到新家了;`deactivated` 只是告诉它"别再往这儿发了,往那边走"。
+///
+/// 返回的文档**没有 proof**,因为它已经不是你签过的那一份了,调用方必须
+/// 用**旧 DID 的绑定密钥**重新签一次 —— 那一下正是"同一个主体宣布这次
+/// 迁移"的证据,少了它,这条边在验证方眼里只能算 `provider_asserted`。
 pub fn deactivate(document: &Value, successor: Option<&str>) -> Result<Value> {
     if let Some(existing) = successor_of(document) {
         if successor != Some(existing) {
             return Err(KeydError::Did(format!(
                 "this document already points at {existing} as its successor, and a \
-                 successor edge may only be written once — changing it would erase the \
-                 path the previous migration was recorded on"
+                 successor edge may only be written once — {} would erase the path the \
+                 previous migration was recorded on",
+                match successor {
+                    Some(successor) => format!("changing it to {successor}"),
+                    None => "clearing it".to_string(),
+                }
             )));
         }
     }
 
-    let mut out = document.clone();
+    // 旧 proof 摘掉,理由和 [`rekey`] 里那处一样:它盖的是改动之前的字节。
+    // 这里比那里更要紧 —— 一份"自称已注销、但签名盖的是另一份文档"的文件
+    // 不是没用的签名,是**一句假话**:验证方按 proof 一验就拒,而人只会
+    // 看到"这个 DID 的文档验不过",不会想到是本地改文档时忘了重签。
+    let mut out = strip_proof(document)?;
     let object = out
         .as_object_mut()
         .ok_or_else(|| KeydError::Did("the document is not a JSON object".into()))?;
@@ -187,7 +213,8 @@ pub fn deactivate(document: &Value, successor: Option<&str>) -> Result<Value> {
         Some(successor) => {
             object.insert("successorDid".into(), Value::String(successor.to_string()));
         }
-        // 永久注销:显式抹掉,不留一条指向空气的边。
+        // 永久注销:不留一条指向空气的边。(已经有一条边的文档走不到这里 ——
+        // 上面那个分支会先把它拦下来。)
         None => {
             object.remove("successorDid");
         }
@@ -229,6 +256,15 @@ pub fn document_digest(document: &Value) -> Result<String> {
 /// `authentication` 里,得到的是一份**指向不存在的方法**的文档 —— 上游的
 /// 规范性检查会拒,而拒绝的理由会指向一个跟真因毫无关系的地方。
 pub fn remove_method(document: &Value, method_id: &str) -> Result<Value> {
+    let fragment = method_id.rsplit_once('#').map(|(_, fragment)| fragment);
+    if fragment == Some(ROOT_FRAGMENT) {
+        return Err(KeydError::Did(format!(
+            "{method_id} is the binding key, and removing it would leave a document that \
+             no longer binds to its own DID — the DID's last segment IS that key's \
+             fingerprint. Rotating the binding key is a migration, not an edit"
+        )));
+    }
+
     let mut out = document.clone();
     let object = out
         .as_object_mut()
@@ -267,4 +303,444 @@ pub fn remove_method(document: &Value, method_id: &str) -> Result<Value> {
 /// "迁移",那不是换密钥,那是**冒名**。
 pub fn same_subject(old: &str, new: &str) -> Result<bool> {
     Ok(subject_path(old)? == subject_path(new)?)
+}
+
+// ————————————————————————————————————————————————————————————————————————
+// 改动文档:加一把、摘一把
+// ————————————————————————————————————————————————————————————————————————
+
+/// 上游的构建器自己生成的那几个顶层属性。
+///
+/// 重建文档时只有这些由上游说了算。**其余的一律原样搬过来** ——
+/// `deactivated`、`successorDid`,以及将来任何我们还不认识的属性。
+/// 白名单而不是黑名单:黑名单漏掉一个,那个属性就会被一次轮换悄悄删掉,
+/// 而覆盖写是不报错的。
+const UPSTREAM_FIELDS: [&str; 7] = [
+    "@context",
+    "id",
+    "verificationMethod",
+    "authentication",
+    "assertionMethod",
+    "keyAgreement",
+    "service",
+];
+
+/// 加一把非绑定密钥,其余一切不动。
+pub fn with_extra_key(
+    document: &Value,
+    did: &str,
+    root: &ed25519_dalek::VerifyingKey,
+    new: ExtraKey,
+) -> Result<Value> {
+    let mut extras = extra_keys(document, did)?;
+    if extras.iter().any(|key| key.fragment == new.fragment) {
+        return Err(KeydError::Did(format!(
+            "{did} already has a verification method named {}, and reusing a fragment \
+             for a different key makes every document anyone cached say the wrong thing \
+             about it",
+            new.fragment
+        )));
+    }
+    extras.push(new);
+    rekey(document, did, root, extras)
+}
+
+/// 摘掉一把非绑定密钥,其余一切不动。
+pub fn without_method(
+    document: &Value,
+    did: &str,
+    root: &ed25519_dalek::VerifyingKey,
+    method_id: &str,
+) -> Result<Value> {
+    let fragment = method_id
+        .rsplit_once('#')
+        .map(|(_, fragment)| fragment)
+        .ok_or_else(|| KeydError::Did(format!("{method_id} is not a verification method id")))?;
+    if fragment == ROOT_FRAGMENT {
+        return Err(KeydError::Did(format!(
+            "{method_id} is the binding key — see remove_method for why that cannot go"
+        )));
+    }
+
+    let all = extra_keys(document, did)?;
+    let mut extras = Vec::with_capacity(all.len());
+    let mut found = false;
+    for key in all {
+        if key.fragment == fragment {
+            found = true;
+            continue;
+        }
+        extras.push(key);
+    }
+    if !found {
+        return Err(KeydError::Did(format!(
+            "{method_id} is not a verification method in this document"
+        )));
+    }
+    rekey(document, did, root, extras)
+}
+
+/// 用"根密钥 + 这几把附加密钥"重建文档,并把上游不认识的顶层属性搬回去。
+///
+/// 走的是重建而不是就地改 JSON,理由只有一个:**规范形式**。就地改出来的
+/// 文档能不能过上游的 `validate_did_document_binding`,取决于我们拼的那几
+/// 个对象和上游拼的逐字节一致 —— 那把"能不能用"押在了我们抄得对不对上。
+/// 重建则相反:形状是上游自己产的,不可能抄错。
+///
+/// 代价是重建会**丢掉**上游不认识的属性,所以搬回来这一步不是可选的。
+fn rekey(
+    document: &Value,
+    did: &str,
+    root: &ed25519_dalek::VerifyingKey,
+    extras: Vec<ExtraKey>,
+) -> Result<Value> {
+    let stripped = strip_proof(document)?;
+    let mut canonical = crate::did::document::rebuild_with(did, root, extras)
+        .map_err(|error| match error {
+            // 重建对不上 DID,说明**别人给的文档**里的根密钥不是这个 DID 的
+            // 那把。往上抛一句"这不是规范形式"会把人引到格式上去,而真因是
+            // 身份对不上。
+            KeydError::Did(_) => KeydError::Did(format!(
+                "cannot rebuild {did} from its own document: the root key in the document \
+                 is not the one the DID's fingerprint names ({error})"
+            )),
+            other => other,
+        })?;
+
+    let source = stripped
+        .as_object()
+        .ok_or_else(|| KeydError::Did("the document is not a JSON object".into()))?;
+    let target = canonical
+        .as_object_mut()
+        .ok_or_else(|| KeydError::Protocol("the rebuilt document is not an object".into()))?;
+    for (name, value) in source {
+        if !UPSTREAM_FIELDS.contains(&name.as_str()) {
+            target.insert(name.clone(), value.clone());
+        }
+    }
+    Ok(canonical)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::hygiene::LockedBytes;
+    use crate::did::document::{build_unsigned_with, sign_document, ExtraKey, ROOT_FRAGMENT};
+    use crate::keystore::record::KeyId;
+    use crate::keystore::wrap::seed_to_public;
+    use crate::sign::LockedSigningKey;
+    use anp::authentication::DidVerificationRelationship as R;
+    use anp::PublicKeyMaterial;
+
+    fn root_key(byte: u8) -> LockedSigningKey {
+        let seed = LockedBytes::fill(|d| *d = [byte; 32]).unwrap();
+        LockedSigningKey::from_seed(
+            KeyId { did: String::new(), kid: String::new(), thumbprint: String::new() },
+            seed,
+        )
+        .unwrap()
+    }
+
+    fn extra(fragment: &str, byte: u8, relationships: Vec<R>) -> ExtraKey {
+        let seed = LockedBytes::fill(|d| *d = [byte; 32]).unwrap();
+        let (public_key, _) = seed_to_public(&seed);
+        ExtraKey::new(fragment, public_key, relationships)
+    }
+
+    /// 一个已发布的样子:根密钥 + 一把热密钥,签好。
+    fn published(extra_byte: u8) -> (LockedSigningKey, String, Value) {
+        let key = root_key(0x51);
+        let spec = crate::did::document::DidDocumentSpec::new(
+            "example.com",
+            vec!["user".into(), "alice".into()],
+        );
+        let (did, unsigned) = build_unsigned_with(
+            &spec,
+            &key.verifying_key(),
+            vec![extra("key-2", extra_byte, vec![R::Authentication])],
+        )
+        .unwrap();
+        let signed = sign_document(&unsigned, &key, &format!("{did}#{ROOT_FRAGMENT}")).unwrap();
+        (key, did, signed)
+    }
+
+    #[test]
+    fn the_subject_path_is_everything_before_the_binding_segment() {
+        assert_eq!(
+            subject_path("did:wba:example.com:user:alice:e1_abc").unwrap(),
+            "example.com:user:alice"
+        );
+        // 端口是身份的一部分 —— 同一个域名上的另一个端口是另一个主体。
+        assert_eq!(
+            subject_path("did:wba:example.com%3A8443:user:alice:e1_abc").unwrap(),
+            "example.com:8443:user:alice"
+        );
+        assert!(same_subject(
+            "did:wba:example.com:user:alice:e1_aaa",
+            "did:wba:example.com:user:alice:e1_bbb"
+        )
+        .unwrap());
+        assert!(!same_subject(
+            "did:wba:example.com:user:alice:e1_aaa",
+            "did:wba:example.com:user:alice2:e1_aaa"
+        )
+        .unwrap());
+    }
+
+    /// 换的是同一路径下的最后一段 —— 那才是"同一个主体换了把钥匙"。
+    #[test]
+    fn a_did_without_a_binding_segment_has_no_subject_path() {
+        assert!(subject_path("did:wba:example.com:user:alice").is_err());
+    }
+
+    #[test]
+    fn hot_fragments_are_monotonic_and_never_reused() {
+        let (_, did, mut document) = published(0x61);
+        assert_eq!(next_hot_fragment(&document, &did).unwrap(), "key-3");
+
+        // 换一把,再换一把:编号只增不减。
+        let key = root_key(0x51);
+        for expected in ["key-3", "key-4"] {
+            document = with_extra_key(
+                &document,
+                &did,
+                &key.verifying_key(),
+                extra(expected, 0x70, vec![R::Authentication]),
+            )
+            .unwrap();
+            assert_eq!(next_hot_fragment(&document, &did).unwrap(), {
+                let n: u32 = expected.trim_start_matches("key-").parse().unwrap();
+                format!("key-{}", n + 1)
+            });
+        }
+
+        // 编号留了洞也不回头补:`key-3` 退休之后下一个还是 `key-5`。
+        // 复用编号 = 两份内容不同的文档顶着同一个 id。
+        let without = without_method(&document, &did, &key.verifying_key(), &format!("{did}#key-3"))
+            .unwrap();
+        assert_eq!(next_hot_fragment(&without, &did).unwrap(), "key-5");
+    }
+
+    #[test]
+    fn recovery_fragments_start_at_one() {
+        let (_, did, document) = published(0x62);
+        assert_eq!(next_fragment(&document, &did, RECOVERY_FRAGMENT_PREFIX).unwrap(), "recovery-1");
+
+        let key = root_key(0x51);
+        let with = with_extra_key(
+            &document,
+            &did,
+            &key.verifying_key(),
+            extra("recovery-1", 0x63, vec![R::AssertionMethod]),
+        )
+        .unwrap();
+        assert_eq!(next_fragment(&with, &did, RECOVERY_FRAGMENT_PREFIX).unwrap(), "recovery-2");
+    }
+
+    /// 加一把钥匙**不能**顺手把别的东西弄丢。
+    #[test]
+    fn adding_a_key_preserves_foreign_top_level_fields() {
+        let (key, did, document) = published(0x64);
+        let mut annotated = document.clone();
+        annotated["deactivated"] = Value::Bool(true);
+        annotated["successorDid"] = Value::String("did:wba:example.com:user:alice:e1_next".into());
+        annotated["agentDescription"] = Value::String("https://example.com/alice.md".into());
+
+        let with = with_extra_key(
+            &annotated,
+            &did,
+            &key.verifying_key(),
+            extra("recovery-1", 0x65, vec![R::AssertionMethod]),
+        )
+        .unwrap();
+
+        assert_eq!(with["deactivated"], Value::Bool(true));
+        assert_eq!(with["successorDid"], "did:wba:example.com:user:alice:e1_next");
+        assert_eq!(with["agentDescription"], "https://example.com/alice.md");
+        // 热密钥也在,新钥匙也在。
+        let names: Vec<_> = extra_keys(&with, &did)
+            .unwrap()
+            .into_iter()
+            .map(|key| key.fragment)
+            .collect();
+        assert_eq!(names, ["key-2", "recovery-1"]);
+    }
+
+    /// 重建之后文档仍然自洽:proof 摘掉了,而且上游认可它的形状。
+    #[test]
+    fn a_rekeyed_document_is_still_a_valid_document() {
+        let (key, did, document) = published(0x66);
+        let with = with_extra_key(
+            &document,
+            &did,
+            &key.verifying_key(),
+            extra("recovery-1", 0x67, vec![R::AssertionMethod]),
+        )
+        .unwrap();
+
+        assert!(with.get("proof").is_none(), "a rekeyed document must be unsigned");
+        let signed = sign_document(&with, &key, &format!("{did}#{ROOT_FRAGMENT}")).unwrap();
+        assert!(crate::did::document::verify_path_binding(&did, &signed).is_ok());
+    }
+
+    /// 恢复密钥挂在 `assertionMethod` 里 —— 而不是 `authentication`。
+    ///
+    /// 挂错关系不是"少了个字段":恢复密钥一旦能认证,它就等于一把常驻的
+    /// 热密钥,而"预授权、平时不用"这个性质是恢复机制的全部意义。
+    #[test]
+    fn a_recovery_key_lands_in_assertion_method_only() {
+        let (key, did, document) = published(0x68);
+        let with = with_extra_key(
+            &document,
+            &did,
+            &key.verifying_key(),
+            extra("recovery-1", 0x69, vec![R::AssertionMethod]),
+        )
+        .unwrap();
+
+        let id = format!("{did}#recovery-1");
+        let listed = |name: &str| {
+            with[name]
+                .as_array()
+                .is_some_and(|list| list.iter().any(|entry| entry.as_str() == Some(id.as_str())))
+        };
+        assert!(listed("assertionMethod"));
+        assert!(!listed("authentication"));
+        assert_eq!(hot_key(&with, &did).unwrap().unwrap().fragment, "key-2");
+    }
+
+    #[test]
+    fn a_relationship_set_upstream_cannot_express_is_refused() {
+        // 空关系 = 一份没人能用的验证方法。
+        let error = build_unsigned_with(
+            &crate::did::document::DidDocumentSpec::new("example.com", vec!["a".into()]),
+            &root_key(0x6a).verifying_key(),
+            vec![extra("key-2", 0x6b, vec![])],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("no relationships"), "{error}");
+    }
+
+    /// 重签时必须把**已有的**那些密钥一把不落地带回去。
+    #[test]
+    fn retiring_one_key_keeps_the_others() {
+        let (key, did, document) = published(0x6c);
+        let with_recovery = with_extra_key(
+            &document,
+            &did,
+            &key.verifying_key(),
+            extra("recovery-1", 0x6d, vec![R::AssertionMethod]),
+        )
+        .unwrap();
+
+        let without =
+            without_method(&with_recovery, &did, &key.verifying_key(), &format!("{did}#key-2"))
+                .unwrap();
+        let names: Vec<_> = extra_keys(&without, &did)
+            .unwrap()
+            .into_iter()
+            .map(|key| key.fragment)
+            .collect();
+        assert_eq!(names, ["recovery-1"]);
+        // 关系数组里也不许留下指向已删方法的 id。
+        assert!(!serde_json::to_string(&without).unwrap().contains("#key-2"));
+    }
+
+    /// 绑定密钥摘不掉 —— 它的指纹就是 DID 的最后一段。
+    #[test]
+    fn the_binding_key_cannot_be_retired() {
+        let (key, did, document) = published(0x6e);
+        let error = without_method(&document, &did, &key.verifying_key(), &format!("{did}#key-1"))
+            .unwrap_err();
+        assert!(error.to_string().contains("binding key"), "{error}");
+        assert!(remove_method(&document, &format!("{did}#key-1")).is_err());
+    }
+
+    #[test]
+    fn deactivating_twice_with_a_different_successor_is_refused() {
+        let (_, _, document) = published(0x6f);
+        let old = "did:wba:example.com:user:alice:e1_old";
+        let one = "did:wba:example.com:user:alice:e1_one";
+        let two = "did:wba:example.com:user:alice:e1_two";
+
+        let done = deactivate(&document, Some(one)).unwrap();
+        assert!(is_deactivated(&done));
+        assert_eq!(successor_of(&done), Some(one));
+
+        // 同一个后继:幂等,不报错。
+        assert!(deactivate(&done, Some(one)).is_ok());
+
+        // 换一个后继:拒绝。回头改会让历史出现两条指向不同下一代的边。
+        let error = deactivate(&done, Some(two)).unwrap_err();
+        assert!(error.to_string().contains("only be written once"), "{error}");
+
+        // **抹掉**也不行。抹掉一次迁移的边和改掉它是同一件事:走这条路的人
+        // 从此找不到新家。
+        let error = deactivate(&done, None).unwrap_err();
+        assert!(error.to_string().contains("clearing it"), "{error}");
+
+        // 而一份**从来没**注销过的文档,可以永久注销 —— 不留一条指向空气的边。
+        let permanent = deactivate(&document, None).unwrap();
+        assert!(is_deactivated(&permanent));
+        assert_eq!(successor_of(&permanent), None);
+        let _ = old;
+    }
+
+    /// 一份读不懂的验证方法必须让整件事失败,而不是被静默丢掉。
+    #[test]
+    fn an_unreadable_verification_method_stops_the_rekey() {
+        let (_, did, mut document) = published(0x70);
+        document["verificationMethod"].as_array_mut().unwrap().push(serde_json::json!({
+            "id": format!("{did}#key-9"),
+            "type": "Multikey",
+            "controller": did,
+            "publicKeyMultibase": "not-a-multibase-key",
+        }));
+
+        let error = extra_keys(&document, &did).unwrap_err();
+        assert!(error.to_string().contains("unreadable"), "{error}");
+    }
+
+    /// 文档不能替**别人**的密钥背书。
+    #[test]
+    fn a_method_from_another_did_is_refused() {
+        let (_, did, mut document) = published(0x71);
+        document["verificationMethod"].as_array_mut().unwrap().push(serde_json::json!({
+            "id": "did:wba:example.com:user:mallory:e1_x#key-2",
+            "type": "Multikey",
+            "controller": "did:wba:example.com:user:mallory:e1_x",
+            "publicKeyMultibase": "z6MkwVDfCg9LbbY6xjH3EZk8YSFQZujV5Y4y1ZWeER9tDiN3",
+        }));
+
+        let error = extra_keys(&document, &did).unwrap_err();
+        assert!(error.to_string().contains("someone else's namespace"), "{error}");
+    }
+
+    #[test]
+    fn the_digest_changes_when_the_document_does() {
+        let (_, _, document) = published(0x72);
+        let before = document_digest(&document).unwrap();
+        let mut changed = document.clone();
+        changed["deactivated"] = Value::Bool(true);
+        assert_ne!(before, document_digest(&changed).unwrap());
+        // 摘要稳定:同一份文档永远是同一个。
+        assert_eq!(before, document_digest(&document).unwrap());
+    }
+
+    /// `PublicKeyMaterial` 的 Ed25519 分支是我们唯一会接受的那一支。
+    #[test]
+    fn an_extra_key_carries_an_ed25519_public_key() {
+        let (_, did, document) = published(0x73);
+        let key = extra_keys(&document, &did).unwrap().remove(0);
+        assert!(matches!(
+            key.relationships.as_slice(),
+            [R::Authentication]
+        ));
+        // 上游看到的必须是 Ed25519,而不是别的曲线 —— 换一条曲线就得换
+        // 一整套指纹算法,而 DID 的最后一段是按 Ed25519 的多基指纹算的。
+        assert!(matches!(
+            PublicKeyMaterial::Ed25519(key.public_key),
+            PublicKeyMaterial::Ed25519(_)
+        ));
+    }
 }

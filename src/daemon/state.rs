@@ -132,8 +132,8 @@ impl Vault {
 
     /// 解开一个信封并留在内存里。口令在这里用完就擦。
     ///
-    /// `kid` 是 `did#fragment`;不给就按 [`store::resolve`] 的规则选,也就是
-    /// 绑定密钥优先。
+    /// `kid` 是 **fragment**(`key-2`);不给就按 [`store::resolve`] 的规则选,
+    /// 也就是绑定密钥优先。`unlocked` 的键是完整的 `did#fragment`。
     fn unlock(
         &mut self,
         did: &str,
@@ -172,6 +172,9 @@ impl Vault {
     /// 给了 `did` 而没给 `kid`:把这个 DID 底下**当时解锁着的**全放掉。
     /// 这把钥匙那个 DID 底下本来可能有热度密钥两把都开着,锁一把留一把
     /// 是另一种语义(而且没人要过),不能靠"顺手实现成哪个"来决定。
+    ///
+    /// `kid` 是 **fragment**(`key-2`),和 `--kid`、和线上协议一致;`unlocked`
+    /// 的键是完整的 `did#fragment`,拼接在这里做一次。
     fn lock(&mut self, did: Option<&str>, kid: Option<&str>) -> usize {
         match did {
             None => {
@@ -183,7 +186,7 @@ impl Vault {
                 let before = self.unlocked.len();
                 match kid {
                     Some(kid) => {
-                        self.unlocked.remove(kid);
+                        self.unlocked.remove(&format!("{did}#{kid}"));
                     }
                     None => {
                         let prefix = format!("{did}#");
