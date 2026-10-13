@@ -1,0 +1,669 @@
+//! 守护进程的状态:**谁解锁了哪把钥匙,以及它现在还在不在内存里**。
+//!
+//! ## 命名空间就是 uid
+//!
+//! 这是这个模块里唯一重要的结构决定:已解锁的钥匙不是存在一个全局表里,
+//! 而是**按对端 uid 分的 vault**,每个 vault 有自己的磁盘根
+//! (`/var/lib/anp-keyd/users/<uid>`)。
+//!
+//! 于是"uid A 用不了 uid B 的钥匙"不是一条需要记得去执行的检查,而是
+//! **没有那个入口**:一个请求能说出任何 did,但 did 只会在调用者自己那个
+//! vault 里被查。A 说出 B 的 did,结果和说一个不存在的 did 完全一样。
+//! 检查会漏、会被绕过、会在重构时被挪走;"查不到"不会。
+//!
+//! ## 锁着的时候,内存里没有钥匙
+//!
+//! 没解锁的钥匙,在这个进程里**不存在**。不是"存在但被拦住",是真的
+//! 没有 —— 只有解开的那些在 `mlock` 住的页里躺着,其余时候守护进程手上
+//! 只有磁盘上的信封。所以"杀掉守护进程"和"锁上"在密钥这件事上是同一件事。
+
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use zeroize::Zeroizing;
+
+use crate::daemon::autolock::Autolock;
+use crate::daemon::peer::PeerPolicy;
+use crate::daemon::wire::{KeySummary, UnlockedKey};
+use crate::did::parse::parse_did_wba;
+use crate::error::{KeydError, Result};
+use crate::keystore::{device, layout::KeydLayout, store};
+use crate::sign::{ed25519::LockedSigningKey, rfc9421};
+
+/// 磁盘根从哪来。
+pub enum Roots {
+    /// 单用户:整个守护进程只服务 `~/.anp-keyd` 这一个命名空间。
+    Single(KeydLayout),
+    /// 系统服务:`/var/lib/anp-keyd/users/<uid>`,对端 uid 决定用哪个。
+    PerUid,
+}
+
+impl Roots {
+    /// 对端 uid → 它的磁盘根。
+    ///
+    /// `Single` 分支**不看 uid** —— 它只会拿到自己的 uid(对端授权在
+    /// [`PeerPolicy::admit`] 那一层已经做过),所以这里没有可以搞错的地方。
+    pub fn layout_for(&self, uid: u32) -> Result<KeydLayout> {
+        match self {
+            Roots::Single(layout) => Ok(KeydLayout::at(layout.root().to_path_buf())),
+            Roots::PerUid => KeydLayout::system(uid),
+        }
+    }
+}
+
+/// 一把已经解开、正躺在 `mlock` 页里的钥匙。
+struct Unlocked {
+    key: LockedSigningKey,
+    /// 什么时候解开的。只用来回答 `status`(给人类看"开了多久")。
+    unlocked_at: Instant,
+    /// 最后一次被用。空闲超时从这一刻起算。
+    last_used: Instant,
+}
+
+/// 一个 uid 的命名空间。
+pub struct Vault {
+    layout: KeydLayout,
+    unlocked: BTreeMap<String, Unlocked>,
+}
+
+impl Vault {
+    fn new(layout: KeydLayout) -> Self {
+        Self { layout, unlocked: BTreeMap::new() }
+    }
+
+    pub fn layout(&self) -> &KeydLayout {
+        &self.layout
+    }
+
+    /// 把空闲太久的钥匙放掉。
+    ///
+    /// 这个动作在**每次访问之前**都跑一遍,所以超时是真的成立,不管有没有
+    /// 一个后台清扫任务在跑。后台那一份只是让"没人访问"的时候也能及时锁上,
+    /// 是体验,不是保证。
+    fn sweep(&mut self, autolock: Autolock, now: Instant) {
+        self.unlocked.retain(|_, entry| {
+            !autolock.is_expired(now.saturating_duration_since(entry.last_used))
+        });
+    }
+
+    /// 磁盘上所有的信封 —— 不需要解锁就能列。
+    pub fn list_keys(&self) -> Result<Vec<KeySummary>> {
+        Ok(store::load_all(&self.layout)?
+            .into_iter()
+            .map(|wrapped| KeySummary {
+                did: wrapped.id.did,
+                kid: wrapped.id.kid,
+                algorithm: wrapped.algorithm,
+            })
+            .collect())
+    }
+
+    /// 当前解锁着的钥匙。调用方先 [`Vault::sweep`],这里就只管报。
+    pub fn unlocked_keys(&self, now: Instant) -> Vec<UnlockedKey> {
+        self.unlocked
+            .values()
+            .map(|entry| UnlockedKey {
+                did: entry.key.id().did.clone(),
+                kid: entry.key.id().kid.clone(),
+                unlocked_secs: now.saturating_duration_since(entry.unlocked_at).as_secs(),
+            })
+            .collect()
+    }
+
+    fn is_unlocked(&self, did: &str) -> bool {
+        self.unlocked.contains_key(did)
+    }
+
+    /// 解开一个信封并留在内存里。口令在这里用完就擦。
+    fn unlock(&mut self, did: &str, passphrase: Zeroizing<String>) -> Result<()> {
+        if self.is_unlocked(did) {
+            // 已经开着。再解一次是合法的(比如用户想确认口令还记不记得),
+            // 但没必要为了这个再跑一遍 Argon2id。
+            return Ok(());
+        }
+
+        let thumbprint = thumbprint_of(did)?;
+        let wrapped = store::load(&self.layout, &thumbprint)?;
+
+        // device.secret **每次解锁现读**,不缓存。缓存它就意味着"零个用户
+        // 解锁时进程内存里什么都没有"这句话不成立 —— 而那句话是这个设计
+        // 的核心承诺之一,不值得为省一次文件读而破掉。
+        let device_secret = device::load(&self.layout)?;
+
+        let key = crate::keystore::unwrap::unlock(&wrapped, passphrase.as_bytes(), &device_secret)?;
+
+        let now = Instant::now();
+        self.unlocked.insert(
+            did.to_string(),
+            Unlocked { key, unlocked_at: now, last_used: now },
+        );
+        Ok(())
+    }
+
+    /// 锁上。返回被放掉了几把。
+    ///
+    /// `did == None` 是"全锁"。**这个动作不报错**:锁一个本来就没解锁的
+    /// 东西应该成功,而不是失败 —— 想要的东西已经在那儿了。
+    fn lock(&mut self, did: Option<&str>) -> usize {
+        match did {
+            Some(did) => usize::from(self.unlocked.remove(did).is_some()),
+            None => {
+                let count = self.unlocked.len();
+                self.unlocked.clear();
+                count
+            }
+        }
+    }
+
+    /// 借出钥匙用一下,并刷新它的空闲计时。
+    ///
+    /// 钥匙**不复制**给调用方:它没有 `Clone`,连所有权都拿不走,只能在
+    /// 这个闭包里被借用。用完之后守护进程手上还是只有那一份。
+    fn with_key<R>(
+        &mut self,
+        did: &str,
+        autolock: Autolock,
+        now: Instant,
+        f: impl FnOnce(&LockedSigningKey) -> Result<R>,
+    ) -> Result<R> {
+        self.sweep(autolock, now);
+
+        let entry = self.unlocked.get_mut(did).ok_or(KeydError::Locked)?;
+        let out = f(&entry.key)?;
+        // 刷新只在**成功之后**做。一次失败的调用不该把钥匙的寿命续上。
+        entry.last_used = now;
+        Ok(out)
+    }
+}
+
+/// 守护进程的全部可变状态。
+pub struct DaemonState {
+    roots: Roots,
+    policy: PeerPolicy,
+    autolock: Autolock,
+    /// `--allow-raw-signing`。默认 false,打开之后每次原始签名都留痕。
+    raw_signing: bool,
+    vaults: Mutex<BTreeMap<u32, Vault>>,
+}
+
+impl DaemonState {
+    pub fn new(roots: Roots, policy: PeerPolicy, autolock: Autolock, raw_signing: bool) -> Self {
+        Self { roots, policy, autolock, raw_signing, vaults: Mutex::new(BTreeMap::new()) }
+    }
+
+    pub fn policy(&self) -> &PeerPolicy {
+        &self.policy
+    }
+
+    pub fn autolock(&self) -> Autolock {
+        self.autolock
+    }
+
+    pub fn raw_signing(&self) -> bool {
+        self.raw_signing
+    }
+
+    /// 对端 uid 的磁盘根。不需要碰锁 —— 它只取决于 uid。
+    pub fn layout_for(&self, uid: u32) -> Result<KeydLayout> {
+        self.roots.layout_for(uid)
+    }
+
+    /// 在某个 uid 的 vault 上做一件事。
+    ///
+    /// 所有用到已解锁钥匙的操作都从这里进去。锁是 `std::sync::Mutex` 而
+    /// 不是 tokio 的:里面的活儿(Argon2id、文件 I/O)是**阻塞**的,
+    /// 调用方应该整体放进 `spawn_blocking`,而不是在这里假装它不阻塞。
+    fn with_vault<R>(&self, uid: u32, f: impl FnOnce(&mut Vault) -> Result<R>) -> Result<R> {
+        let layout = self.layout_for(uid)?;
+        let mut vaults = self
+            .vaults
+            .lock()
+            .map_err(|_| KeydError::Protocol("the vault lock was poisoned".into()))?;
+        let vault = vaults.entry(uid).or_insert_with(|| Vault::new(layout));
+        f(vault)
+    }
+
+    // —— 下面这几个是 handlers 真正调的 ——
+
+    pub fn list_keys(&self, uid: u32) -> Result<Vec<KeySummary>> {
+        self.with_vault(uid, |vault| vault.list_keys())
+    }
+
+    pub fn status(&self, uid: u32) -> Result<Vec<UnlockedKey>> {
+        let autolock = self.autolock;
+        let now = Instant::now();
+        self.with_vault(uid, |vault| {
+            vault.sweep(autolock, now);
+            Ok(vault.unlocked_keys(now))
+        })
+    }
+
+    pub fn unlock(&self, uid: u32, did: &str, passphrase: Zeroizing<String>) -> Result<()> {
+        self.with_vault(uid, |vault| vault.unlock(did, passphrase))
+    }
+
+    pub fn lock(&self, uid: u32, did: Option<&str>) -> Result<usize> {
+        self.with_vault(uid, |vault| Ok(vault.lock(did)))
+    }
+
+    /// 后台清扫:把每个 vault 里空闲太久的钥匙放掉。
+    ///
+    /// 返回被放掉的总数,纯粹是为了让测试和日志看得见。
+    pub fn sweep_all(&self, now: Instant) -> usize {
+        let autolock = self.autolock;
+        let mut vaults = match self.vaults.lock() {
+            Ok(vaults) => vaults,
+            // 毒化的锁说明别的线程在改状态时 panic 了。清扫不是要紧事,
+            // 跳过它 —— 但**不**去 unwrap,那会把一个已经在恢复的进程再炸一次。
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        let mut dropped = 0;
+        for vault in vaults.values_mut() {
+            let before = vault.unlocked.len();
+            vault.sweep(autolock, now);
+            dropped += before - vault.unlocked.len();
+        }
+        dropped
+    }
+
+    /// 结构化签名 —— 签名基由 [`rfc9421::sign_request`] 重建,覆盖面由它决定。
+    ///
+    /// 调用方给不出签名基,只能给一份请求的**描述**。
+    ///
+    /// `did` 单独传,不在 [`rfc9421::SignRequest`] 里:那把结构体描述的是
+    /// "一个 HTTP 请求长什么样",而 did 说的是"用谁的钥匙"。两件事混在一个
+    /// 结构里,迟早有人以为请求里的某个字段能影响选哪把钥匙。
+    pub fn sign_structured(
+        &self,
+        uid: u32,
+        did: &str,
+        request: &rfc9421::SignRequest,
+    ) -> Result<rfc9421::Signed> {
+        let layout = self.layout_for(uid)?;
+
+        // 文档先读出来 —— 别在读磁盘的时候攥着锁。
+        let document = store::read_did_document(&layout, did)?;
+
+        let autolock = self.autolock;
+        let now = Instant::now();
+        self.with_vault(uid, |vault| {
+            vault.with_key(did, autolock, now, |key| {
+                rfc9421::sign_request(&document, key, request)
+            })
+        })
+    }
+
+    /// 借出钥匙做一次原始签名(`--allow-raw-signing` 那条路)。
+    ///
+    /// 开关的检查**在这里**,不在 handlers —— 让"能不能走这条路"和
+    /// "这条路怎么走"待在同一个地方,免得哪天有人绕开 handler 直接调。
+    pub fn sign_raw<R>(
+        &self,
+        uid: u32,
+        did: &str,
+        f: impl FnOnce(&LockedSigningKey) -> Result<R>,
+    ) -> Result<R> {
+        if !self.raw_signing {
+            return Err(KeydError::RawDisabled);
+        }
+        let autolock = self.autolock;
+        let now = Instant::now();
+        self.with_vault(uid, |vault| vault.with_key(did, autolock, now, f))
+    }
+}
+
+/// `did:wba:...:e1_<指纹>` → `e1_<指纹>`,也就是信封的文件名。
+///
+/// 没有 `e1_` 段的 DID 是**目录 DID**,不是一把具体的钥匙 —— 它没有对应的
+/// 信封,所以是 `KeyNotFound` 而不是别的。
+pub fn thumbprint_of(did: &str) -> Result<String> {
+    let parts = parse_did_wba(did)?;
+    match parts.e1_segment() {
+        Some(segment) => Ok(segment.to_string()),
+        None => Err(KeydError::KeyNotFound(format!(
+            "{did} names no key: it has no e1_ segment"
+        ))),
+    }
+}
+
+/// 方便调用方:把 `Duration` 变成 [`Autolock`]。
+pub fn autolock_from_secs(secs: u64) -> Autolock {
+    Autolock::idle(Duration::from_secs(secs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::kdf::Argon2Config;
+    use crate::daemon::wire::Request;
+    use crate::did::DidDocumentSpec;
+    use crate::keystore::create;
+    use crate::keystore::record::KeyAlgorithm;
+    use crate::sign::rfc9421::SignRequest;
+    use crate::sign::Signer;
+
+    const PASSPHRASE: &str = "correct horse battery staple";
+
+    /// Argon2 是**刻意慢**的 —— 那是它对离线爆破的抵抗。测试不该为此等
+    /// 三秒钟一次,所以参数压到最小;信封里存的是这批参数,解开时照用,
+    /// 所以快慢只影响测试时长,不影响被验的代码路径。
+    fn fast() -> Argon2Config {
+        Argon2Config { m_cost: 1024, t_cost: 1, p_cost: 1 }
+    }
+
+    fn spec() -> DidDocumentSpec {
+        DidDocumentSpec::new("example.com", vec!["user".into(), "alice".into()])
+            .with_fragment("key-1")
+    }
+
+    /// 一个装着一把真钥匙的 vault。DID 由公钥算出来,所以**不能硬编码** ——
+    /// 拿回去用。
+    struct Fixture {
+        _dir: TempDir,
+        state: DaemonState,
+        did: String,
+    }
+
+    impl Fixture {
+        fn new(raw_signing: bool) -> Self {
+            let dir = TempDir::new();
+            let layout = KeydLayout::at(dir.path().to_path_buf());
+            layout.ensure().unwrap();
+
+            let created = create::create(
+                &layout,
+                &spec(),
+                "default",
+                PASSPHRASE.as_bytes(),
+                fast(),
+            )
+            .unwrap();
+
+            // keygen 不写 DID 文档(没签名的文档落盘会让人误以为发布了)。
+            // 但签名要用它,所以这里补上 —— 现实中这是 `publish` 干的活。
+            store::write_did_document(&layout, &created.did, &created.document).unwrap();
+
+            Self {
+                state: DaemonState::new(
+                    Roots::Single(layout),
+                    PeerPolicy::default(),
+                    Autolock::idle(Duration::from_secs(900)),
+                    raw_signing,
+                ),
+                did: created.did,
+                _dir: dir,
+            }
+        }
+
+        fn unlock(&self) {
+            self.state
+                .unlock(501, &self.did, Zeroizing::new(PASSPHRASE.to_string()))
+                .unwrap();
+        }
+
+        fn request(&self) -> SignRequest {
+            SignRequest {
+                method: "POST".to_string(),
+                url: "https://example.com/api".to_string(),
+                headers: BTreeMap::new(),
+                body: Some(b"{}".to_vec()),
+                covered: Vec::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn listing_keys_does_not_require_the_vault_to_be_unlocked() {
+        let f = Fixture::new(false);
+        let keys = f.state.list_keys(501).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].did, f.did);
+        assert_eq!(keys[0].algorithm, KeyAlgorithm::Ed25519);
+        assert!(f.state.status(501).unwrap().is_empty(), "nothing is unlocked yet");
+    }
+
+    #[test]
+    fn signing_a_locked_key_is_refused_rather_than_prompted() {
+        let f = Fixture::new(false);
+        let err = f.state.sign_structured(501, &f.did, &f.request()).unwrap_err();
+        assert!(matches!(err, KeydError::Locked), "{err}");
+    }
+
+    #[test]
+    fn the_right_passphrase_unlocks_and_then_the_key_signs() {
+        let f = Fixture::new(false);
+        f.unlock();
+
+        assert_eq!(f.state.status(501).unwrap().len(), 1);
+        let signed = f.state.sign_structured(501, &f.did, &f.request()).unwrap();
+        assert!(signed.headers.contains_key("Signature"));
+
+        // 覆盖面下限照样在 —— 解锁不改变"谁来定覆盖面"这件事。
+        for want in ["@method", "@target-uri", "@authority", "content-digest"] {
+            assert!(signed.covered.iter().any(|c| c == want), "{:?}", signed.covered);
+        }
+    }
+
+    #[test]
+    fn the_wrong_passphrase_leaves_nothing_unlocked() {
+        let f = Fixture::new(false);
+        let err = f
+            .state
+            .unlock(501, &f.did, Zeroizing::new("wrong".to_string()))
+            .unwrap_err();
+        assert!(matches!(err, KeydError::BadPassphrase), "{err}");
+        assert!(f.state.status(501).unwrap().is_empty());
+    }
+
+    /// 锁上之后,钥匙不只是"被拦住"—— 它从进程里消失了。
+    #[test]
+    fn locking_removes_the_key_from_memory() {
+        let f = Fixture::new(false);
+        f.unlock();
+        assert_eq!(f.state.lock(501, Some(&f.did)).unwrap(), 1);
+
+        assert!(f.state.status(501).unwrap().is_empty());
+        assert!(matches!(
+            f.state.sign_structured(501, &f.did, &f.request()).unwrap_err(),
+            KeydError::Locked
+        ));
+        // 锁第二次不是错误 —— 想要的状态已经在那儿了。
+        assert_eq!(f.state.lock(501, Some(&f.did)).unwrap(), 0);
+    }
+
+    #[test]
+    fn locking_everything_is_a_different_request_from_locking_one_key() {
+        assert_ne!(
+            Request::Lock { did: None },
+            Request::Lock { did: Some("d".to_string()) }
+        );
+    }
+
+    /// **本模块的核心断言**:B 的 did 在 A 的 vault 里查不到。
+    ///
+    /// 就算 A 一字不差地报出 B 的 did,结果也只和"报了一个不存在的 did"
+    /// 一样 —— 没有分支会走到 B 的磁盘根上去。
+    #[test]
+    fn one_uid_cannot_reach_another_uids_key_even_by_naming_it_exactly() {
+        // B 有一把装满的 vault。
+        let b = Fixture::new(false);
+        assert_eq!(b.state.list_keys(502).unwrap().len(), 1);
+
+        // A 的 vault 是空的。
+        let a_dir = TempDir::new();
+        let a_layout = KeydLayout::at(a_dir.path().to_path_buf());
+        a_layout.ensure().unwrap();
+        crate::keystore::device::load_or_create(&a_layout).unwrap();
+
+        let a = DaemonState::new(
+            Roots::Single(a_layout),
+            PeerPolicy::default(),
+            Autolock::idle(Duration::from_secs(900)),
+            false,
+        );
+
+        // A 报出 B 的 did:列不到、解不开、更签不出来。
+        //
+        // 三个都报 `KeyNotFound` —— "我这儿没有这么一把钥匙" —— 而不是
+        // `Locked`。这个区别是有意思的:`Locked` 等于承认"有这么一把钥匙,
+        // 只是锁着",那本身就是 A 不该知道的信息。A 的根目录下确实什么都
+        // 没有,所以 `KeyNotFound` 是这里唯一说得通、也不多嘴的答案。
+        assert!(a.list_keys(501).unwrap().is_empty());
+        assert!(matches!(
+            a.unlock(501, &b.did, Zeroizing::new(PASSPHRASE.to_string())).unwrap_err(),
+            KeydError::KeyNotFound(_)
+        ));
+        assert!(matches!(
+            a.sign_structured(501, &b.did, &b.request()).unwrap_err(),
+            KeydError::KeyNotFound(_)
+        ));
+
+        // 而 B 自己那把钥匙好好的,没被动过。
+        b.unlock();
+        assert!(b.state.sign_structured(501, &b.did, &b.request()).is_ok());
+    }
+
+    #[test]
+    fn an_idle_key_is_dropped_before_it_can_be_used() {
+        let f = Fixture::new(false);
+        f.unlock();
+        assert_eq!(f.state.status(501).unwrap().len(), 1);
+
+        // 把"现在"往后拨过超时线 —— 不用真的等 15 分钟。
+        let later = Instant::now() + Duration::from_secs(901);
+        assert_eq!(f.state.sweep_all(later), 1);
+
+        assert!(f.state.status(501).unwrap().is_empty());
+        assert!(matches!(
+            f.state.sign_structured(501, &f.did, &f.request()).unwrap_err(),
+            KeydError::Locked
+        ));
+    }
+
+    /// 用一次就续一次。空闲超时收走的是"没人用"的钥匙,不是"开了一会儿"的。
+    #[test]
+    fn using_a_key_restarts_its_idle_clock() {
+        let f = Fixture::new(false);
+        f.unlock();
+
+        // 解锁在 T0。现在假装时钟走到 T0+800s 并"用"一次。
+        let now = Instant::now() + Duration::from_secs(800);
+        f.state
+            .with_vault(501, |vault| vault.with_key(&f.did, f.state.autolock(), now, |_| Ok(())))
+            .unwrap();
+
+        // 从 T0 算早就过期了,从 T0+800s 算还没。
+        assert_eq!(f.state.sweep_all(now + Duration::from_secs(99)), 0);
+        // 再往前走满 900s 就又过期了。
+        assert_eq!(f.state.sweep_all(now + Duration::from_secs(901)), 1);
+    }
+
+    /// 一个失败的调用不该把钥匙的寿命续上。
+    #[test]
+    fn a_failed_sign_does_not_extend_the_lifetime() {
+        let f = Fixture::new(false);
+        f.unlock();
+
+        let now = Instant::now() + Duration::from_secs(800);
+        let outcome = f.state.with_vault(501, |vault| {
+            vault.with_key(&f.did, f.state.autolock(), now, |_| {
+                Err::<(), _>(KeydError::Protocol("nope".into()))
+            })
+        });
+        assert!(outcome.is_err());
+
+        // last_used 还停在解锁那一刻,所以过了超时线就掉。
+        assert_eq!(f.state.sweep_all(now + Duration::from_secs(101)), 1);
+    }
+
+    #[test]
+    fn raw_signing_is_off_unless_it_was_turned_on() {
+        let f = Fixture::new(false);
+        f.unlock();
+
+        let err = f.state.sign_raw(501, &f.did, |_| Ok(())).unwrap_err();
+        assert!(matches!(err, KeydError::RawDisabled), "{err}");
+    }
+
+    /// 开关先于一切:关着的时候,连"没解锁"都轮不到报。
+    #[test]
+    fn the_raw_switch_is_checked_before_the_lock_state() {
+        let f = Fixture::new(false);
+        assert!(matches!(
+            f.state.sign_raw(501, &f.did, |_| Ok(())).unwrap_err(),
+            KeydError::RawDisabled
+        ));
+    }
+
+    #[test]
+    fn an_unlocked_key_is_usable_for_raw_signing_when_the_switch_is_on() {
+        let f = Fixture::new(true);
+        f.unlock();
+
+        let signature = f
+            .state
+            .sign_raw(501, &f.did, |key| Ok(key.sign(b"hello").unwrap()))
+            .unwrap();
+        assert_eq!(signature.len(), 64);
+    }
+
+    #[test]
+    fn a_did_without_a_key_segment_names_no_key() {
+        let err = thumbprint_of("did:wba:example.com:user:alice").unwrap_err();
+        assert!(matches!(err, KeydError::KeyNotFound(_)), "{err}");
+        // 有 e1_ 段的就取最后那一段。
+        assert_eq!(
+            thumbprint_of("did:wba:example.com:user:alice:e1_abc").unwrap(),
+            "e1_abc"
+        );
+        // 连 did:wba 都不是的,报的是 DID 解析失败,不是"找不到钥匙"。
+        assert!(matches!(
+            thumbprint_of("https://example.com/").unwrap_err(),
+            KeydError::Did(_)
+        ));
+    }
+
+    /// 测试用的小临时目录。**不引入 `tempfile` 依赖** —— 这一层只需要
+    /// "建一个进程退出就没了、每次名字都不同的目录"。
+    mod tempdir {
+        use std::path::{Path, PathBuf};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        pub struct TempDir {
+            path: PathBuf,
+        }
+
+        impl TempDir {
+            pub fn new() -> Self {
+                let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "anp-keyd-test-{}-{n}-{:?}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                std::fs::create_dir_all(&path).unwrap();
+                Self { path }
+            }
+
+            pub fn path(&self) -> &Path {
+                &self.path
+            }
+        }
+
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                // 权限是 0700,内容里没有明文秘密(全是信封),直接删。
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
+    use tempdir::TempDir;
+}
