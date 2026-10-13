@@ -64,24 +64,22 @@ impl TempDir {
         &self.0
     }
 
-    /// 一个已经装好一把钥匙的密钥库。文档是**已发布**的那一份(带 proof),
-    /// 和别人从 `did.json` 抓到的一模一样 —— 验签用的就是它。
-    fn with_a_key(tag: &str) -> (Self, KeydLayout, create::Created) {
+    /// 一个已经装好一把钥匙的密钥库,外加**已发布**的那份文档(带 proof)
+    /// —— 和别人从 `did.json` 抓到的一模一样,验签用的就是它。
+    fn with_a_key(tag: &str) -> (Self, KeydLayout, create::Created, Value) {
         let dir = TempDir::new(tag);
         let layout = KeydLayout::at(dir.path().to_path_buf());
         layout.ensure().unwrap();
         let spec = DidDocumentSpec::new("example.com", vec!["agents".into(), tag.into()]);
-        let mut created =
+        let created =
             create::create(&layout, &spec, "default", PASSPHRASE, fast()).expect("create a key");
 
         let device_secret = device::load(&layout).unwrap();
         let key = unwrap::unlock(&created.wrapped, PASSPHRASE, &device_secret).unwrap();
-        let unsigned = document::rebuild(&created.did, &key.verifying_key()).unwrap();
-        let signed = document::sign_document(&unsigned, &key, &created.wrapped.id.kid).unwrap();
-        document::verify_path_binding(&created.did, &signed).unwrap();
+        let signed = document::publishable(&spec, &created.did, &key).unwrap();
         store::write_did_document(&layout, &created.did, &signed).unwrap();
-        created.document = signed;
-        (dir, layout, created)
+        drop(key);
+        (dir, layout, created, signed)
     }
 
     /// 一个空布局。
@@ -144,7 +142,7 @@ fn request() -> SignRequest {
 /// 既说得通、又不多嘴的答案。
 #[test]
 fn one_uid_cannot_reach_another_uids_key() {
-    let (_victim_dir, victim_layout, victim) = TempDir::with_a_key("victim");
+    let (_victim_dir, victim_layout, victim, _) = TempDir::with_a_key("victim");
     let victim_state = state_for(victim_layout, false);
 
     let (_attacker_dir, attacker_layout) = TempDir::empty("attacker");
@@ -182,7 +180,7 @@ fn one_uid_cannot_reach_another_uids_key() {
 /// 两因子的东西变成一个单因子的东西,而且用户看不出任何区别。
 #[test]
 fn an_envelope_does_not_open_without_the_device_secret() {
-    let (dir, layout, created) = TempDir::with_a_key("no-device");
+    let (dir, layout, created, _) = TempDir::with_a_key("no-device");
     let wrapped = store::load(&layout, &created.wrapped.id.thumbprint).unwrap();
 
     // 文件整个不在:报的是"device secret 缺失",不是"顺手生成一个"。
@@ -208,7 +206,7 @@ fn an_envelope_does_not_open_without_the_device_secret() {
 /// 半对等于全错。
 #[test]
 fn the_wrong_passphrase_and_the_wrong_device_secret_are_indistinguishable() {
-    let (_dir, layout, created) = TempDir::with_a_key("credentials");
+    let (_dir, layout, created, _) = TempDir::with_a_key("credentials");
     let wrapped = store::load(&layout, &created.wrapped.id.thumbprint).unwrap();
     let real_device = device::load(&layout).unwrap();
 
@@ -246,7 +244,7 @@ fn the_wrong_passphrase_and_the_wrong_device_secret_are_indistinguishable() {
 /// 出来,然后**成功**解出一把和文件名不符的钥匙。
 #[test]
 fn an_envelope_renamed_to_another_identity_is_refused_before_decryption() {
-    let (_dir, layout, first) = TempDir::with_a_key("rename");
+    let (_dir, layout, first, _) = TempDir::with_a_key("rename");
     let envelope = store::load(&layout, &first.wrapped.id.thumbprint).unwrap();
 
     // 换掉头里的身份,别的字节原样不动 —— 密文仍然是好的,坏的只有 AAD。
@@ -272,7 +270,7 @@ fn an_envelope_renamed_to_another_identity_is_refused_before_decryption() {
 /// agent 冒充我。
 #[test]
 fn raw_signing_is_refused_while_the_switch_is_off() {
-    let (_dir, layout, created) = TempDir::with_a_key("raw-off");
+    let (_dir, layout, created, _) = TempDir::with_a_key("raw-off");
     let state = state_for(layout, false);
 
     state
@@ -286,7 +284,7 @@ fn raw_signing_is_refused_while_the_switch_is_off() {
     ));
 
     // 而操作者显式打开之后它是通的 —— 否则这条测试等于在验一个死开关。
-    let (_dir2, layout2, created2) = TempDir::with_a_key("raw-on");
+    let (_dir2, layout2, created2, _) = TempDir::with_a_key("raw-on");
     let state2 = state_for(layout2, true);
     state2
         .unlock(UID, &created2.did, None, Zeroizing::new(String::from_utf8_lossy(PASSPHRASE).into_owned()))
@@ -308,7 +306,7 @@ fn raw_signing_is_refused_while_the_switch_is_off() {
 /// 一起错。
 #[test]
 fn a_signature_does_not_verify_against_a_tampered_request() {
-    let (_dir, layout, created) = TempDir::with_a_key("tamper");
+    let (_dir, layout, created, document) = TempDir::with_a_key("tamper");
     let state = state_for(layout, false);
     state
         .unlock(UID, &created.did, None, Zeroizing::new(String::from_utf8_lossy(PASSPHRASE).into_owned()))
@@ -324,17 +322,17 @@ fn a_signature_does_not_verify_against_a_tampered_request() {
 
     // ① 换一个目标 URL —— 验不过。
     assert!(
-        verify(&created.document, &request, "https://evil.example.com/api", &headers).is_err(),
+        verify(&document, &request, "https://evil.example.com/api", &headers).is_err(),
         "an attacker's URL must not verify against a signature made for another one"
     );
     // ② 换一个方法 —— 验不过。
     assert!(
-        verify_method(&created.document, "DELETE", &request.url, &headers).is_err(),
+        verify_method(&document, "DELETE", &request.url, &headers).is_err(),
         "the method is covered, so changing it must break verification"
     );
     // ③ 而原样的那份是验得过的 —— 否则上面两条什么也没证明。
     assert!(
-        verify(&created.document, &request, &request.url, &headers).is_ok(),
+        verify(&document, &request, &request.url, &headers).is_ok(),
         "the untampered request must verify"
     );
 }
@@ -436,7 +434,7 @@ fn a_connection_whose_credentials_cannot_be_read_is_refused() {
 /// 后台清扫任务做的事,不是对它的近似。
 #[test]
 fn a_request_after_the_idle_deadline_is_refused() {
-    let (_dir, layout, created) = TempDir::with_a_key("idle");
+    let (_dir, layout, created, _) = TempDir::with_a_key("idle");
     let state = state_for(layout, false);
     state
         .unlock(UID, &created.did, None, Zeroizing::new(String::from_utf8_lossy(PASSPHRASE).into_owned()))
@@ -464,7 +462,7 @@ fn a_request_after_the_idle_deadline_is_refused() {
 /// 交错会留下的痕迹)。
 #[test]
 fn concurrent_signatures_on_one_key_do_not_interleave() {
-    let (_dir, layout, created) = TempDir::with_a_key("concurrent");
+    let (_dir, layout, created, document) = TempDir::with_a_key("concurrent");
     let state = Arc::new(state_for(layout, false));
     state
         .unlock(UID, &created.did, None, Zeroizing::new(String::from_utf8_lossy(PASSPHRASE).into_owned()))
@@ -478,7 +476,7 @@ fn concurrent_signatures_on_one_key_do_not_interleave() {
         let state = Arc::clone(&state);
         let digests = Arc::clone(&digests);
         let did = created.did.clone();
-        let document = created.document.clone();
+        let document = document.clone();
         handles.push(std::thread::spawn(move || {
             let request = request();
             let signed = state

@@ -397,16 +397,24 @@ mod tests {
             let layout = KeydLayout::at(dir.path().to_path_buf());
             layout.ensure().unwrap();
 
+            let spec = DidDocumentSpec::new("example.com", vec!["user".into(), "alice".into()])
+                .with_fragment("key-1");
             let created = create::create(
                 &layout,
-                &DidDocumentSpec::new("example.com", vec!["user".into(), "alice".into()])
-                    .with_fragment("key-1"),
+                &spec,
                 "default",
                 PASSPHRASE.as_bytes(),
                 Argon2Config { m_cost: 1024, t_cost: 1, p_cost: 1 },
             )
             .unwrap();
-            store::write_did_document(&layout, &created.did, &created.document).unwrap();
+            let wrapped = store::load(&layout, &created.wrapped.id.thumbprint).unwrap();
+            let device_secret = crate::keystore::device::load(&layout).unwrap();
+            let key =
+                crate::keystore::unwrap::unlock(&wrapped, PASSPHRASE.as_bytes(), &device_secret)
+                    .unwrap();
+            let document = crate::did::document::publishable(&spec, &created.did, &key).unwrap();
+            store::write_did_document(&layout, &created.did, &document).unwrap();
+            drop(key);
 
             let state = Arc::new(DaemonState::new(
                 Roots::Single(KeydLayout::at(dir.path().to_path_buf())),

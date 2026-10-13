@@ -20,7 +20,7 @@ use std::collections::BTreeSet;
 
 use serde_json::Value;
 
-use crate::did::document::{ExtraKey, ROOT_FRAGMENT};
+use crate::did::document::{DidDocumentSpec, ExtraKey, ROOT_FRAGMENT};
 use crate::did::parse::parse_did_wba;
 use crate::error::{KeydError, Result};
 
@@ -364,7 +364,7 @@ pub fn with_extra_key(
         )));
     }
     extras.push(new);
-    rekey(document, did, root, extras)
+    rekey(document, &DidDocumentSpec::from_document(document)?, did, root, extras)
 }
 
 /// 摘掉一把非绑定密钥,其余一切不动。
@@ -399,7 +399,7 @@ pub fn without_method(
             "{method_id} is not a verification method in this document"
         )));
     }
-    rekey(document, did, root, extras)
+    rekey(document, &DidDocumentSpec::from_document(document)?, did, root, extras)
 }
 
 /// 用"根密钥 + 这几把附加密钥"重建文档,并把上游不认识的顶层属性搬回去。
@@ -409,15 +409,19 @@ pub fn without_method(
 /// 个对象和上游拼的逐字节一致 —— 那把"能不能用"押在了我们抄得对不对上。
 /// 重建则相反:形状是上游自己产的,不可能抄错。
 ///
-/// 代价是重建会**丢掉**上游不认识的属性,所以搬回来这一步不是可选的。
+/// 代价是重建会**丢掉**上游不认识的属性,所以搬回来这一步不是可选的;
+/// 而 `service` 那一档虽然上游认识、却由规格说了算,所以**规格也得给对**
+/// —— 从 `document` 里反推出来的那份([`DidDocumentSpec::from_document`])
+/// 就是"这份文档现在声明的东西"。
 pub(crate) fn rekey(
     document: &Value,
+    spec: &DidDocumentSpec,
     did: &str,
     root: &ed25519_dalek::VerifyingKey,
     extras: Vec<ExtraKey>,
 ) -> Result<Value> {
     let stripped = strip_proof(document)?;
-    let mut canonical = crate::did::document::rebuild_with(did, root, extras)
+    let mut canonical = crate::did::document::rebuild_with(spec, did, root, extras)
         .map_err(|error| match error {
             // 重建对不上 DID,说明**别人给的文档**里的根密钥不是这个 DID 的
             // 那把。往上抛一句"这不是规范形式"会把人引到格式上去,而真因是
@@ -633,6 +637,40 @@ mod tests {
         assert!(with.get("proof").is_none(), "a rekeyed document must be unsigned");
         let signed = sign_document(&with, &key, &format!("{did}#{ROOT_FRAGMENT}")).unwrap();
         assert!(crate::did::document::verify_path_binding(&did, &signed).is_ok());
+    }
+
+    /// **加一把钥匙不能把 service 声明弄丢。**
+    ///
+    /// `service` 在上游的构建器里,所以它既不在"上游不认识的属性原样搬回去"
+    /// 那一档里,也不会自己从 DID 里长出来 —— 重建时它完全由规格决定。规格
+    /// 是从被改的**那份文档**反推的,这一条就是在验这条线没断:断了的话,
+    /// 一个绑了 WNS handle 的 DID 会在加一把热密钥之后**静静地**不再绑着它。
+    #[test]
+    fn rekeying_keeps_the_service_entries() {
+        let key = root_key(0x7a);
+        let spec = crate::did::document::DidDocumentSpec::new(
+            "example.com",
+            vec!["user".into(), "alice".into()],
+        )
+        .with_service(serde_json::json!({
+            "id": "#handle",
+            "type": "ANPHandleService",
+            "serviceEndpoint": "https://wns.example.com/alice",
+        }));
+        let (did, unsigned) = build_unsigned_with(&spec, &key.verifying_key(), Vec::new()).unwrap();
+        let document = sign_document(&unsigned, &key, &format!("{did}#{ROOT_FRAGMENT}")).unwrap();
+        let before = document["service"].clone();
+        assert!(before.as_array().is_some_and(|entries| entries.len() == 1));
+
+        let with = with_extra_key(
+            &document,
+            &did,
+            &key.verifying_key(),
+            extra("key-2", 0x7b, vec![R::Authentication]),
+        )
+        .unwrap();
+
+        assert_eq!(with["service"], before, "a rekey must not drop a service binding");
     }
 
     /// 恢复密钥挂在 `assertionMethod` 里 —— 而不是 `authentication`。

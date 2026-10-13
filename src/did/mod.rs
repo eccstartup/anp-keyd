@@ -4,9 +4,11 @@ pub mod document;
 pub mod lifecycle;
 pub mod migrate;
 pub mod parse;
+pub mod spec;
 
 pub use document::{
-    build_unsigned, build_unsigned_with, rebuild, rebuild_with, sign_document, verify_path_binding,
-    DidDocumentSpec, ExtraKey, ROOT_FRAGMENT,
+    build_unsigned, build_unsigned_with, publishable, rebuild, rebuild_with, sign_document,
+    verify_path_binding, DidDocumentSpec, ExtraKey, ROOT_FRAGMENT,
 };
 pub use parse::{did_url_path, parse_did_wba, DidWbaParts};
+pub use spec::{compose_did_wba, SpecFile};

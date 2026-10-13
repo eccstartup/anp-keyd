@@ -306,25 +306,23 @@ fn run_bare(args: &[&str]) -> Outcome {
 // 一、参数解析:在问口令**之前**就把该说的说出来
 // ========================================================================
 
-/// `--path` 没有默认值,漏了就当场说。
+/// `--spec` 没有默认值,漏了就当场说。
 ///
-/// 这条挡的是一句谎话:did:wba **要求**至少有一段路径,所以"给一个默认的
-/// 空路径"等于让命令先跑起来、再失败在一个没人预料的地方。clap 的退出码
-/// 是 2 —— 那是"你用错了",不是"事情办不成"。
+/// 这条挡的是一句谎话:DID 是"坐标 + 公钥"算出来的,而坐标必须是人写在
+/// 文件里的那几个 —— 由工具替人挑一个,等于替人决定他的身份挂在哪儿。
+/// clap 的退出码是 2:那是"你用错了",不是"事情办不成"。
 #[test]
-fn keygen_without_a_path_is_refused_by_the_argument_parser() {
-    let dir = TempDir::new("no-path");
+fn keygen_without_a_spec_file_is_refused_by_the_argument_parser() {
+    let dir = TempDir::new("no-spec");
     let outcome = run_bare(&[
         "keygen",
         "--root",
         &dir.path().display().to_string(),
-        "--host",
-        "example.com",
     ]);
 
     assert_eq!(outcome.code, Some(2), "clap must reject it:\n{}", outcome.text());
     assert!(
-        outcome.text().contains("--path"),
+        outcome.text().contains("--spec"),
         "the error has to name the missing flag:\n{}",
         outcome.text()
     );
@@ -342,6 +340,7 @@ fn help_lists_every_command() {
     for command in [
         "serve",
         "keygen",
+        "spec",
         "publish",
         "verify-doc",
         "list",
@@ -384,11 +383,26 @@ fn sign_refuses_raw_together_with_structured_flags() {
 // 二、keygen:两句口令,一个信封
 // ========================================================================
 
+/// 一份规格文件,写在临时目录里,返回它的路径。
+///
+/// 文档该有什么由**这个文件**说了算 —— `keygen` 只是照它构造文档、签名。
+/// 工具不再接 `--host` / `--path` 这类参数,理由见 `spec` 那个模块的头。
+fn spec_file(dir: &TempDir, name: &str, content: &str) -> String {
+    let path = dir.path().join(format!("{name}.spec.json"));
+    std::fs::write(&path, content).expect("write the spec file");
+    path.display().to_string()
+}
+
+fn a_spec_for(host: &str, path: &str) -> String {
+    format!(r#"{{ "host": "{host}", "path": "{path}" }}"#)
+}
+
 /// 造一把钥匙,然后**在磁盘上确认它真的躺在那儿**,而且模式是 0600。
 fn keygen(dir: &TempDir, tag: &str) -> String {
+    let spec = spec_file(dir, tag, &a_spec_for("example.com", &format!("agents/{tag}")));
     let outcome = run_in_terminal(
         dir.path(),
-        &["keygen", "--host", "example.com", "--path", &format!("agents/{tag}")],
+        &["keygen", "--spec", &spec],
         &default_rules(),
     );
     let text = outcome.expect_ok();
@@ -403,6 +417,37 @@ fn keygen(dir: &TempDir, tag: &str) -> String {
         .find(|line| line.starts_with("did:wba:"))
         .expect("keygen prints the DID")
         .to_string()
+}
+
+/// `spec` 的产物就是 `keygen` 要读的那个文件 —— 中间没有别的格式。
+#[test]
+fn spec_writes_a_file_that_keygen_can_use() {
+    let dir = TempDir::new("spec");
+    let written = dir.path().join("written.spec.json");
+    run_bare(&[
+        "spec",
+        "--host",
+        "example.com",
+        "--path",
+        "agents/bot",
+        "--out",
+        &written.display().to_string(),
+    ])
+    .expect_ok();
+
+    let did = run_in_terminal(
+        dir.path(),
+        &["keygen", "--spec", &written.display().to_string()],
+        &default_rules(),
+    )
+    .expect_ok()
+    .lines()
+    .map(str::trim)
+    .find(|line| line.starts_with("did:wba:"))
+    .expect("keygen prints the DID")
+    .to_string();
+
+    assert!(did.starts_with("did:wba:example.com:agents:bot:e1_"), "got {did:?}");
 }
 
 #[test]
@@ -433,11 +478,8 @@ fn keygen_refuses_when_the_two_entries_do_not_match() {
 
     // 三轮都答错,于是到顶 —— 每一轮都要重新回答"新口令"和"重复"两句,
     // 所以规则得能重复命中(游标是往前推的,不是"每条只答一次")。
-    let outcome = run_in_terminal(
-        dir.path(),
-        &["keygen", "--host", "example.com", "--path", "agents/bot"],
-        &rules,
-    );
+    let spec = spec_file(&dir, "bot", &a_spec_for("example.com", "agents/bot"));
+    let outcome = run_in_terminal(dir.path(), &["keygen", "--spec", &spec], &rules);
     let text = outcome.expect_failure();
 
     assert!(
@@ -457,11 +499,8 @@ fn keygen_refuses_when_the_two_entries_do_not_match() {
 #[test]
 fn an_ip_literal_host_is_refused_before_the_passphrase_is_ever_asked() {
     let dir = TempDir::new("ip-literal");
-    let outcome = run_in_terminal(
-        dir.path(),
-        &["keygen", "--host", "127.0.0.1", "--path", "agents/bot"],
-        &default_rules(),
-    );
+    let spec = spec_file(&dir, "ip", &a_spec_for("127.0.0.1", "agents/bot"));
+    let outcome = run_in_terminal(dir.path(), &["keygen", "--spec", &spec], &default_rules());
     let text = outcome.expect_failure();
 
     assert!(text.contains("IP"), "the refusal has to name what is wrong:\n{text}");
@@ -523,6 +562,107 @@ fn a_document_for_another_did_is_refused() {
         &default_rules(),
     );
     outcome.expect_failure();
+}
+
+/// 拿一个 DID 去签**另一个地方**的文档:直接拒,不挑一个信。
+///
+/// 这条挡的不是手滑,是那句话本身:文档要不要改动由规格说了算,而规格里的
+/// 坐标要是和 `--did` 对不上,那就说明**其中一样不是你的本意**。挑一个信等于
+/// 替人决定哪个是本意 —— 而这两个选项都签得出一个能验过的文档。
+#[test]
+fn publish_refuses_a_spec_that_points_somewhere_else() {
+    let dir = TempDir::new("spec-mismatch");
+    let spec = spec_file(&dir, "bot", &a_spec_for("example.com", "agents/bot"));
+    let did = run_in_terminal(dir.path(), &["keygen", "--spec", &spec], &default_rules())
+        .expect_ok()
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("did:wba:"))
+        .expect("keygen prints the DID")
+        .to_string();
+
+    let elsewhere = spec_file(
+        &dir,
+        "elsewhere",
+        &a_spec_for("example.com", "agents/someone-else"),
+    );
+    let outcome = run_in_terminal(
+        dir.path(),
+        &["publish", "--did", &did, "--spec", &elsewhere],
+        &default_rules(),
+    );
+    let text = outcome.expect_failure();
+
+    assert!(
+        text.contains("someone-else"),
+        "the refusal has to name the path it could not reconcile:\n{text}"
+    );
+    assert!(
+        !dir.path().join("dids").exists()
+            || std::fs::read_dir(dir.path().join("dids")).unwrap().count() == 0,
+        "a mismatched spec must not leave a document behind"
+    );
+}
+
+/// 不带 `--spec` 重发一次,本地文档里已有的声明**一个也不许掉**。
+///
+/// 这是这次拆分的头号动机。`service` 由规格说了算,所以它不在"上游不认识的
+/// 属性原样搬回去"那一档里 —— 从前从 DID 字符串重建文档,`service` 会因为
+/// "没人提到它"而消失,**而且不报错**。WNS handle 的绑定就挂在那个数组里。
+#[test]
+fn republishing_keeps_the_declarations_already_in_the_local_document() {
+    let dir = TempDir::new("republish");
+    let spec = dir.path().join("bot.spec.json");
+    std::fs::write(
+        &spec,
+        r##"{
+            "host": "example.com",
+            "path": "agents/bot",
+            "services": [
+                {
+                    "id": "#handle",
+                    "type": "ANPHandleService",
+                    "serviceEndpoint": "https://example.com/handle/bot"
+                }
+            ]
+        }"##,
+    )
+    .unwrap();
+    let spec = spec.display().to_string();
+
+    let did = run_in_terminal(dir.path(), &["keygen", "--spec", &spec], &default_rules())
+        .expect_ok()
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("did:wba:"))
+        .expect("keygen prints the DID")
+        .to_string();
+
+    run_in_terminal(
+        dir.path(),
+        &["publish", "--did", &did, "--spec", &spec],
+        &default_rules(),
+    )
+    .expect_ok();
+    let before = read_local_document(&dir, &did);
+    assert_eq!(
+        before["service"][0]["id"],
+        serde_json::Value::String(format!("{did}#handle")),
+        "the `#`-prefixed id must be expanded against the DID: {before:#}"
+    );
+
+    // 再发一次,**不提任何规格** —— 它必须沿用本地那份文档里的声明。
+    run_in_terminal(dir.path(), &["publish", "--did", &did], &default_rules()).expect_ok();
+    let after = read_local_document(&dir, &did);
+    assert_eq!(
+        after["service"], before["service"],
+        "a republish that drops `service` is a silent loss of the handle binding"
+    );
+    // 而 proof 是**新**的 —— 否则上面那条只是在比一份没被重签的旧文件。
+    assert_ne!(
+        after["proof"], before["proof"],
+        "the document must actually have been re-signed"
+    );
 }
 
 // ========================================================================

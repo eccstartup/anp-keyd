@@ -44,15 +44,43 @@ cron、CI、systemd 的 `ExecStartPre`、被 agent 拉起来的子进程都在�
 
 ## 五分钟跑通
 
+**文档该有什么,由一份文件说了算 —— 不是由命令行的几个开关。** did.json
+里除了密钥之外的东西(挂哪个域名、service 条目、agent description 地址)
+通常来自别处:注册 WNS handle 的脚本、你们自己的配置。所以这里分开:
+**你写规格,工具照它构造文档并签名。**
+
+先起一份模板,它就是你手上那个文件:
+
 ```bash
-anp-keyd keygen --host example.com --path agents/mybot
+anp-keyd spec --host example.com --path agents/mybot --out mybot.spec.json
 ```
 
-它会让你**敲两遍口令**(口令从终端读,不走命令行参数、不走环境变量)。
-然后打印出 DID,和一句提示:信封落在哪个文件里。
+```json
+{
+  "host": "example.com",
+  "path": "agents/mybot"
+}
+```
 
-`--host` 是你控制的域名,`--path` 是 `e1_` 段之前的那一段路径。两个都没有
-默认值 —— did:wba **要求**至少有一段路径,而且要求域名是 FQDN 不是 IP。
+之后随你改:`services` 里放 `{"id": "#handle", "type": "ANPHandleService",
+"serviceEndpoint": "…"}` 这类条目,`id` 以 `#` 开头会被展开成 `{did}#…`;
+`agentDescriptionUrl` 是个简写,等价于一条 `{did}#ad` 的 `AgentDescription`
+条目;`port` 要写就写非默认端口。**这份文件里没有密钥,也不能有** ——
+公钥是 keygen 那一刻才有的。
+
+认不出的字段会被拒,而不是被悄悄忽略:"我以为我声明了"和"它真的声明了"是
+两件事,而一个拼错的键正是这两件事开始分岔的地方。根密钥的 fragment 也不
+在文件里(写了同样被拒):它不是一条声明,是本工具自己认根密钥用的名字。
+
+```bash
+anp-keyd keygen --spec mybot.spec.json
+```
+
+它会让你**敲两遍口令**(口令从终端读,不走命令行参数、不走环境变量),
+打印出 DID,并告诉你怎么发布。`--spec` 没有默认值:坐标必须是**你写在
+文件里的**那几个,由工具替你挑一个等于替你决定身份挂在哪儿。坐标的几条
+规则(域名要是 FQDN 不是 IP、路径段必须 URL 安全、至少要有一段路径)在
+`spec` 那一刻就报出来,而不是等到钥匙都生成好了才在别处报错。
 
 ```bash
 anp-keyd publish --did did:wba:example.com:agents:mybot:e1_abc…
@@ -126,8 +154,9 @@ anp-keyd sign --did … --method POST --url https://… \
 | 命令 | 干什么 |
 |---|---|
 | `serve` | 常驻:在 Unix socket 上服务签名请求 |
+| `spec` | 写一份文档规格文件(模板),`keygen` / `publish` 读的就是它 |
 | `keygen` | 生成一把新的 did:wba 密钥,把信封写进 `keys/` |
-| `publish` | 给文档盖上自签 proof,写出 did.json |
+| `publish` | 按规格构造文档、盖上自签 proof,写出 did.json |
 | `verify-doc` | 校验一份文档确实是它自称的那个 DID 的文档 |
 | `probe` | 体检:这台机器能不能兑现这个工具给出的承诺 |
 | `add-recovery-key` | 给一个 DID 加一把恢复密钥(预授权签一次迁移) |
@@ -153,10 +182,18 @@ cargo install --path . --features mcp           # 多出 mcp
 
 ### 几个不显然的默认值
 
-- **`keygen --path` 没有默认值。** 与其给一个注定会失败的默认值(光秃秃的
-  `did:wba:example.com:e1_...` 不是合法 did:wba DID),不如让命令在解析参数
-  时就把这条规则说出来。
-- **`--host` 拒收 IP 字面量。** did:wba 要求 FQDN。
+- **`keygen --spec` 没有默认值。** DID 是"坐标 + 公钥"算出来的,而坐标必须是
+  **你写在文件里的**那几个 —— 由工具替你挑一个,等于替你决定身份挂在哪儿。
+- **规格文件拒收未知字段。** "我以为我声明了"和"它真的声明了"是两件事,
+  悄悄忽略一个拼错的键正是这两件事开始分岔的地方。
+- **`spec --host` 拒收 IP 字面量。** did:wba 要求 FQDN。这一条在读规格文件时
+  就报,不等到人坐下来敲口令。
+- **根密钥的 fragment 写不进规格文件。** 它不是声明,是本工具自己认根密钥
+  用的名字;开放出去能造出一份本工具自己看不懂的文档。
+- **`publish` 不给 `--spec` 就沿用本地那份文档的声明。** 重发一次文档不该顺手
+  把 service 条目清掉 —— 那是不报错的丢东西。
+- **`publish --spec` 的坐标必须和 `--did` 说的一致。** 对不上直接拒,而不是
+  挑一个信:拿一个 DID 去签另一个地方的文档,是这里最贵的一种错。
 - **`serve --idle 0` 是"立刻上锁",不是"永不"。** 想要永不,别用 0。
 - **`sign --raw` 默认关着。** 那是守护进程里唯一一条能给调用方任意签名的路,
   要用得先 `serve --allow-raw-signing`。

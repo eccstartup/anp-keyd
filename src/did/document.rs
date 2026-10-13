@@ -13,8 +13,10 @@ use crate::did::parse::parse_did_wba;
 use crate::error::{KeydError, Result};
 use crate::sign::{LockedSigningKey, Signer};
 
-/// 根密钥在文档里的 fragment。上游的 `VM_KEY_AUTH` 也是这个值。
-pub const ROOT_FRAGMENT: &str = "key-1";
+// 规格(文档该有什么)住在 [`crate::did::spec`],这里只负责把规格变成一份
+// 规范形式的文档并签名。这两个东西分开是为了让"文档里放什么"能独立于
+// 钥匙保管往前走 —— 见那个模块的头。
+pub use crate::did::spec::{DidDocumentSpec, SpecFile, ROOT_FRAGMENT};
 
 /// 文档里**除根密钥之外**的一把验证方法。
 ///
@@ -85,38 +87,6 @@ fn role_for(
     }
 }
 
-/// 一个 did:wba 的"坐标" —— 文档挂在哪、路径是什么。
-#[derive(Debug, Clone)]
-pub struct DidDocumentSpec {
-    /// 域名,不含端口。IP 字面量会被上游拒绝。
-    pub host: String,
-    pub port: Option<u16>,
-    /// `e1_` 段**之前**的路径段。`e1_` 段由上游按公钥算出来追加。
-    pub path_segments: Vec<String>,
-    pub fragment: String,
-}
-
-impl DidDocumentSpec {
-    pub fn new(host: impl Into<String>, path_segments: Vec<String>) -> Self {
-        Self {
-            host: host.into(),
-            port: None,
-            path_segments,
-            fragment: ROOT_FRAGMENT.to_string(),
-        }
-    }
-
-    pub fn with_port(mut self, port: u16) -> Self {
-        self.port = Some(port);
-        self
-    }
-
-    pub fn with_fragment(mut self, fragment: impl Into<String>) -> Self {
-        self.fragment = fragment.into();
-        self
-    }
-}
-
 /// 构造一份**未签名**的 did:wba 文档,同时把它的 DID 返回。
 ///
 /// 把 DID 和文档一起返回是刻意的:DID 的最后一段是当前这把公钥算出来的,
@@ -154,8 +124,8 @@ pub fn build_unsigned_with(
     let options = anp::authentication::SuppliedE1DidDocumentOptions {
         port: spec.port,
         path_segments: spec.path_segments.clone(),
-        agent_description_url: None,
-        services: Vec::new(),
+        agent_description_url: spec.agent_description_url.clone(),
+        services: spec.services.clone(),
         root_key: anp::authentication::SuppliedDidKey {
             fragment: spec.fragment.clone(),
             role: anp::authentication::DidKeyRole::RootControl,
@@ -214,50 +184,55 @@ pub fn sign_document(
 /// 从 DID 字符串 + 公钥**重建**出那份文档。
 ///
 /// 签名路径需要文档,但签名路径手里只有磁盘上的信封(它存了 DID 和公钥),
-/// 没有当初构造文档时的那些参数。好在 DID 本身就是那些参数的编码 ——
-/// 域名、端口、路径段全在里面。
+/// 没有当初构造文档时的那些参数。好在 DID 本身就是**坐标**的编码 ——
+/// 域名、端口、路径段全在里面。所以这里从 DID 反推规格,可选项留空。
+///
+/// 想带上 agent description 或 service 条目(WNS handle 就在那一档)的,
+/// 走 [`rebuild_with`] 并给一份补齐了的规格。
 ///
 /// 重建之后**必须**和原来的 DID 逐字节相等,否则拒。这一条保证了
 /// 「我们手上的 DID」和「我们重建出的文档」说的是同一件事;不相等就说明
 /// 这个 DID 不是规范形式(比如被额外百分号编码过),那就别猜,直接失败。
 pub fn rebuild(did: &str, root: &ed25519_dalek::VerifyingKey) -> Result<Value> {
-    rebuild_with(did, root, Vec::new())
+    rebuild_with(&DidDocumentSpec::coordinates_from_did(did)?, did, root, Vec::new())
 }
 
-/// 同上,但把附加密钥一起挂回去。
+/// 同上,但用**给定的规格**重建,并把附加密钥一起挂回去。
 ///
 /// **给已经挂了热密钥/恢复密钥的 DID 重发文档时必须走这一条。** 走
 /// [`rebuild`] 等于拿着一份只有根密钥的文档去盖掉线上那份 —— 而
 /// `deactivated`/`successorDid` 也好、热密钥也好、恢复密钥也好,全在
 /// 那次重发里消失。这正是"文档是以 DIDs 为键的、覆盖写"这件事最危险的地方:
 /// 覆盖不会报错,只会静静地少掉东西。
+///
+/// `spec` 必须是 `did` 的规格:坐标对不上就直接拒,而不是拿它去签一份
+/// 挂在别的地方的文档。
 pub fn rebuild_with(
+    spec: &DidDocumentSpec,
     did: &str,
     root: &ed25519_dalek::VerifyingKey,
     extra: Vec<ExtraKey>,
 ) -> Result<Value> {
-    let parts = parse_did_wba(did)?;
-    let mut path_segments = parts.path_segments.clone();
-    let last = path_segments
-        .pop()
-        .ok_or_else(|| KeydError::Did(format!("{did} has no e1_ binding segment")))?;
-    if !last.starts_with("e1_") {
-        return Err(KeydError::Did(format!("{did} has no e1_ binding segment")));
-    }
-
-    let spec = DidDocumentSpec {
-        host: parts.host,
-        port: parts.port,
-        path_segments,
-        fragment: ROOT_FRAGMENT.to_string(),
-    };
-    let (rebuilt, document) = build_unsigned_with(&spec, root, extra)?;
-    if rebuilt != did {
-        return Err(KeydError::Did(format!(
-            "{did} is not in the canonical form this build produces (got {rebuilt})"
-        )));
-    }
+    spec.check_canonical(did, root)?;
+    let (_, document) = build_unsigned_with(spec, root, extra)?;
     Ok(document)
+}
+
+/// 一份**可以发布出去**的文档:重建 → 签名 → 自检,三步缺一不可。
+///
+/// `publish` 走的也是这三步(它另外还要问口令、决定写到哪去、把本地那份里
+/// 已有的附加密钥带上 —— 那些是"人"的部分)。测试要一份"真的会被发布出去"
+/// 的文档时走这里,而不是手拼一份没签名的:手拼的那种,要到验签那一刻才
+/// 发现不是一回事。
+pub fn publishable(
+    spec: &DidDocumentSpec,
+    did: &str,
+    key: &LockedSigningKey,
+) -> Result<Value> {
+    let unsigned = rebuild_with(spec, did, &key.verifying_key(), Vec::new())?;
+    let signed = sign_document(&unsigned, key, &key.id().kid)?;
+    verify_path_binding(did, &signed)?;
+    Ok(signed)
 }
 
 /// 校验一份文档确实是它自称的那个 DID 的文档。

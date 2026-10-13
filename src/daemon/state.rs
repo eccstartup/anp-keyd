@@ -520,8 +520,19 @@ mod tests {
             .unwrap();
 
             // keygen 不写 DID 文档(没签名的文档落盘会让人误以为发布了)。
-            // 但签名要用它,所以这里补上 —— 现实中这是 `publish` 干的活。
-            store::write_did_document(&layout, &created.did, &created.document).unwrap();
+            // 但签名要用它,而且用的必须是**已发布出去的那一份**,所以这里
+            // 补上 `publish` 的活。
+            let wrapped = store::load(&layout, &created.wrapped.id.thumbprint).unwrap();
+            let device_secret = crate::keystore::device::load(&layout).unwrap();
+            let key = crate::keystore::unwrap::unlock(
+                &wrapped,
+                PASSPHRASE.as_bytes(),
+                &device_secret,
+            )
+            .unwrap();
+            let document = crate::did::document::publishable(&spec(), &created.did, &key).unwrap();
+            store::write_did_document(&layout, &created.did, &document).unwrap();
+            drop(key);
 
             // vault 认的是 kid,不是 DID。从落盘的信封里读回来,别在这里
             // 手拼一个 "… #key-1" —— 那种字符串一旦和实际写进去的不一样,

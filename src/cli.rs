@@ -30,6 +30,7 @@ use crate::daemon::{self, server, ServerConfig};
 use crate::did::document::{self, DidDocumentSpec};
 use crate::did::lifecycle;
 use crate::did::did_url_path;
+use crate::did::SpecFile;
 use crate::error::{KeydError, Result};
 use crate::keystore::layout::KeydLayout;
 use crate::keystore::{device, store};
@@ -62,6 +63,13 @@ pub enum Command {
     Serve(ServeArgs),
     /// 生成一把新的 did:wba 密钥,把信封写进 `keys/`。
     Keygen(KeygenArgs),
+    /// 写一份**文档规格文件** —— 从一份模板开始,之后就归你改。
+    ///
+    /// 规格文件是"这份文档该有什么"的唯一来源(域名、路径、service 声明),
+    /// 而 `keygen` / `publish` 读它、不猜它。这条命令只是给手写减负:
+    /// 坐标的几条规则(域名不能是 IP、路径段必须 URL 安全)在这里当场查,
+    /// 而不是等到钥匙都生成出来了才在别处报错。
+    Spec(SpecArgs),
     /// 给文档盖上自签 proof,写出 did.json。
     Publish(PublishArgs),
     /// 校验一份文档确实是它自称的那个 DID 的文档。
@@ -174,25 +182,13 @@ impl ServeArgs {
 
 #[derive(Args, Debug)]
 pub struct KeygenArgs {
-    /// 你控制的域名。IP 字面量会被拒 —— did:wba 要求 FQDN。
-    #[arg(long, value_name = "HOST")]
-    pub host: String,
-
-    /// 非默认端口。
-    #[arg(long, value_name = "PORT")]
-    pub port: Option<u16>,
-
-    /// `e1_` 段之前的路径,用 `/` 分隔(如 `agents/mybot`)。
+    /// 文档规格文件(JSON)。坐标和 service 声明都从它来。
     ///
-    /// 没有默认值,因为 did:wba **要求**至少有一段:光秃秃的
-    /// `did:wba:example.com:e1_...` 不是合法的 did:wba DID。与其给一个
-    /// 会失败的默认值,不如让 clap 在解析参数时就把这条规则说出来。
-    #[arg(long, value_name = "A/B")]
-    pub path: String,
-
-    /// 验证方法的 fragment。
-    #[arg(long, default_value = document::ROOT_FRAGMENT, value_name = "NAME")]
-    pub fragment: String,
+    /// 没有它就没法生成:DID 是"坐标 + 公钥"算出来的,而坐标必须是**你
+    /// 写在文件里的**那几个,不能由工具替你挑。要一份起步的模板用
+    /// `anp-keyd spec --help`。
+    #[arg(long, value_name = "FILE")]
+    pub spec: PathBuf,
 
     /// 人读的标签。它进 AAD,所以改它要重封,不是改个注释。
     #[arg(long, default_value = "default", value_name = "LABEL")]
@@ -200,9 +196,40 @@ pub struct KeygenArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct SpecArgs {
+    /// 你控制的域名。IP 字面量会被拒 —— did:wba 要求 FQDN。
+    #[arg(long, value_name = "HOST")]
+    pub host: String,
+
+    /// `e1_` 段之前的路径,用 `/` 分隔(如 `agents/mybot`)。
+    #[arg(long, value_name = "A/B")]
+    pub path: String,
+
+    /// 非默认端口。
+    #[arg(long, value_name = "PORT")]
+    pub port: Option<u16>,
+
+    /// 文档要声明的 agent description 地址。
+    #[arg(long, value_name = "URL")]
+    pub agent_description_url: Option<String>,
+
+    /// 写到哪里。不给就打到 stdout。
+    #[arg(long, value_name = "FILE")]
+    pub out: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
 pub struct PublishArgs {
     #[arg(long, value_name = "DID")]
     pub did: String,
+
+    /// 文档规格文件。**不给就沿用本地那份文档里的声明** —— 重发文档不该
+    /// 顺手把 service 条目清掉,那是不报错的丢东西。
+    ///
+    /// 给了的话,它的坐标必须和 `--did` 说的一致(对不上直接拒,而不是
+    /// 挑一个信):拿一个 DID 去签另一个地方的文档,是这里最贵的一种错。
+    #[arg(long, value_name = "FILE")]
+    pub spec: Option<PathBuf>,
 
     /// 写到哪里。不给就写进本地 `dids/`。
     #[arg(long, value_name = "DIR")]
@@ -446,6 +473,7 @@ pub fn run(cli: Cli) -> Result<()> {
     match command {
         Command::Serve(args) => serve(root, args),
         Command::Keygen(args) => keygen(root, args),
+        Command::Spec(args) => write_spec(root, args),
         Command::Publish(args) => publish(root, args),
         Command::VerifyDoc(args) => verify_doc(root, args),
         Command::List => list(root),
@@ -634,7 +662,9 @@ async fn wait_for_a_stop_signal() {
 
 fn keygen(root: Option<&Path>, args: KeygenArgs) -> Result<()> {
     let layout = layout(root)?;
-    let spec = spec_of(&args)?;
+    // 规格先读、先查,在**问口令之前** —— 人已经坐下来、敲完两遍口令之后
+    // 才被告知"你这个域名不行",而这条错误本来在他敲第一个字符之前就成立。
+    let spec = SpecFile::from_file(&args.spec)?.to_spec()?;
 
     let tty = tty::open()?;
     let passphrase =
@@ -655,67 +685,38 @@ fn keygen(root: Option<&Path>, args: KeygenArgs) -> Result<()> {
     println!("envelope written to {}", layout.key_path(&created.wrapped.id.thumbprint)?.display());
     println!();
     println!("publish it with:");
-    println!("    anp-keyd publish --did {}", created.did);
+    println!("    anp-keyd publish --did {} --spec {}", created.did, args.spec.display());
     println!();
     println!("it must then be served at:");
     println!("    {}", did_url_path(&created.did)?);
     Ok(())
 }
 
-/// 把命令行参数变成一份文档规格,**在问口令之前**。
-///
-/// 这里检查的三条(主机非空、不是 IP 字面量、至少有一段路径)是 did:wba
-/// 自己的规则,上游会再查一遍。提前查一遍的理由只有一个:人已经坐下来、
-/// 敲完两遍口令之后才被告知"你这个域名不行",而这条错误本来在他敲第一个
-/// 字符之前就成立。这里只是把同一句话挪到更早说。
-fn spec_of(args: &KeygenArgs) -> Result<DidDocumentSpec> {
-    let host = args.host.trim();
-    if host.is_empty() {
-        return Err(KeydError::Did(format!(
-            "--host {} names no domain",
-            args.host
-        )));
-    }
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return Err(KeydError::Did(format!(
-            "did:wba 按**托管这个 DID 文档的域名**来命名一把钥匙,所以 {host:?} 不能是 IP \
-             字面量 —— 要给的是那个会被别人去请求 did.json 的域名"
-        )));
-    }
-    if args.path.trim_matches('/').is_empty() {
-        return Err(KeydError::Did(format!(
-            "the path {} is empty, and did:wba requires at least one segment before the e1_ \
-             one — a DID with no path segment ({host}:e1_...) is not a valid did:wba DID",
-            args.path
-        )));
-    }
+// ————————————————————————————————————————————————————————————————————————
+// spec
+// ————————————————————————————————————————————————————————————————————————
 
-    let mut spec = DidDocumentSpec::new(host.to_string(), path_segments(&args.path)?)
-        .with_fragment(args.fragment.clone());
-    if let Some(port) = args.port {
-        spec = spec.with_port(port);
-    }
-    Ok(spec)
-}
+fn write_spec(_root: Option<&Path>, args: SpecArgs) -> Result<()> {
+    let file = SpecFile {
+        host: args.host,
+        port: args.port,
+        path: args.path,
+        agent_description_url: args.agent_description_url,
+        services: Vec::new(),
+    };
+    // 让 `to_spec` 查一遍再写:一份自己都算不出 DID 的规格写出去,只会把
+    // 错误推迟到 `keygen`(那时候人已经坐下来准备敲口令了)。
+    file.to_spec()?;
 
-/// `agents/mybot` → `["agents", "mybot"]`,两头的 `/` 容忍。
-///
-/// 空段直接拒:`a//b` 会被上游拼成一条带空段的路径,而那个 DID 解析出来
-/// 的 URL 和它看起来的样子不一样。与其发布一个自己都念不准的 DID,现在说。
-fn path_segments(path: &str) -> Result<Vec<String>> {
-    let trimmed = path.trim_matches('/');
-    if trimmed.is_empty() {
-        return Err(KeydError::Did(format!(
-            "the path {path:?} has no segments; did:wba needs at least one (see --path)"
-        )));
+    let text = file.to_json()?;
+    match &args.out {
+        Some(path) => {
+            std::fs::write(path, format!("{text}\n"))?;
+            println!("wrote {}", path.display());
+        }
+        None => println!("{text}"),
     }
-    let segments: Vec<String> = trimmed.split('/').map(str::to_string).collect();
-    if let Some(empty) = segments.iter().position(String::is_empty) {
-        return Err(KeydError::Did(format!(
-            "the path {path:?} has an empty segment at position {empty}"
-        )));
-    }
-    Ok(segments)
+    Ok(())
 }
 
 // ————————————————————————————————————————————————————————————————————————
@@ -726,6 +727,33 @@ fn publish(root: Option<&Path>, args: PublishArgs) -> Result<()> {
     let layout = layout(root)?;
     let thumbprint = thumbprint_of(&args.did)?;
     let wrapped = store::load(&layout, &thumbprint)?;
+
+    // 本地那份文档 —— 没有就是没发布过。它有两件事要交代:已经挂在这台
+    // 机器上的热密钥和恢复密钥(重建会丢,见下),以及它自己声明过的
+    // service 条目。
+    let existing = match store::read_did_document(&layout, &args.did) {
+        Ok(document) => Some(document),
+        Err(KeydError::KeyNotFound(_)) => None,
+        Err(error) => return Err(error),
+    };
+
+    // 规格:坐标从 DID 反推(文档必须挂在它自称的地方),可选项**先看
+    // `--spec`,没有就沿用本地那份文档里的**。
+    //
+    // 后者不是省事:service 由规格决定,而重建会照规格写 —— 一份带 WNS
+    // handle 绑定的文档,如果重发时不把那条声明带上,它就**静静地**没了。
+    // 覆盖写不报错,只会少东西。
+    let spec = match &args.spec {
+        Some(path) => {
+            let file = SpecFile::from_file(path)?;
+            file.check_coordinates(&args.did)?;
+            file.to_spec()?
+        }
+        None => match &existing {
+            Some(document) => DidDocumentSpec::from_document(document)?,
+            None => DidDocumentSpec::coordinates_from_did(&args.did)?,
+        },
+    };
 
     let tty = tty::open()?;
     let passphrase = tty::read_secret(&tty, &format!("Passphrase for {}: ", args.did))?;
@@ -738,27 +766,22 @@ fn publish(root: Option<&Path>, args: PublishArgs) -> Result<()> {
     //
     // 但"应有的文档"里**包含**已经挂在这台机器上的热密钥和恢复密钥 ——
     // 光按 DID 重建会得到一份只有根密钥的文档,而它盖上去之后,那两把钥匙
-    // 就从文档里消失了。覆盖写不会报错,只会静静地少掉东西,所以这里必须
-    // 先把附加密钥捞回来一起重建(见 `rebuild_with` 的注释)。
-    //
-    // 本地那份文档不存在时没有可捞的东西:要么这个 DID 从没发布过,要么
-    // 它是别的机器上的。两种情况都按"只有根密钥"重建。
-    let unsigned = match store::read_did_document(&layout, &args.did) {
-        Ok(existing) => {
-            let extras = lifecycle::extra_keys(&existing, &args.did)?;
+    // 就从文档里消失了。所以有本地文档时走 `rekey`:它在重建的同时把
+    // 附加密钥和上游不认识的顶层属性一起搬回来。
+    let signed = match &existing {
+        Some(existing) => {
+            let extras = lifecycle::extra_keys(existing, &args.did)?;
             if !extras.is_empty() {
                 println!("keeping {} extra key(s) from the local document", extras.len());
             }
-            lifecycle::rekey(&existing, &args.did, &key.verifying_key(), extras)?
+            let unsigned =
+                lifecycle::rekey(existing, &spec, &args.did, &key.verifying_key(), extras)?;
+            let signed = document::sign_document(&unsigned, &key, &wrapped.id.kid)?;
+            document::verify_path_binding(&args.did, &signed)?;
+            signed
         }
-        Err(KeydError::KeyNotFound(_)) => document::rebuild(&args.did, &key.verifying_key())?,
-        Err(error) => return Err(error),
+        None => document::publishable(&spec, &args.did, &key)?,
     };
-    let signed = document::sign_document(&unsigned, &key, &wrapped.id.kid)?;
-
-    // 走出去之前先自己验一遍。一份签得出来却绑不上路径的文档,发布出去
-    // 只会让**别人**发现我们在骗自己。
-    document::verify_path_binding(&args.did, &signed)?;
 
     let bytes = serde_json::to_vec_pretty(&signed)?;
     let path = match &args.out {
@@ -1064,27 +1087,31 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::ArgumentConflict, "{error}");
     }
 
+    /// 一份规格文件 —— `keygen` / `publish` 读的就是它,走的是同一条
+    /// `to_spec`。所以下面几条"坐标不合法"的验收,验的正是人敲命令时
+    /// 会撞上的那条路(而它在**问口令之前**就会炸:`keygen` 先读文件)。
     fn spec(host: &str, path: &str) -> Result<DidDocumentSpec> {
-        spec_of(&KeygenArgs {
+        SpecFile {
             host: host.to_string(),
             port: None,
             path: path.to_string(),
-            fragment: "key-1".to_string(),
-            label: "default".to_string(),
-        })
+            agent_description_url: None,
+            services: Vec::new(),
+        }
+        .to_spec()
     }
 
     #[test]
     fn a_path_is_split_on_slashes_and_tolerates_surrounding_ones() {
-        assert_eq!(path_segments("agents/mybot").unwrap(), ["agents", "mybot"]);
-        assert_eq!(path_segments("/agents/mybot/").unwrap(), ["agents", "mybot"]);
+        let spec = spec("example.com", "/agents/mybot/").unwrap();
+        assert_eq!(spec.path_segments, ["agents", "mybot"]);
     }
 
     /// 空段要拒 —— `a//b` 拼出来的 DID 和它看起来的样子不是一回事。
     #[test]
     fn an_empty_path_segment_is_refused() {
-        let error = path_segments("a//b").unwrap_err();
-        assert!(error.to_string().contains("empty segment"), "{error}");
+        let error = spec("example.com", "a//b").unwrap_err();
+        assert!(error.to_string().contains("empty path segment"), "{error}");
     }
 
     /// **apex 不是合法的 did:wba DID。**
@@ -1097,7 +1124,7 @@ mod tests {
         for path in ["", "/", "///"] {
             let error = spec("example.com", path).unwrap_err();
             let text = error.to_string();
-            assert!(text.contains("at least one segment"), "{path:?}: {text}");
+            assert!(text.contains("no segments"), "{path:?}: {text}");
         }
     }
 
@@ -1114,7 +1141,7 @@ mod tests {
     #[test]
     fn an_empty_host_is_refused_before_the_prompt() {
         let error = spec("   ", "agents/bot").unwrap_err();
-        assert!(error.to_string().contains("names no domain"), "{error}");
+        assert!(error.to_string().contains("domain"), "{error}");
     }
 
     /// 主机两头的空白要削掉 —— 粘贴域名的时候很容易带进来。
@@ -1122,6 +1149,7 @@ mod tests {
     fn a_host_is_trimmed() {
         let spec = spec("  example.com  ", " agents/bot ").unwrap();
         assert_eq!(spec.host, "example.com");
+        assert_eq!(spec.path_segments, ["agents", "bot"]);
     }
 
     #[test]

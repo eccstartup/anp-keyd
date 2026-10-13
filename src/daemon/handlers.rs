@@ -193,16 +193,31 @@ mod tests {
             let layout = KeydLayout::at(dir.path().to_path_buf());
             layout.ensure().unwrap();
 
+            let spec = DidDocumentSpec::new("example.com", vec!["user".into(), "alice".into()])
+                .with_fragment("key-1");
             let created = create::create(
                 &layout,
-                &DidDocumentSpec::new("example.com", vec!["user".into(), "alice".into()])
-                    .with_fragment("key-1"),
+                &spec,
                 "default",
                 PASSPHRASE.as_bytes(),
                 fast(),
             )
             .unwrap();
-            store::write_did_document(&layout, &created.did, &created.document).unwrap();
+
+            // `keygen` 不写 DID 文档(没签名的文档落盘会让人以为它已经发布
+            // 了),签名时用的必须是**已发布出去的那一份**。所以这里补上
+            // `publish` 的活 —— 补的是签好的,不是随手拼一份。
+            let wrapped = store::load(&layout, &created.wrapped.id.thumbprint).unwrap();
+            let device_secret = crate::keystore::device::load(&layout).unwrap();
+            let key = crate::keystore::unwrap::unlock(
+                &wrapped,
+                PASSPHRASE.as_bytes(),
+                &device_secret,
+            )
+            .unwrap();
+            let document = crate::did::document::publishable(&spec, &created.did, &key).unwrap();
+            store::write_did_document(&layout, &created.did, &document).unwrap();
+            drop(key);
 
             Self {
                 state: DaemonState::new(

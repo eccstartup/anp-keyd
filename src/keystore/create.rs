@@ -1,15 +1,19 @@
 //! 生成一把新的 did:wba 密钥,并把它的信封写下去。
 //!
-//! 这里的顺序是有讲究的:**先有 seed,再由 seed 推出公钥,再由公钥算出 DID**。
-//! 反过来(先定 DID 再想办法凑公钥)是不可能做到的 —— 也就意味着 DID 的
-//! `e1_` 段天然就是公钥的指纹,不需要额外信任任何东西。
-
-use serde_json::Value;
+//! 这里的顺序是有讲究的:**先有 seed,再由 seed 推出公钥,再由公钥和坐标
+//! 算出 DID**。反过来(先定 DID 再想办法凑公钥)是不可能做到的 —— 也就
+//! 意味着 DID 的 `e1_` 段天然就是公钥的指纹,不需要额外信任任何东西。
+//!
+//! **这里不构造文档。** 一份文档是"协议面"的东西(service 条目、agent
+//! description……),`keygen` 一个字节都用不上 —— 它只要 DID 字符串。
+//! 文档由 [`crate::did::document`] 从规格构造、由 `publish` 签名,规格本身
+//! 是外部的(见 [`crate::did::spec`])。
 
 use crate::crypto::hygiene::LockedBytes;
 use crate::crypto::kdf::Argon2Config;
 use crate::crypto::thumbprint::e1_segment;
-use crate::did::document::{build_unsigned, DidDocumentSpec, ExtraKey};
+use crate::did::document::{DidDocumentSpec, ExtraKey};
+use crate::did::spec::compose_did_wba;
 use crate::error::Result;
 use crate::keystore::layout::KeydLayout;
 use crate::keystore::record::{KeyAlgorithm, KeyId, WrappedKey};
@@ -22,8 +26,6 @@ pub struct Created {
     pub did: String,
     /// 根密钥验证方法的完整 id(`did#key-1`)。
     pub verification_method: String,
-    /// **未签名**的文档。签名是 `publish` 的事,因为它需要私钥在场。
-    pub document: Value,
 }
 
 /// 只生成,不碰磁盘。
@@ -39,13 +41,10 @@ pub fn generate(
     let (verifying, public_multibase) = wrap::seed_to_public(&seed);
     let thumbprint = e1_segment(&verifying)?;
 
-    // DID 由上游按公钥算出来 —— 不是我们拼的,所以指纹必然自洽。
-    let (did, document) = build_unsigned(spec, &verifying)?;
+    // DID 由坐标 + 公钥合成 —— `e1_` 段就是我们刚算出的那个指纹,所以
+    // 「DID 里的公钥」和「信封里的公钥」必然自洽,不需要事后核对。
+    let did = compose_did_wba(spec, &verifying)?;
     let verification_method = format!("{did}#{}", spec.fragment);
-
-    // 上游一定把 e1_ 段追加在最后,这一点我们刚在 build_unsigned 里依赖过;
-    // 这里再核一次,免得哪天上游改了行为而 DID 悄悄和公钥脱钩。
-    debug_assert!(did.ends_with(&thumbprint), "upstream DID {did} lost the e1_ binding");
 
     let wrapped = wrap::seal(wrap::SealRequest {
         id: KeyId {
@@ -62,12 +61,7 @@ pub fn generate(
         argon,
     })?;
 
-    Ok(Created {
-        wrapped,
-        did,
-        verification_method,
-        document,
-    })
+    Ok(Created { wrapped, did, verification_method })
 }
 
 /// 生成并落盘:信封进 `keys/`,设备密钥不在就顺手建一把。
@@ -169,7 +163,9 @@ pub fn create_extra(
 mod tests {
     use super::*;
     use crate::crypto::thumbprint::e1_from_did;
+    use crate::did::document::{build_unsigned, ROOT_FRAGMENT};
     use crate::sign::Signer;
+    use serde_json::Value;
 
     fn fast() -> Argon2Config {
         Argon2Config { m_cost: 1024, t_cost: 1, p_cost: 1 }
@@ -184,8 +180,9 @@ mod tests {
     }
 
     #[test]
-    fn the_key_id_is_consistent_with_the_documents_own_public_key() {
+    fn the_did_binds_the_envelope_public_key() {
         let c = generate(&spec(), "alice", b"pw", &device(), fast()).unwrap();
+        let root = c.wrapped.verifying_key().unwrap();
 
         // DID 最后一段 == e1_ 段 == KeyId.thumbprint
         assert_eq!(e1_from_did(&c.did).unwrap(), c.wrapped.id.thumbprint);
@@ -193,13 +190,19 @@ mod tests {
         assert_eq!(c.wrapped.id.did, c.did);
         assert_eq!(
             c.wrapped.id.kid,
-            format!("{}#key-1", c.did),
+            format!("{}#{}", c.did, ROOT_FRAGMENT),
             "the kid must be a real verification method id in the document"
         );
-        assert_eq!(c.document["id"], Value::String(c.did.clone()));
+
+        // 合成的 DID 就是文档构建器会写进 `id` 的那一个 —— 这里没有第二条
+        // 拼 DID 的路,`keygen` 拿到的是同一份文档会用的那个字符串。
+        let (from_document, document) = build_unsigned(&spec(), &root).unwrap();
+        assert_eq!(compose_did_wba(&spec(), &root).unwrap(), c.did);
+        assert_eq!(from_document, c.did);
+        assert_eq!(document["id"], Value::String(c.did.clone()));
 
         // 信封上写的公钥就是文档里写的公钥。
-        let methods = c.document["verificationMethod"].as_array().unwrap();
+        let methods = document["verificationMethod"].as_array().unwrap();
         assert!(methods
             .iter()
             .any(|m| m["publicKeyMultibase"] == Value::String(c.wrapped.public_multibase.clone())));
@@ -237,14 +240,5 @@ mod tests {
         assert_eq!(key.public_multibase(), created.wrapped.public_multibase);
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn generated_documents_are_unsigned() {
-        let c = generate(&spec(), "alice", b"pw", &device(), fast()).unwrap();
-        assert!(
-            c.document.get("proof").is_none(),
-            "generate must hand back an unsigned document"
-        );
     }
 }

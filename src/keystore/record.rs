@@ -182,6 +182,21 @@ impl WrappedKey {
         Ok(crate::crypto::sha256(&canonical))
     }
 
+    /// 信封上那把公钥,读回成一把可用的钥匙。
+    ///
+    /// 文档的**重建**用它:DID 文档里写什么,取决于这把钥匙;而重建发生在
+    /// 签名之前、在解密之后 —— 手上当时只有信封和刚解出来的 seed。从 seed
+    /// 再推一次公钥也行,但那是"再算一遍",而这里要的是"信封上声明的是哪
+    /// 一把" —— 两者一旦不同,信封就已经坏了,那就该在这里炸掉。
+    pub fn verifying_key(&self) -> Result<ed25519_dalek::VerifyingKey> {
+        if self.algorithm != KeyAlgorithm::Ed25519 {
+            return Err(KeydError::Protocol(
+                "this build only holds Ed25519 keys".into(),
+            ));
+        }
+        crate::crypto::thumbprint::ed25519_from_multibase(&self.public_multibase)
+    }
+
     /// AAD 自检:摘要是重新算出来的,不是信存下来的那个数。
     pub fn verify_aad(&self) -> Result<[u8; 32]> {
         let recomputed = self.aad_digest()?;
@@ -314,5 +329,20 @@ mod tests {
         let mut k = sample();
         k.aead.aad_digest = encode_b64(&k.aad_digest().unwrap());
         assert!(k.verify_aad().is_ok());
+    }
+
+    /// 信封上写的公钥要能读回成一把真钥匙 —— 重建文档时用的就是它。
+    #[test]
+    fn the_envelope_public_key_reads_back() {
+        let seed = crate::crypto::hygiene::LockedBytes::fill(|d| *d = [5u8; 32]).unwrap();
+        let (expected, multibase) = crate::keystore::wrap::seed_to_public(&seed);
+
+        let mut k = sample();
+        k.public_multibase = multibase;
+        assert_eq!(k.verifying_key().unwrap(), expected);
+
+        // 不是 Ed25519 的算法不在这里"试着解一下"。
+        k.algorithm = KeyAlgorithm::P256;
+        assert!(k.verifying_key().is_err());
     }
 }

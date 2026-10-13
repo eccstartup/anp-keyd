@@ -52,6 +52,33 @@ pub fn ed25519_multibase(public: &VerifyingKey) -> String {
     format!("z{}", bs58::encode(buf).into_string())
 }
 
+/// [`ed25519_multibase`] 的逆向:信封里存着的那串公钥读回成一把钥匙。
+///
+/// 解析**不宽容**:前缀、长度、multicodec 头、曲线点合法性,四样全对才算数。
+/// 信封是从磁盘读回来的**不可信输入**,而这里出来的东西下一步就要拿去和
+/// DID 的指纹比对 —— 一个"能解析但解析成了别的东西"的公钥,症状是绑定
+/// 校验莫名其妙地失败。
+pub fn ed25519_from_multibase(multibase: &str) -> Result<VerifyingKey> {
+    let body = multibase.strip_prefix('z').ok_or_else(|| {
+        KeydError::Protocol(format!(
+            "a multibase public key must start with `z` (base58btc), got {multibase:?}"
+        ))
+    })?;
+    let raw = bs58::decode(body)
+        .into_vec()
+        .map_err(|e| KeydError::Protocol(format!("bad base58 in a multibase public key: {e}")))?;
+    if raw.len() != 34 || raw[0] != 0xed || raw[1] != 0x01 {
+        return Err(KeydError::Protocol(
+            "this multibase is not an ed25519-pub multicodec key".into(),
+        ));
+    }
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&raw[2..]);
+    VerifyingKey::from_bytes(&bytes).map_err(|e| {
+        KeydError::Protocol(format!("a multibase public key is not a valid ed25519 point: {e}"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,6 +110,30 @@ mod tests {
     fn multibase_has_the_z6mk_prefix() {
         let mb = ed25519_multibase(&test_key());
         assert!(mb.starts_with("z6Mk"), "ed25519 multikey must start z6Mk, got {mb}");
+    }
+
+    /// 编码再解码要回到原来那把钥匙 —— 信封里存的公钥就是这么读回来的。
+    #[test]
+    fn multibase_roundtrips_back_into_the_same_key() {
+        let mb = ed25519_multibase(&test_key());
+        assert_eq!(ed25519_from_multibase(&mb).unwrap(), test_key());
+    }
+
+    #[test]
+    fn a_multibase_that_is_not_an_ed25519_key_is_refused() {
+        let other_codec = format!("z{}", bs58::encode([0xec, 0x01, 9, 9]).into_string());
+        for bad in [
+            "6Mkabcd".to_string(),  // 少了 `z` 前缀
+            "z".to_string(),        // 空
+            "zzzz".to_string(),     // 不是 base58
+            "z6Mkattacker".to_string(), // 长度不对
+            other_codec,            // 别的 multicodec
+        ] {
+            assert!(
+                ed25519_from_multibase(&bad).is_err(),
+                "{bad:?} must not be read as an ed25519 public key"
+            );
+        }
     }
 
     #[test]

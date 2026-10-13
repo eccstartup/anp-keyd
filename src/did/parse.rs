@@ -74,50 +74,63 @@ pub fn parse_did_wba(did: &str) -> Result<DidWbaParts> {
 
     let decoded_host = percent_decode(encoded_host);
     let (host, port) = split_port(&decoded_host, did)?;
-
-    if host.is_empty() {
-        return Err(KeydError::Did(format!("did:wba has an empty domain: {did}")));
-    }
-    // 上游的构造器拒绝 IP 字面量,解析器这边对称地也拒绝:
-    // 一个绑在裸 IP 上的 did:wba 不是"域名验证过的身份",而发布流程会照着
-    // 这个域名去拼上传地址 —— 允许 IP 等于允许把文档推到任意地址。
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return Err(KeydError::Did(format!(
-            "did:wba must bind a domain, not an IP address: {did}"
-        )));
-    }
-    if !is_plausible_domain(&host) {
-        return Err(KeydError::Did(format!("did:wba has a malformed domain: {host:?}")));
-    }
+    check_host(&host)?;
 
     let path_segments: Vec<String> = segments.map(str::to_string).collect();
     for segment in &path_segments {
-        if segment.is_empty() {
-            return Err(KeydError::Did(format!(
-                "did:wba has an empty path segment: {did}"
-            )));
-        }
-        if segment == "." || segment == ".." {
-            return Err(KeydError::Did(format!(
-                "did:wba path segment is a relative-path token: {did}"
-            )));
-        }
-        // 路径段只允许 RFC 3986 的 unreserved 字符。
-        //
-        // 上游拼 URL 时**不**对路径段做百分号解码,所以 `%2F` 不会当场变成
-        // 斜杠 —— 但它会在服务端被解成斜杠,于是取回地址就能被拐到别的路径。
-        // 与其依赖"对端不会解码",不如在这里只放行一定能安全拼进 URL 的字符。
-        if !segment
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '~'))
-        {
-            return Err(KeydError::Did(format!(
-                "did:wba path segment has a character that is not URL-safe: {segment:?}"
-            )));
-        }
+        check_path_segment(segment)?;
     }
 
     Ok(DidWbaParts { host, port, path_segments })
+}
+
+/// 域名这一段的规则,单独拿出来给**还没成为 DID 的**输入用。
+///
+/// 「规格文件里的 `host` 合不合法」和「DID 里的域名段合不合法」是同一个
+/// 问题,答案也只能有一份 —— 否则两份规则迟早对不上,而对不上的那一侧
+/// 会放行一个发布出去谁都找不到的 DID。所以规则住在这里,由解析器和
+/// [`crate::did::spec`] 一起调。
+pub(crate) fn check_host(host: &str) -> Result<()> {
+    if host.is_empty() {
+        return Err(KeydError::Did("did:wba has an empty domain".into()));
+    }
+    // 一个绑在裸 IP 上的 did:wba 不是"域名验证过的身份",而发布流程会照着
+    // 这个域名去拼取回地址 —— 允许 IP 等于允许把文档推到任意地址。
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Err(KeydError::Did(format!(
+            "did:wba must bind a domain, not an IP address: {host}"
+        )));
+    }
+    if !is_plausible_domain(host) {
+        return Err(KeydError::Did(format!("did:wba has a malformed domain: {host:?}")));
+    }
+    Ok(())
+}
+
+/// 一个路径段的规则,理由和 [`check_host`] 一样单独拿出来。
+pub(crate) fn check_path_segment(segment: &str) -> Result<()> {
+    if segment.is_empty() {
+        return Err(KeydError::Did("did:wba has an empty path segment".into()));
+    }
+    if segment == "." || segment == ".." {
+        return Err(KeydError::Did(format!(
+            "did:wba path segment is a relative-path token: {segment:?}"
+        )));
+    }
+    // 路径段只允许 RFC 3986 的 unreserved 字符。
+    //
+    // 上游拼 URL 时**不**对路径段做百分号解码,所以 `%2F` 不会当场变成
+    // 斜杠 —— 但它会在服务端被解成斜杠,于是取回地址就能被拐到别的路径。
+    // 与其依赖"对端不会解码",不如在这里只放行一定能安全拼进 URL 的字符。
+    if !segment
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '~'))
+    {
+        return Err(KeydError::Did(format!(
+            "did:wba path segment has a character that is not URL-safe: {segment:?}"
+        )));
+    }
+    Ok(())
 }
 
 /// DID → 取回的 URL。
