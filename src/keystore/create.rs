@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::crypto::hygiene::LockedBytes;
 use crate::crypto::kdf::Argon2Config;
 use crate::crypto::thumbprint::e1_segment;
-use crate::did::document::{build_unsigned, DidDocumentSpec};
+use crate::did::document::{build_unsigned, DidDocumentSpec, ExtraKey};
 use crate::error::Result;
 use crate::keystore::layout::KeydLayout;
 use crate::keystore::record::{KeyAlgorithm, KeyId, WrappedKey};
@@ -87,6 +87,82 @@ pub fn create(
     let created = generate(spec, label, passphrase, &device_secret, argon)?;
     store::save_new(layout, &created.wrapped)?;
     Ok(created)
+}
+
+/// 给一个**已经存在**的 DID 造一把新钥匙 —— 热密钥或者恢复密钥。
+///
+/// 和 [`generate`] 只差一处,但那一处是本质的:`generate` 让上游按新公钥算
+/// 出**一个新 DID**(绑定密钥的指纹就是 DID 的最后一段);这里公钥要挂到
+/// **既有的** DID 上,所以那把钥匙的指纹和 DID 的最后一段**必然不同**,
+/// 它的信封文件名是它自己的指纹算出来的。
+///
+/// 这条差别往下渗透到好几处,最要命的一处是:`keys/<DID 的 e1_ 段>.json`
+/// 这个找钥匙的规则对热密钥**不成立**(见
+/// [`crate::keystore::store::envelopes_for_did`])。所以这里把 `did` 交给
+/// 调用方拿着的那个,而不是从公钥反推一个 —— 反推出来的会是另一个 DID。
+///
+/// `relationships` 由调用方给:热密钥是 `authentication`,恢复密钥是
+/// `assertionMethod`。上游把"关系"和"角色"做成了一对一,所以这个选择决定
+/// 了这把钥匙在文档里能干什么,不能事后补。
+pub fn generate_extra(
+    did: &str,
+    fragment: &str,
+    relationships: Vec<anp::authentication::DidVerificationRelationship>,
+    label: &str,
+    passphrase: &[u8],
+    device_secret: &LockedBytes,
+    argon: Argon2Config,
+) -> Result<(WrappedKey, ExtraKey)> {
+    let seed = LockedBytes::generate()?;
+    let (verifying, public_multibase) = wrap::seed_to_public(&seed);
+    // 指纹算的是**这把**钥匙,不是 DID 最后一段。
+    let thumbprint = e1_segment(&verifying)?;
+
+    let wrapped = wrap::seal(wrap::SealRequest {
+        id: KeyId {
+            did: did.to_string(),
+            kid: format!("{did}#{fragment}"),
+            thumbprint,
+        },
+        algorithm: KeyAlgorithm::Ed25519,
+        public_multibase,
+        label: label.to_string(),
+        passphrase,
+        device_secret,
+        seed: &seed,
+        argon,
+    })?;
+
+    Ok((wrapped, ExtraKey::new(fragment, verifying, relationships)))
+}
+
+/// [`generate_extra`] 再落盘。钥匙先写、文档后写 —— 反过来的话,一份
+/// 指向"本机没有的钥匙"的文档会先落地,而那是一份**谁也签不出来的**文档。
+pub fn create_extra(
+    layout: &KeydLayout,
+    did: &str,
+    fragment: &str,
+    relationships: Vec<anp::authentication::DidVerificationRelationship>,
+    label: &str,
+    passphrase: &[u8],
+    argon: Argon2Config,
+) -> Result<(WrappedKey, ExtraKey)> {
+    layout.ensure()?;
+    let device_secret = device::load_or_create(layout)?;
+
+    let (wrapped, key) = generate_extra(
+        did,
+        fragment,
+        relationships,
+        label,
+        passphrase,
+        &device_secret,
+        argon,
+    )?;
+    // `save_new`:同一个指纹再生成一次是不可能的(除非运气好到撞上 2^-256),
+    // 但万一撞上,盖掉的是**这个文件里唯一一份** seed。
+    store::save_new(layout, &wrapped)?;
+    Ok((wrapped, key))
 }
 
 #[cfg(test)]

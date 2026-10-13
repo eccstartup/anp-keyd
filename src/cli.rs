@@ -28,6 +28,7 @@ use crate::daemon::state::{autolock_from_secs, thumbprint_of, DaemonState, Roots
 use crate::daemon::wire::{KeySummary, SignRequest};
 use crate::daemon::{self, server, ServerConfig};
 use crate::did::document::{self, DidDocumentSpec};
+use crate::did::lifecycle;
 use crate::did::did_url_path;
 use crate::error::{KeydError, Result};
 use crate::keystore::layout::KeydLayout;
@@ -75,6 +76,16 @@ pub enum Command {
     Lock(LockArgs),
     /// 签一条 RFC 9421 请求,把签名头打到 stdout。
     Sign(SignArgs),
+    /// 给一个 DID 加一把恢复密钥(预授权签一次迁移)。
+    AddRecoveryKey(AddRecoveryKeyArgs),
+    /// 轮换日常签名用的热密钥。
+    RotateHotKey(RotateHotKeyArgs),
+    /// 从文档里摘掉一把非绑定密钥。
+    RemoveKey(RemoveKeyArgs),
+    /// 迁移到一个新 DID:旧文档标记为已注销并指向它。
+    Migrate(MigrateArgs),
+    /// 永久注销一个 DID,可以顺手指向一个后继。
+    Deactivate(DeactivateArgs),
 }
 
 #[derive(Args, Debug)]
@@ -246,6 +257,73 @@ pub struct SignArgs {
     pub socket: Option<PathBuf>,
 }
 
+#[derive(Args, Debug)]
+pub struct AddRecoveryKeyArgs {
+    #[arg(long, value_name = "DID")]
+    pub did: String,
+
+    /// 人读的标签。它进 AAD,所以改它要重封,不是改个注释。
+    #[arg(long, default_value = "recovery", value_name = "LABEL")]
+    pub label: String,
+}
+
+#[derive(Args, Debug)]
+pub struct RotateHotKeyArgs {
+    #[arg(long, value_name = "DID")]
+    pub did: String,
+
+    #[arg(long, default_value = "hot", value_name = "LABEL")]
+    pub label: String,
+
+    /// 把旧的那把留在文档里。默认不留 —— 轮换的意思是"不再用它"。
+    #[arg(long)]
+    pub keep_old: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct RemoveKeyArgs {
+    #[arg(long, value_name = "DID")]
+    pub did: String,
+
+    /// 要摘掉的那个 fragment(`key-2`、`recovery-1`……),不是完整的
+    /// `did#key-2`。绑定密钥摘不掉 —— 它的指纹就是 DID,摘了文档就不再
+    /// 绑定它自己了。
+    #[arg(long, value_name = "FRAGMENT")]
+    pub kid: String,
+}
+
+#[derive(Args, Debug)]
+pub struct MigrateArgs {
+    /// 旧的 DID。它的文档会被改写,不会被删除。
+    #[arg(long, value_name = "DID")]
+    pub did: String,
+
+    /// 新的 DID。
+    #[arg(long, value_name = "DID")]
+    pub to: String,
+
+    /// 允许后继的 stable subject path 和旧的不一样(也就是换域名)。
+    ///
+    /// 默认拒,因为默认放行等于让一次打错字的 `--to` 变成一次无人察觉的
+    /// 冒名:验证方认"同一个 stable subject path"是同一个主体,path 一变,
+    /// 这条边就只能靠域名自己作证了。
+    #[arg(long)]
+    pub allow_different_subject: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DeactivateArgs {
+    #[arg(long, value_name = "DID")]
+    pub did: String,
+
+    /// 注销并指向这个后继。不给就是彻底到头。
+    ///
+    /// 这条路**不做**环检测,也不查 stable subject path —— 要那两样就用
+    /// `migrate`。
+    #[arg(long, value_name = "DID")]
+    pub to: Option<String>,
+}
+
 /// 跑一条命令。
 ///
 /// 先把 `Cli` 拆开:命令本身要被移出来交给各自的函数,而 `--root` 又要
@@ -263,6 +341,34 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Unlock(args) => unlock(root, args),
         Command::Lock(args) => lock(root, args),
         Command::Sign(args) => sign(root, args),
+        Command::AddRecoveryKey(args) => crate::ops::keys::add_recovery_key(
+            root,
+            crate::ops::keys::AddRecoveryKey { did: args.did, label: args.label },
+        ),
+        Command::RotateHotKey(args) => crate::ops::keys::rotate_hot_key(
+            root,
+            crate::ops::keys::RotateHotKey {
+                did: args.did,
+                label: args.label,
+                keep_old: args.keep_old,
+            },
+        ),
+        Command::RemoveKey(args) => crate::ops::keys::remove_key(
+            root,
+            crate::ops::keys::RemoveKey { did: args.did, kid: args.kid },
+        ),
+        Command::Migrate(args) => crate::ops::identity::migrate(
+            root,
+            crate::ops::identity::Migrate {
+                did: args.did,
+                to: args.to,
+                allow_different_subject: args.allow_different_subject,
+            },
+        ),
+        Command::Deactivate(args) => crate::ops::identity::deactivate(
+            root,
+            crate::ops::identity::Deactivate { did: args.did, to: args.to },
+        ),
     }
 }
 
@@ -470,7 +576,25 @@ fn publish(root: Option<&Path>, args: PublishArgs) -> Result<()> {
     // 文档从 DID + **刚解出来的公钥**重建,不是从磁盘读回来的那一份。
     // 重建出来的一定是规范形式,而磁盘上那一份可能是上一次留下的、或者
     // 被人改过的;要签的是"这个 DID 应有的文档",不是"别人给我们的文档"。
-    let unsigned = document::rebuild(&args.did, &key.verifying_key())?;
+    //
+    // 但"应有的文档"里**包含**已经挂在这台机器上的热密钥和恢复密钥 ——
+    // 光按 DID 重建会得到一份只有根密钥的文档,而它盖上去之后,那两把钥匙
+    // 就从文档里消失了。覆盖写不会报错,只会静静地少掉东西,所以这里必须
+    // 先把附加密钥捞回来一起重建(见 `rebuild_with` 的注释)。
+    //
+    // 本地那份文档不存在时没有可捞的东西:要么这个 DID 从没发布过,要么
+    // 它是别的机器上的。两种情况都按"只有根密钥"重建。
+    let unsigned = match store::read_did_document(&layout, &args.did) {
+        Ok(existing) => {
+            let extras = lifecycle::extra_keys(&existing, &args.did)?;
+            if !extras.is_empty() {
+                println!("keeping {} extra key(s) from the local document", extras.len());
+            }
+            lifecycle::rekey(&existing, &args.did, &key.verifying_key(), extras)?
+        }
+        Err(KeydError::KeyNotFound(_)) => document::rebuild(&args.did, &key.verifying_key())?,
+        Err(error) => return Err(error),
+    };
     let signed = document::sign_document(&unsigned, &key, &wrapped.id.kid)?;
 
     // 走出去之前先自己验一遍。一份签得出来却绑不上路径的文档,发布出去

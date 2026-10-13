@@ -474,6 +474,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(l.root());
     }
 
+    /// 重签之后的注销文档**仍然**是一份合法的 did:wba 文档。
+    ///
+    /// 这一条不是形式主义,它是整条迁移链的前提:验证方从旧 DID 出发,拿到的
+    /// 是一份带 `deactivated` 和 `successorDid` 的文档,而它必须能通过**同一套**
+    /// 规范性检查、proof 照样验得过 —— 否则"顺着 successorDid 走过去"这件事
+    /// 就无从谈起,规范说的 `verified` 那一档可信度也就不存在。
+    #[test]
+    fn a_deactivated_document_still_passes_the_binding_check() {
+        let k = key(0x97);
+        let spec = DidDocumentSpec::new("example.com", PATH.split('/').map(str::to_string).collect());
+        let (did, unsigned) = build_unsigned(&spec, &k.verifying_key()).unwrap();
+        let method = format!("{did}#{ROOT_FRAGMENT}");
+
+        let live = sign_document(&unsigned, &k, &method).unwrap();
+        crate::did::document::verify_path_binding(&did, &live).unwrap();
+
+        let (to, _) = signed(0x98, "example.com");
+        let planned = plan(&did, &to, &live, &BTreeMap::new(), false).unwrap();
+        let deactivated = sign_document(&planned, &k, &method).unwrap();
+
+        // `deactivated` 和 `successorDid` 都在 proof 覆盖的字节里,所以这份
+        // 签名同时作证了"这个 DID 的持有人说要迁移"。
+        crate::did::document::verify_path_binding(&did, &deactivated)
+            .expect("a deactivated document must still be a well-formed did:wba document");
+        assert_eq!(lifecycle::successor_of(&deactivated), Some(to.as_str()));
+    }
+
     #[test]
     fn known_successors_reads_the_local_documents() {
         let l = layout("known");

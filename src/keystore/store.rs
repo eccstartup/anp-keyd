@@ -3,6 +3,7 @@
 //! 这一层只做三件事:原子写、按指纹读、以及**确认文件自称的身份**。
 //! 密码学不在这里 —— 这里读回来的东西仍然是加密的。
 
+use std::collections::BTreeSet;
 use std::fs;
 
 use crate::error::{KeydError, Result};
@@ -94,6 +95,23 @@ pub fn envelopes_for_did(layout: &KeydLayout, did: &str) -> Result<Vec<WrappedKe
     Ok(load_all(layout)?
         .into_iter()
         .filter(|wrapped| wrapped.id.did == did)
+        .collect())
+}
+
+/// 本机为某个 DID 铸过的钥匙的 fragment —— **包括已经摘掉的**。
+///
+/// 摘钥匙不删信封(见 [`crate::ops::keys::remove_key`]),所以磁盘上的信封
+/// 是"这个 DID 在本机用过哪些编号"的记录,而文档只是"现在还认哪些"。这两个
+/// 集合**不一样**,而且差的正是危险的那部分:编号分配必须看前者。
+///
+/// 只看文档的话,摘掉一把钥匙会把它的编号放回池子里,下一次加钥匙就会重新
+/// 发出同一个编号 —— 而那个编号可能正被一把**已经泄露、所以被摘掉**的
+/// 私钥用着。任何缓存过旧文档的验证方都会把旧钥匙的签名当成有效签名。
+pub fn envelope_fragments(layout: &KeydLayout, did: &str) -> Result<BTreeSet<String>> {
+    let prefix = format!("{did}#");
+    Ok(envelopes_for_did(layout, did)?
+        .into_iter()
+        .filter_map(|wrapped| wrapped.id.kid.strip_prefix(&prefix).map(str::to_string))
         .collect())
 }
 
@@ -251,6 +269,28 @@ mod tests {
         assert_eq!(back.id.thumbprint, "e1_one");
         assert_eq!(back.public_multibase, w.public_multibase);
         assert!(back.verify_aad().is_ok());
+
+        let _ = fs::remove_dir_all(l.root());
+    }
+
+    /// 信封是"这个 DID 用过哪些编号"的记录 —— 它必须包含**已经摘掉**的钥匙。
+    ///
+    /// 编号分配依赖这条:文档会随着摘钥匙忘掉一个编号,信封不会。
+    #[test]
+    fn envelope_fragments_include_keys_that_were_removed() {
+        let l = layout("fragments");
+        let did = "did:wba:example.com:user:alice:e1_one";
+        // 绑定密钥 + 两把热密钥;热密钥那把是被摘掉之后才留下的信封。
+        save_new(&l, &envelope_for(did, &format!("{did}#key-1"), "e1_one")).unwrap();
+        save_new(&l, &envelope_for(did, &format!("{did}#key-2"), "e1_two")).unwrap();
+        save_new(&l, &envelope_for(did, &format!("{did}#recovery-1"), "e1_three")).unwrap();
+        // 别人的 DID 不该混进来。
+        save_new(&l, &envelope("e1_other")).unwrap();
+
+        let fragments = envelope_fragments(&l, did).unwrap();
+        let expected: BTreeSet<String> =
+            ["key-1", "key-2", "recovery-1"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(fragments, expected);
 
         let _ = fs::remove_dir_all(l.root());
     }

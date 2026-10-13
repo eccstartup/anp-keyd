@@ -10,6 +10,7 @@ pub mod daemon;
 pub mod did;
 pub mod error;
 pub mod keystore;
+pub mod ops;
 pub mod sign;
 pub mod tty;
 

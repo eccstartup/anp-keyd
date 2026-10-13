@@ -16,6 +16,8 @@
 //! fragment、以及把注销标记写进去。密码学一步都没有 —— 改完还是要拿绑定
 //! 密钥去重签,那一步在 [`crate::did::document::sign_document`]。
 
+use std::collections::BTreeSet;
+
 use serde_json::Value;
 
 use crate::did::document::{ExtraKey, ROOT_FRAGMENT};
@@ -145,12 +147,23 @@ pub fn hot_key(document: &Value, did: &str) -> Result<Option<ExtraKey>> {
 
 /// 下一个可用的热密钥 fragment:`key-2`、`key-3`……
 ///
-/// 用"当前用掉的最大编号 + 1",不是"数量 + 1":轮换过几轮之后编号会留下
-/// 空洞,而重用一个已经退休过的编号会让两份**内容不同**的文档顶着同一个
-/// `id` —— 任何缓存过旧文档的验证方都会把新签名判成坏签名。单调递增,
-/// 不复用。
-pub fn next_hot_fragment(document: &Value, did: &str) -> Result<String> {
-    next_fragment(document, did, HOT_KEY_PREFIX)
+/// 用"**曾经**用掉的最大编号 + 1",不是"数量 + 1",也不是"文档里还剩的
+/// 最大编号 + 1":轮换过几轮之后编号会留下空洞,而重用一个已经退休过的编号
+/// 会让两份**内容不同**的文档顶着同一个 `id` —— 任何缓存过旧文档的验证方
+/// 都会把新签名判成坏签名。单调递增,永不复用。
+///
+/// "曾经"这个字是关键,所以签名里要一个 [`also_used`]:文档只记得**现在
+/// 还挂着**的钥匙,而摘掉一把之后,那个编号就从文档里消失了。本机铸过的
+/// 全部编号在 [`crate::keystore::store::envelope_fragments`] 里 —— 摘钥匙
+/// 不删信封,这正是那个决定在这里兑现的地方。
+///
+/// [`also_used`]: next_fragment
+pub fn next_hot_fragment(
+    document: &Value,
+    did: &str,
+    also_used: &BTreeSet<String>,
+) -> Result<String> {
+    next_fragment(document, did, HOT_KEY_PREFIX, also_used)
 }
 
 /// 同 [`next_hot_fragment`],按前缀算。恢复密钥用 `recovery-`。
@@ -158,10 +171,19 @@ pub fn next_hot_fragment(document: &Value, did: &str) -> Result<String> {
 /// 恢复密钥也不复用编号,理由和热密钥一样:一份缓存过的文档里写的是
 /// "`recovery-1` 这把钥匙",而钥匙换了、名字没换,那个缓存就变成了一把
 /// 已经作废的钥匙的通行证。
-pub fn next_fragment(document: &Value, did: &str, prefix: &str) -> Result<String> {
+///
+/// 编号取"文档里的"和 `also_used`(本机信封里的)的**并集** —— 两个集合
+/// 会不一致,而漏掉任何一个都会让编号倒着走。
+pub fn next_fragment(
+    document: &Value,
+    did: &str,
+    prefix: &str,
+    also_used: &BTreeSet<String>,
+) -> Result<String> {
     let mut highest = 0u32;
-    for key in extra_keys(document, did)? {
-        if let Some(number) = key.fragment.strip_prefix(prefix) {
+    let listed = extra_keys(document, did)?.into_iter().map(|key| key.fragment);
+    for fragment in listed.chain(also_used.iter().cloned()) {
+        if let Some(number) = fragment.strip_prefix(prefix) {
             if let Ok(number) = number.parse::<u32>() {
                 highest = highest.max(number);
             }
@@ -388,7 +410,7 @@ pub fn without_method(
 /// 重建则相反:形状是上游自己产的,不可能抄错。
 ///
 /// 代价是重建会**丢掉**上游不认识的属性,所以搬回来这一步不是可选的。
-fn rekey(
+pub(crate) fn rekey(
     document: &Value,
     did: &str,
     root: &ed25519_dalek::VerifyingKey,
@@ -496,7 +518,8 @@ mod tests {
     #[test]
     fn hot_fragments_are_monotonic_and_never_reused() {
         let (_, did, mut document) = published(0x61);
-        assert_eq!(next_hot_fragment(&document, &did).unwrap(), "key-3");
+        let nothing = BTreeSet::new();
+        assert_eq!(next_hot_fragment(&document, &did, &nothing).unwrap(), "key-3");
 
         // 换一把,再换一把:编号只增不减。
         let key = root_key(0x51);
@@ -508,7 +531,7 @@ mod tests {
                 extra(expected, 0x70, vec![R::Authentication]),
             )
             .unwrap();
-            assert_eq!(next_hot_fragment(&document, &did).unwrap(), {
+            assert_eq!(next_hot_fragment(&document, &did, &nothing).unwrap(), {
                 let n: u32 = expected.trim_start_matches("key-").parse().unwrap();
                 format!("key-{}", n + 1)
             });
@@ -518,13 +541,39 @@ mod tests {
         // 复用编号 = 两份内容不同的文档顶着同一个 id。
         let without = without_method(&document, &did, &key.verifying_key(), &format!("{did}#key-3"))
             .unwrap();
-        assert_eq!(next_hot_fragment(&without, &did).unwrap(), "key-5");
+        assert_eq!(next_hot_fragment(&without, &did, &nothing).unwrap(), "key-5");
+    }
+
+    /// **摘掉一把钥匙不会把它的编号放回池子里。**
+    ///
+    /// `remove-key` 之后文档里再也找不到那把钥匙,所以单看文档,"下一个可用
+    /// 编号"会倒着走回 `key-2`。而 `remove-key` 存在的主要理由就是"这把热密钥
+    /// 泄露了" —— 让它的编号被一把新钥匙顶替,等于给泄露出去的那把发了一张
+    /// 新的通行证:缓存过旧文档的验证方会把 `key-2` 认成它。
+    ///
+    /// 本机信封是那个"曾经用过"的记录(摘钥匙不删信封),编号分配必须看它。
+    #[test]
+    fn a_removed_key_does_not_release_its_fragment() {
+        let (key, did, document) = published(0x64);
+        let removed = without_method(&document, &did, &key.verifying_key(), &format!("{did}#key-2"))
+            .unwrap();
+
+        // 只看文档:编号回到了池子里 —— 这正是要防的那个状态。
+        assert_eq!(next_hot_fragment(&removed, &did, &BTreeSet::new()).unwrap(), "key-2");
+
+        // 带上本机信封的记录:`key-2` 已经被用掉了,下一个是 `key-3`。
+        let used: BTreeSet<String> = ["key-2".to_string()].into_iter().collect();
+        assert_eq!(next_hot_fragment(&removed, &did, &used).unwrap(), "key-3");
     }
 
     #[test]
     fn recovery_fragments_start_at_one() {
         let (_, did, document) = published(0x62);
-        assert_eq!(next_fragment(&document, &did, RECOVERY_FRAGMENT_PREFIX).unwrap(), "recovery-1");
+        let nothing = BTreeSet::new();
+        assert_eq!(
+            next_fragment(&document, &did, RECOVERY_FRAGMENT_PREFIX, &nothing).unwrap(),
+            "recovery-1"
+        );
 
         let key = root_key(0x51);
         let with = with_extra_key(
@@ -534,7 +583,10 @@ mod tests {
             extra("recovery-1", 0x63, vec![R::AssertionMethod]),
         )
         .unwrap();
-        assert_eq!(next_fragment(&with, &did, RECOVERY_FRAGMENT_PREFIX).unwrap(), "recovery-2");
+        assert_eq!(
+            next_fragment(&with, &did, RECOVERY_FRAGMENT_PREFIX, &nothing).unwrap(),
+            "recovery-2"
+        );
     }
 
     /// 加一把钥匙**不能**顺手把别的东西弄丢。
