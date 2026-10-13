@@ -76,6 +76,13 @@ struct Unlocked {
 /// 一个 uid 的命名空间。
 pub struct Vault {
     layout: KeydLayout,
+    /// **键是 `kid`,不是 `did`。**
+    ///
+    /// 一个 DID 底下可以挂不止一把钥匙:绑定密钥(它的指纹就是 DID 的最后
+    /// 一段,动不了)+ 若干热密钥/恢复密钥(见 [`crate::did::lifecycle`])。
+    /// 按 did 索引的话,后挂上的那几把会互相盖掉,而且"现在解锁的到底是
+    /// 哪一把"会取决于解锁的先后顺序 —— 那种不确定性最后会变成"同一份
+    /// 请求有时验得过有时验不过"。
     unlocked: BTreeMap<String, Unlocked>,
 }
 
@@ -123,20 +130,24 @@ impl Vault {
             .collect()
     }
 
-    fn is_unlocked(&self, did: &str) -> bool {
-        self.unlocked.contains_key(did)
-    }
-
     /// 解开一个信封并留在内存里。口令在这里用完就擦。
-    fn unlock(&mut self, did: &str, passphrase: Zeroizing<String>) -> Result<()> {
-        if self.is_unlocked(did) {
+    ///
+    /// `kid` 是 `did#fragment`;不给就按 [`store::resolve`] 的规则选,也就是
+    /// 绑定密钥优先。
+    fn unlock(
+        &mut self,
+        did: &str,
+        kid: Option<&str>,
+        passphrase: Zeroizing<String>,
+    ) -> Result<()> {
+        let wrapped = store::resolve(&self.layout, did, kid)?;
+        let resident = wrapped.id.kid.clone();
+
+        if self.unlocked.contains_key(&resident) {
             // 已经开着。再解一次是合法的(比如用户想确认口令还记不记得),
             // 但没必要为了这个再跑一遍 Argon2id。
             return Ok(());
         }
-
-        let thumbprint = thumbprint_of(did)?;
-        let wrapped = store::load(&self.layout, &thumbprint)?;
 
         // device.secret **每次解锁现读**,不缓存。缓存它就意味着"零个用户
         // 解锁时进程内存里什么都没有"这句话不成立 —— 而那句话是这个设计
@@ -147,7 +158,7 @@ impl Vault {
 
         let now = Instant::now();
         self.unlocked.insert(
-            did.to_string(),
+            resident,
             Unlocked { key, unlocked_at: now, last_used: now },
         );
         Ok(())
@@ -157,13 +168,29 @@ impl Vault {
     ///
     /// `did == None` 是"全锁"。**这个动作不报错**:锁一个本来就没解锁的
     /// 东西应该成功,而不是失败 —— 想要的东西已经在那儿了。
-    fn lock(&mut self, did: Option<&str>) -> usize {
+    ///
+    /// 给了 `did` 而没给 `kid`:把这个 DID 底下**当时解锁着的**全放掉。
+    /// 这把钥匙那个 DID 底下本来可能有热度密钥两把都开着,锁一把留一把
+    /// 是另一种语义(而且没人要过),不能靠"顺手实现成哪个"来决定。
+    fn lock(&mut self, did: Option<&str>, kid: Option<&str>) -> usize {
         match did {
-            Some(did) => usize::from(self.unlocked.remove(did).is_some()),
             None => {
                 let count = self.unlocked.len();
                 self.unlocked.clear();
                 count
+            }
+            Some(did) => {
+                let before = self.unlocked.len();
+                match kid {
+                    Some(kid) => {
+                        self.unlocked.remove(kid);
+                    }
+                    None => {
+                        let prefix = format!("{did}#");
+                        self.unlocked.retain(|resident, _| !resident.starts_with(&prefix));
+                    }
+                }
+                before - self.unlocked.len()
             }
         }
     }
@@ -174,14 +201,14 @@ impl Vault {
     /// 这个闭包里被借用。用完之后守护进程手上还是只有那一份。
     fn with_key<R>(
         &mut self,
-        did: &str,
+        resident: &str,
         autolock: Autolock,
         now: Instant,
         f: impl FnOnce(&LockedSigningKey) -> Result<R>,
     ) -> Result<R> {
         self.sweep(autolock, now);
 
-        let entry = self.unlocked.get_mut(did).ok_or(KeydError::Locked)?;
+        let entry = self.unlocked.get_mut(resident).ok_or(KeydError::Locked)?;
         let out = f(&entry.key)?;
         // 刷新只在**成功之后**做。一次失败的调用不该把钥匙的寿命续上。
         entry.last_used = now;
@@ -298,12 +325,18 @@ impl DaemonState {
         })
     }
 
-    pub fn unlock(&self, uid: u32, did: &str, passphrase: Zeroizing<String>) -> Result<()> {
-        self.with_vault(uid, |vault| vault.unlock(did, passphrase))
+    pub fn unlock(
+        &self,
+        uid: u32,
+        did: &str,
+        kid: Option<&str>,
+        passphrase: Zeroizing<String>,
+    ) -> Result<()> {
+        self.with_vault(uid, |vault| vault.unlock(did, kid, passphrase))
     }
 
-    pub fn lock(&self, uid: u32, did: Option<&str>) -> Result<usize> {
-        self.with_vault(uid, |vault| Ok(vault.lock(did)))
+    pub fn lock(&self, uid: u32, did: Option<&str>, kid: Option<&str>) -> Result<usize> {
+        self.with_vault(uid, |vault| Ok(vault.lock(did, kid)))
     }
 
     /// 把所有 uid 的钥匙全放掉。退出前用。
@@ -316,7 +349,7 @@ impl DaemonState {
             Err(poisoned) => poisoned.into_inner(),
         };
         for (uid, vault) in vaults.iter_mut() {
-            let dropped = vault.lock(None);
+            let dropped = vault.lock(None, None);
             if dropped > 0 {
                 tracing::info!(uid, dropped, "locked on shutdown");
             }
@@ -373,17 +406,20 @@ impl DaemonState {
         &self,
         uid: u32,
         did: &str,
+        kid: Option<&str>,
         request: &rfc9421::SignRequest,
     ) -> Result<rfc9421::Signed> {
         let layout = self.layout_for(uid)?;
 
+        // 谁要有权决定"用哪把钥匙",只能是这里 —— 不在调用方手上。
+        let resident = store::resolve(&layout, did, kid)?.id.kid;
         // 文档先读出来 —— 别在读磁盘的时候攥着锁。
         let document = store::read_did_document(&layout, did)?;
 
         let autolock = self.autolock;
         let now = Instant::now();
         self.with_vault(uid, |vault| {
-            vault.with_key(did, autolock, now, |key| {
+            vault.with_key(&resident, autolock, now, |key| {
                 rfc9421::sign_request(&document, key, request)
             })
         })
@@ -397,14 +433,17 @@ impl DaemonState {
         &self,
         uid: u32,
         did: &str,
+        kid: Option<&str>,
         f: impl FnOnce(&LockedSigningKey) -> Result<R>,
     ) -> Result<R> {
         if !self.raw_signing {
             return Err(KeydError::RawDisabled);
         }
+        let layout = self.layout_for(uid)?;
+        let resident = store::resolve(&layout, did, kid)?.id.kid;
         let autolock = self.autolock;
         let now = Instant::now();
-        self.with_vault(uid, |vault| vault.with_key(did, autolock, now, f))
+        self.with_vault(uid, |vault| vault.with_key(&resident, autolock, now, f))
     }
 }
 
@@ -458,6 +497,8 @@ mod tests {
         _dir: TempDir,
         state: DaemonState,
         did: String,
+        /// vault 的键 —— `did#fragment`,而不是 DID 本身。见 [`Vault::unlocked`]。
+        resident: String,
     }
 
     impl Fixture {
@@ -479,6 +520,11 @@ mod tests {
             // 但签名要用它,所以这里补上 —— 现实中这是 `publish` 干的活。
             store::write_did_document(&layout, &created.did, &created.document).unwrap();
 
+            // vault 认的是 kid,不是 DID。从落盘的信封里读回来,别在这里
+            // 手拼一个 "… #key-1" —— 那种字符串一旦和实际写进去的不一样,
+            // 测试就会以"钥匙没解锁"的面目失败,而真因在测试自己身上。
+            let resident = store::load_all(&layout).unwrap()[0].id.kid.clone();
+
             Self {
                 state: DaemonState::new(
                     Roots::Single(layout),
@@ -487,13 +533,14 @@ mod tests {
                     raw_signing,
                 ),
                 did: created.did,
+                resident,
                 _dir: dir,
             }
         }
 
         fn unlock(&self) {
             self.state
-                .unlock(501, &self.did, Zeroizing::new(PASSPHRASE.to_string()))
+                .unlock(501, &self.did, None, Zeroizing::new(PASSPHRASE.to_string()))
                 .unwrap();
         }
 
@@ -521,7 +568,7 @@ mod tests {
     #[test]
     fn signing_a_locked_key_is_refused_rather_than_prompted() {
         let f = Fixture::new(false);
-        let err = f.state.sign_structured(501, &f.did, &f.request()).unwrap_err();
+        let err = f.state.sign_structured(501, &f.did, None, &f.request()).unwrap_err();
         assert!(matches!(err, KeydError::Locked), "{err}");
     }
 
@@ -531,7 +578,7 @@ mod tests {
         f.unlock();
 
         assert_eq!(f.state.status(501).unwrap().len(), 1);
-        let signed = f.state.sign_structured(501, &f.did, &f.request()).unwrap();
+        let signed = f.state.sign_structured(501, &f.did, None, &f.request()).unwrap();
         assert!(signed.headers.contains_key("Signature"));
 
         // 覆盖面下限照样在 —— 解锁不改变"谁来定覆盖面"这件事。
@@ -545,7 +592,7 @@ mod tests {
         let f = Fixture::new(false);
         let err = f
             .state
-            .unlock(501, &f.did, Zeroizing::new("wrong".to_string()))
+            .unlock(501, &f.did, None, Zeroizing::new("wrong".to_string()))
             .unwrap_err();
         assert!(matches!(err, KeydError::BadPassphrase), "{err}");
         assert!(f.state.status(501).unwrap().is_empty());
@@ -556,22 +603,22 @@ mod tests {
     fn locking_removes_the_key_from_memory() {
         let f = Fixture::new(false);
         f.unlock();
-        assert_eq!(f.state.lock(501, Some(&f.did)).unwrap(), 1);
+        assert_eq!(f.state.lock(501, Some(&f.did), None).unwrap(), 1);
 
         assert!(f.state.status(501).unwrap().is_empty());
         assert!(matches!(
-            f.state.sign_structured(501, &f.did, &f.request()).unwrap_err(),
+            f.state.sign_structured(501, &f.did, None, &f.request()).unwrap_err(),
             KeydError::Locked
         ));
         // 锁第二次不是错误 —— 想要的状态已经在那儿了。
-        assert_eq!(f.state.lock(501, Some(&f.did)).unwrap(), 0);
+        assert_eq!(f.state.lock(501, Some(&f.did), None).unwrap(), 0);
     }
 
     #[test]
     fn locking_everything_is_a_different_request_from_locking_one_key() {
         assert_ne!(
-            Request::Lock { did: None },
-            Request::Lock { did: Some("d".to_string()) }
+            Request::Lock { kid: None, did: None },
+            Request::Lock { kid: None, did: Some("d".to_string()) }
         );
     }
 
@@ -606,17 +653,17 @@ mod tests {
         // 没有,所以 `KeyNotFound` 是这里唯一说得通、也不多嘴的答案。
         assert!(a.list_keys(501).unwrap().is_empty());
         assert!(matches!(
-            a.unlock(501, &b.did, Zeroizing::new(PASSPHRASE.to_string())).unwrap_err(),
+            a.unlock(501, &b.did, None, Zeroizing::new(PASSPHRASE.to_string())).unwrap_err(),
             KeydError::KeyNotFound(_)
         ));
         assert!(matches!(
-            a.sign_structured(501, &b.did, &b.request()).unwrap_err(),
+            a.sign_structured(501, &b.did, None, &b.request()).unwrap_err(),
             KeydError::KeyNotFound(_)
         ));
 
         // 而 B 自己那把钥匙好好的,没被动过。
         b.unlock();
-        assert!(b.state.sign_structured(501, &b.did, &b.request()).is_ok());
+        assert!(b.state.sign_structured(501, &b.did, None, &b.request()).is_ok());
     }
 
     #[test]
@@ -631,7 +678,7 @@ mod tests {
 
         assert!(f.state.status(501).unwrap().is_empty());
         assert!(matches!(
-            f.state.sign_structured(501, &f.did, &f.request()).unwrap_err(),
+            f.state.sign_structured(501, &f.did, None, &f.request()).unwrap_err(),
             KeydError::Locked
         ));
     }
@@ -645,7 +692,7 @@ mod tests {
         // 解锁在 T0。现在假装时钟走到 T0+800s 并"用"一次。
         let now = Instant::now() + Duration::from_secs(800);
         f.state
-            .with_vault(501, |vault| vault.with_key(&f.did, f.state.autolock(), now, |_| Ok(())))
+            .with_vault(501, |vault| vault.with_key(&f.resident, f.state.autolock(), now, |_| Ok(())))
             .unwrap();
 
         // 从 T0 算早就过期了,从 T0+800s 算还没。
@@ -662,7 +709,7 @@ mod tests {
 
         let now = Instant::now() + Duration::from_secs(800);
         let outcome = f.state.with_vault(501, |vault| {
-            vault.with_key(&f.did, f.state.autolock(), now, |_| {
+            vault.with_key(&f.resident, f.state.autolock(), now, |_| {
                 Err::<(), _>(KeydError::Protocol("nope".into()))
             })
         });
@@ -677,7 +724,7 @@ mod tests {
         let f = Fixture::new(false);
         f.unlock();
 
-        let err = f.state.sign_raw(501, &f.did, |_| Ok(())).unwrap_err();
+        let err = f.state.sign_raw(501, &f.did, None, |_| Ok(())).unwrap_err();
         assert!(matches!(err, KeydError::RawDisabled), "{err}");
     }
 
@@ -686,7 +733,7 @@ mod tests {
     fn the_raw_switch_is_checked_before_the_lock_state() {
         let f = Fixture::new(false);
         assert!(matches!(
-            f.state.sign_raw(501, &f.did, |_| Ok(())).unwrap_err(),
+            f.state.sign_raw(501, &f.did, None, |_| Ok(())).unwrap_err(),
             KeydError::RawDisabled
         ));
     }
@@ -698,7 +745,7 @@ mod tests {
 
         let signature = f
             .state
-            .sign_raw(501, &f.did, |key| Ok(key.sign(b"hello").unwrap()))
+            .sign_raw(501, &f.did, None, |key| Ok(key.sign(b"hello").unwrap()))
             .unwrap();
         assert_eq!(signature.len(), 64);
     }

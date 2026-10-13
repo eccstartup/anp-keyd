@@ -84,6 +84,81 @@ pub fn load_all(layout: &KeydLayout) -> Result<Vec<WrappedKey>> {
     Ok(out)
 }
 
+/// 磁盘上属于某个 DID 的全部信封。
+///
+/// **不能只看 `keys/<DID 的 e1_ 段>.json`。** 那个文件名是**绑定密钥**的
+/// 指纹算出来的,而一个 DID 可以合法地再挂热密钥和恢复密钥(见
+/// [`crate::did::lifecycle`])—— 它们的信封是按各自的公钥指纹命名的,跟
+/// DID 的最后一段对不上。只按文件名找,那两把钥匙就等于不存在。
+pub fn envelopes_for_did(layout: &KeydLayout, did: &str) -> Result<Vec<WrappedKey>> {
+    Ok(load_all(layout)?
+        .into_iter()
+        .filter(|wrapped| wrapped.id.did == did)
+        .collect())
+}
+
+/// 把一个 DID(可选再指定一个 fragment)解析成**唯一一份**信封。
+///
+/// 三条规则,每一条都是为了不给调用方一个可以静默猜错的地方:
+///
+/// 1. 给了 fragment:就要那一个。找不到就是找不到,不许退回到别的。
+/// 2. 没给 fragment,而绑定密钥在这台机器上:**就是它**。绑定密钥是 DID
+///    自己的一部分(最后一段就是它的指纹),所以它是这个 DID 的**默认**
+///    那把 —— 而不是"碰巧只有一把"的兜底。挂上热密钥之后老调用方不会
+///    因为多了一把钥匙就换了把钥匙来签名。
+/// 3. 没给 fragment,绑定密钥也不在,而只有一把:用它。
+///
+/// 剩下"好几把、还都不是绑定密钥"的情况**报错**,列出候选。挑一把最近的、
+/// 最小的或者随便哪一把都是在替调用方决定"用哪把钥匙签名",而签名用的是
+/// 哪把钥匙决定了签名能被谁验过 —— 这种事不许靠猜。
+pub fn resolve(layout: &KeydLayout, did: &str, kid: Option<&str>) -> Result<WrappedKey> {
+    let candidates = envelopes_for_did(layout, did)?;
+    if candidates.is_empty() {
+        return Err(KeydError::KeyNotFound(did.to_string()));
+    }
+
+    if let Some(kid) = kid {
+        return candidates
+            .into_iter()
+            .find(|wrapped| wrapped.id.kid == kid)
+            .ok_or_else(|| {
+                KeydError::KeyNotFound(format!("{did} has no key with fragment {kid:?}"))
+            });
+    }
+
+    let binding = binding_thumbprint(did);
+    if let Some(thumbprint) = binding {
+        if let Some(found) = candidates
+            .iter()
+            .find(|wrapped| wrapped.id.thumbprint == thumbprint)
+        {
+            return Ok(found.clone());
+        }
+    }
+
+    match candidates.len() {
+        1 => Ok(candidates.into_iter().next().expect("checked the length")),
+        _ => {
+            let mut names: Vec<&str> =
+                candidates.iter().map(|wrapped| wrapped.id.kid.as_str()).collect();
+            names.sort_unstable();
+            Err(KeydError::Protocol(format!(
+                "{did} has {} keys on this machine and none of them is its binding key, \
+                 so which one to use has to be said out loud: {}",
+                names.len(),
+                names.join(", ")
+            )))
+        }
+    }
+}
+
+/// `did:wba:...:e1_<指纹>` → `<指纹>`。解不出 `e1_` 段的 DID 没有绑定密钥。
+fn binding_thumbprint(did: &str) -> Option<String> {
+    crate::did::parse::parse_did_wba(did)
+        .ok()
+        .and_then(|parts| parts.e1_segment().map(str::to_string))
+}
+
 /// 删掉一个信封。这是不可逆的 —— 调用方负责先确认用户真的要这么做。
 pub fn delete(layout: &KeydLayout, thumbprint: &str) -> Result<()> {
     let path = layout.key_path(thumbprint)?;

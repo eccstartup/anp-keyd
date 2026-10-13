@@ -169,6 +169,13 @@ pub struct UnlockArgs {
     #[arg(long, value_name = "DID")]
     pub did: String,
 
+    /// 只解这一把,写 fragment(`key-2`、`recovery-1`……)。
+    ///
+    /// 不给就是 `--did` 名下默认那把,也就是**绑定密钥** —— 一个 DID 上
+    /// 后来挂的热密钥不会让老调用方不知不觉换了把钥匙签名。
+    #[arg(long, value_name = "FRAGMENT")]
+    pub kid: Option<String>,
+
     /// socket 路径(默认按目录布局推导)。
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
@@ -176,9 +183,13 @@ pub struct UnlockArgs {
 
 #[derive(Args, Debug)]
 pub struct LockArgs {
-    /// 只锁这一把。不给就全锁。
+    /// 只锁这一个 DID 名下的。不给就全锁。
     #[arg(long, value_name = "DID")]
     pub did: Option<String>,
+
+    /// 再加 `--did` 就精确到一把。单独给没意义(clap 会拦住)。
+    #[arg(long, value_name = "FRAGMENT", requires = "did")]
+    pub kid: Option<String>,
 
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
@@ -188,6 +199,12 @@ pub struct LockArgs {
 pub struct SignArgs {
     #[arg(long, value_name = "DID")]
     pub did: String,
+
+    /// 用哪把钥匙签,写 fragment(`key-2`、`recovery-1`……)。
+    ///
+    /// 不给就是 `--did` 名下默认那把(绑定密钥)。
+    #[arg(long, value_name = "FRAGMENT")]
+    pub kid: Option<String>,
 
     #[arg(long, default_value = "GET")]
     pub method: String,
@@ -575,14 +592,14 @@ fn unlock(root: Option<&Path>, args: UnlockArgs) -> Result<()> {
     let passphrase = tty::read_secret(&tty, &format!("Passphrase for {}: ", args.did))?;
 
     let mut client = connect(root, args.socket.as_deref())?;
-    client.unlock(&args.did, &passphrase)?;
+    client.unlock(&args.did, args.kid.as_deref(), &passphrase)?;
     println!("unlocked {}", args.did);
     Ok(())
 }
 
 fn lock(root: Option<&Path>, args: LockArgs) -> Result<()> {
     let mut client = connect(root, args.socket.as_deref())?;
-    client.lock(args.did.as_deref())?;
+    client.lock(args.did.as_deref(), args.kid.as_deref())?;
     match &args.did {
         Some(did) => println!("locked {did}"),
         None => println!("locked everything"),
@@ -590,18 +607,34 @@ fn lock(root: Option<&Path>, args: LockArgs) -> Result<()> {
     Ok(())
 }
 
+/// 读一个"命令行指过来的文件",读不到时说清楚是**哪个**文件。
+///
+/// `std::fs::read(path)?` 展开成的是 `io: No such file or directory (os
+/// error 2)`,一个字都没提那个路径。而 `--body` 最容易踩的就是这个坑:
+/// 习惯上 `--header` 收的是字面量,于是很自然地把请求体也照着字面量写,
+/// `--body '{"a":1}'` —— 得到的是一句没有任何上下文的话。说了文件名,
+/// 人一眼就知道它要的是文件。
+fn read_flag_file(path: &Path, flag: &str) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|error| {
+        KeydError::Protocol(format!(
+            "cannot read {flag} {}: {error} (this flag takes a file, not the text itself)",
+            path.display()
+        ))
+    })
+}
+
 fn sign(root: Option<&Path>, args: SignArgs) -> Result<()> {
     let mut client = connect(root, args.socket.as_deref())?;
 
     if let Some(path) = &args.raw {
-        let payload = std::fs::read(path)?;
-        let signature = client.sign_raw(&args.did, payload)?;
+        let payload = read_flag_file(path, "--raw")?;
+        let signature = client.sign_raw(&args.did, args.kid.as_deref(), payload)?;
         println!("{}", base64(&signature));
         return Ok(());
     }
 
     let body = match &args.body {
-        Some(path) => Some(std::fs::read(path)?),
+        Some(path) => Some(read_flag_file(path, "--body")?),
         None => None,
     };
 
@@ -614,6 +647,7 @@ fn sign(root: Option<&Path>, args: SignArgs) -> Result<()> {
 
     let signed = client.sign(SignRequest::Structured {
         did: args.did.clone(),
+        kid: args.kid.clone(),
         method: args.method.clone(),
         target_uri,
         headers: parse_headers(&args.headers)?,

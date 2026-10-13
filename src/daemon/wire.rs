@@ -168,6 +168,9 @@ pub enum SignRequest {
     /// 主路径。守护进程从这里重建签名基,并自己决定覆盖面下限。
     Structured {
         did: String,
+        /// 要用的那个 fragment(`key-2`、`recovery-1`……)。不给 = `did` 名下
+        /// 的默认那把(绑定密钥)。见 [`crate::keystore::store::resolve`]。
+        kid: Option<String>,
         method: String,
         target_uri: String,
         headers: BTreeMap<String, String>,
@@ -186,7 +189,7 @@ pub enum SignRequest {
         covered: Vec<String>,
     },
     /// 受限路径:原始字节。默认关,`--allow-raw-signing` 才开,且必留审计。
-    Raw { did: String, payload: Vec<u8> },
+    Raw { did: String, kid: Option<String>, payload: Vec<u8> },
 }
 
 /// 一把钥匙在磁盘上的样子 —— `LIST_KEYS` 的应答项。
@@ -203,9 +206,10 @@ pub enum Request {
     ListKeys,
     Sign(SignRequest),
     /// 解锁一把钥匙。`passphrase` 是**明文**,只在内存里活到用完为止。
-    Unlock { did: String, passphrase: String },
-    /// 锁上。`did` 为空表示全锁。
-    Lock { did: Option<String> },
+    Unlock { did: String, kid: Option<String>, passphrase: String },
+    /// 锁上。**两级**:`did` 为空表示全锁;只给 `did` 表示把这个 DID 底下
+    /// 解锁着的全放掉;再给 `kid` 就是精确到一把。
+    Lock { did: Option<String>, kid: Option<String> },
     Status,
 }
 
@@ -338,16 +342,18 @@ fn decode_request(payload: &[u8]) -> Result<Request> {
         UNLOCK => {
             let mut c = Cursor::new(body);
             let did = c.string16()?;
+            let kid = c.opt_string16()?;
             let passphrase = c.string16()?;
             c.expect_end("UNLOCK")?;
-            Ok(Request::Unlock { did, passphrase })
+            Ok(Request::Unlock { did, kid, passphrase })
         }
         LOCK => {
             let mut c = Cursor::new(body);
             let did = c.string16()?;
+            let kid = c.opt_string16()?;
             c.expect_end("LOCK")?;
             // 空字符串 = 全部锁上。
-            Ok(Request::Lock { did: if did.is_empty() { None } else { Some(did) } })
+            Ok(Request::Lock { did: if did.is_empty() { None } else { Some(did) }, kid })
         }
         STATUS => {
             expect_empty(body, "STATUS")?;
@@ -365,6 +371,7 @@ fn decode_sign(body: &[u8]) -> Result<SignRequest> {
     match tag {
         0x01 => {
             let did = c.string16()?;
+            let kid = c.opt_string16()?;
             let method = c.string16()?;
             let target_uri = c.string16()?;
 
@@ -391,13 +398,14 @@ fn decode_sign(body: &[u8]) -> Result<SignRequest> {
             }
             c.expect_end("SIGN(Structured)")?;
 
-            Ok(SignRequest::Structured { did, method, target_uri, headers, body, covered })
+            Ok(SignRequest::Structured { did, kid, method, target_uri, headers, body, covered })
         }
         0x02 => {
             let did = c.string16()?;
+            let kid = c.opt_string16()?;
             let payload = c.bytes32()?;
             c.expect_end("SIGN(Raw)")?;
-            Ok(SignRequest::Raw { did, payload })
+            Ok(SignRequest::Raw { did, kid, payload })
         }
         other => Err(KeydError::Protocol(format!(
             "0x{other:02x} is not a SIGN variant"
@@ -476,6 +484,7 @@ fn encode_request(request: &Request) -> Result<Vec<u8>> {
             match sign {
                 SignRequest::Structured {
                     did,
+                    kid,
                     method,
                     target_uri,
                     headers,
@@ -484,6 +493,7 @@ fn encode_request(request: &Request) -> Result<Vec<u8>> {
                 } => {
                     body.push(0x01);
                     body.string16(did)?;
+                    body.string16(kid.as_deref().unwrap_or(""))?;
                     body.string16(method)?;
                     body.string16(target_uri)?;
                     body.u16(u16::try_from(headers.len())
@@ -499,21 +509,24 @@ fn encode_request(request: &Request) -> Result<Vec<u8>> {
                         body.string16(component)?;
                     }
                 }
-                SignRequest::Raw { did, payload } => {
+                SignRequest::Raw { did, kid, payload } => {
                     body.push(0x02);
                     body.string16(did)?;
+                    body.string16(kid.as_deref().unwrap_or(""))?;
                     body.bytes32(payload)?;
                 }
             }
             SIGN
         }
-        Request::Unlock { did, passphrase } => {
+        Request::Unlock { did, kid, passphrase } => {
             body.string16(did)?;
+            body.string16(kid.as_deref().unwrap_or(""))?;
             body.string16(passphrase)?;
             UNLOCK
         }
-        Request::Lock { did } => {
+        Request::Lock { did, kid } => {
             body.string16(did.as_deref().unwrap_or(""))?;
+            body.string16(kid.as_deref().unwrap_or(""))?;
             LOCK
         }
     };
@@ -622,6 +635,18 @@ impl<'a> Cursor<'a> {
         std::str::from_utf8(raw)
             .map(str::to_owned)
             .map_err(|_| KeydError::Protocol("a string field is not valid UTF-8".into()))
+    }
+
+    /// 空串 = "没给"。和 `Lock { did }` 一直以来的约定一致。
+    ///
+    /// 用空串而不是另加一个标志字节:fragment 永远不可能是空的(`key-1`
+    /// 至少也有一个字符),所以空串不会和任何合法值撞上,而多一个标志字节
+    /// 只是给每一种请求多一处可以编错的地方。
+    fn opt_string16(&mut self) -> Result<Option<String>> {
+        Ok(match self.string16()? {
+            value if value.is_empty() => None,
+            value => Some(value),
+        })
     }
 
     fn bytes16(&mut self) -> Result<Vec<u8>> {
@@ -801,6 +826,7 @@ mod tests {
         headers.insert("content-type".to_string(), "application/json".to_string());
         headers.insert("x-request-id".to_string(), "abc".to_string());
         SignRequest::Structured {
+            kid: None,
             did: "did:wba:example.com:user:alice:e1_abc".into(),
             method: "POST".into(),
             target_uri: "https://example.com/api".into(),
@@ -816,10 +842,18 @@ mod tests {
             Request::ListKeys,
             Request::Status,
             Request::Sign(structured()),
-            Request::Sign(SignRequest::Raw { did: "did:wba:x".into(), payload: vec![0, 1, 2] }),
-            Request::Unlock { did: "did:wba:x".into(), passphrase: "hunter2".into() },
-            Request::Lock { did: Some("did:wba:x".into()) },
-            Request::Lock { did: None },
+            Request::Sign(SignRequest::Raw {
+                did: "did:wba:x".into(),
+                kid: None,
+                payload: vec![0, 1, 2],
+            }),
+            Request::Unlock {
+                did: "did:wba:x".into(),
+                kid: None,
+                passphrase: "hunter2".into(),
+            },
+            Request::Lock { did: Some("did:wba:x".into()), kid: None },
+            Request::Lock { did: None, kid: None },
         ];
 
         for request in requests {
@@ -856,6 +890,7 @@ mod tests {
     fn an_absent_body_is_not_an_empty_body() {
         let absent = SignRequest::Structured {
             did: "d".into(),
+            kid: None,
             method: "GET".into(),
             target_uri: "https://e.com/".into(),
             headers: BTreeMap::new(),
@@ -863,9 +898,10 @@ mod tests {
             covered: Vec::new(),
         };
         let empty = match absent.clone() {
-            SignRequest::Structured { did, method, target_uri, headers, covered, .. } => {
+            SignRequest::Structured { did, kid, method, target_uri, headers, covered, .. } => {
                 SignRequest::Structured {
                     did,
+                    kid,
                     method,
                     target_uri,
                     headers,
@@ -960,6 +996,7 @@ mod tests {
         let mut body = Encoder::default();
         body.push(0x01);
         body.string16("d").unwrap();
+        body.string16("").unwrap();
         body.string16("GET").unwrap();
         body.string16("https://e.com/").unwrap();
         body.u16(2);

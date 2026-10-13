@@ -195,11 +195,12 @@ async fn a_signature_made_over_the_socket_verifies_with_the_upstream_verifier() 
 
     let (with_body, without_body) = running
         .session(move |client| {
-            client.unlock(&did, std::str::from_utf8(PASSPHRASE).unwrap()).unwrap();
+            client.unlock(&did, None, std::str::from_utf8(PASSPHRASE).unwrap()).unwrap();
 
             let get = client
                 .sign(SignRequest::Structured {
                     did: did.clone(),
+                    kid: None,
                     method: "GET".into(),
                     target_uri: "https://example.com/agents/e2e/resource?page=2".into(),
                     headers: BTreeMap::from([("accept".to_string(), "application/json".into())]),
@@ -211,6 +212,7 @@ async fn a_signature_made_over_the_socket_verifies_with_the_upstream_verifier() 
             let post = client
                 .sign(SignRequest::Structured {
                     did: did.clone(),
+                    kid: None,
                     method: "POST".into(),
                     target_uri: "https://example.com/agents/e2e/resource".into(),
                     headers: BTreeMap::from([(
@@ -279,10 +281,11 @@ async fn the_signature_is_bound_to_the_request_it_was_made_for() {
 
     let signed = running
         .session(move |client| {
-            client.unlock(&did, std::str::from_utf8(PASSPHRASE).unwrap()).unwrap();
+            client.unlock(&did, None, std::str::from_utf8(PASSPHRASE).unwrap()).unwrap();
             client
                 .sign(SignRequest::Structured {
                     did: did.clone(),
+                    kid: None,
                     method: "POST".into(),
                     target_uri: "https://example.com/pay".into(),
                     headers: BTreeMap::new(),
@@ -363,6 +366,7 @@ async fn signing_is_refused_while_locked() {
             client
                 .sign(SignRequest::Structured {
                     did,
+                    kid: None,
                     method: "GET".into(),
                     target_uri: "https://example.com/x".into(),
                     headers: BTreeMap::new(),
@@ -390,7 +394,7 @@ async fn two_concurrent_signers_do_not_interleave() {
     running
         .session({
             let did = did.clone();
-            move |client| client.unlock(&did, std::str::from_utf8(PASSPHRASE).unwrap()).unwrap()
+            move |client| client.unlock(&did, None, std::str::from_utf8(PASSPHRASE).unwrap()).unwrap()
         })
         .await;
 
@@ -403,6 +407,7 @@ async fn two_concurrent_signers_do_not_interleave() {
             let signed = client
                 .sign(SignRequest::Structured {
                     did,
+                    kid: None,
                     method: "GET".into(),
                     target_uri: format!("https://example.com/x/{index}"),
                     headers: BTreeMap::new(),

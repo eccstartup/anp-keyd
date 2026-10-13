@@ -41,15 +41,15 @@ fn dispatch(state: &DaemonState, peer: &PeerIdentity, request: Request) -> Resul
         Request::ListKeys => Ok(Response::ListKeys(state.list_keys(peer.uid)?)),
         Request::Status => Ok(Response::Status(state.status(peer.uid)?)),
 
-        Request::Unlock { did, passphrase } => {
+        Request::Unlock { did, kid, passphrase } => {
             // 口令从 socket 上传过来，用完就在 daemon 侧擦掉。
-            state.unlock(peer.uid, &did, zeroize::Zeroizing::new(passphrase))?;
+            state.unlock(peer.uid, &did, kid.as_deref(), zeroize::Zeroizing::new(passphrase))?;
             state.record(peer.uid, &Event::Unlocked { uid: peer.uid, did })?;
             Ok(Response::Ok)
         }
 
-        Request::Lock { did } => {
-            let dropped = state.lock(peer.uid, did.as_deref())?;
+        Request::Lock { did, kid } => {
+            let dropped = state.lock(peer.uid, did.as_deref(), kid.as_deref())?;
             state.record(
                 peer.uid,
                 &Event::Locked { uid: peer.uid, did, dropped },
@@ -69,6 +69,7 @@ fn sign_request(
     match request {
         SignRequest::Structured {
             did,
+            kid,
             method,
             target_uri,
             headers,
@@ -84,7 +85,7 @@ fn sign_request(
                 covered,
             };
 
-            let signed = state.sign_structured(peer.uid, &did, &signing)?;
+            let signed = state.sign_structured(peer.uid, &did, kid.as_deref(), &signing)?;
 
             let event = Event::Signed {
                 uid: peer.uid,
@@ -105,8 +106,9 @@ fn sign_request(
             Ok(Response::Signature(encode_signed_headers(&signed.headers)))
         }
 
-        SignRequest::Raw { did, payload } => {
-            let signature = state.sign_raw(peer.uid, &did, |key| key.sign(&payload))?;
+        SignRequest::Raw { did, kid, payload } => {
+            let signature =
+                state.sign_raw(peer.uid, &did, kid.as_deref(), |key| key.sign(&payload))?;
 
             let event = Event::RawSigned {
                 uid: peer.uid,
@@ -224,6 +226,7 @@ mod tests {
                 &self.peer(),
                 Request::Unlock {
                     did: self.did.clone(),
+                    kid: None,
                     passphrase: PASSPHRASE.to_string(),
                 },
             )
@@ -234,6 +237,7 @@ mod tests {
             headers.insert("content-type".to_string(), "application/json".to_string());
             Request::Sign(SignRequest::Structured {
                 did: self.did.clone(),
+                kid: None,
                 method: "POST".into(),
                 target_uri: "https://example.com/api".into(),
                 headers,
@@ -353,7 +357,7 @@ mod tests {
         let f = Fixture::new(false);
         f.unlock();
         assert_eq!(
-            handle(&f.state, &f.peer(), Request::Lock { did: Some(f.did.clone()) }),
+            handle(&f.state, &f.peer(), Request::Lock { did: Some(f.did.clone()), kid: None }),
             Response::Ok
         );
 
@@ -379,6 +383,7 @@ mod tests {
             &f.state,
             &f.peer(),
             Request::Sign(SignRequest::Raw {
+                kid: None,
                 did: f.did.clone(),
                 payload: b"anything".to_vec(),
             }),
@@ -401,6 +406,7 @@ mod tests {
             &f.state,
             &f.peer(),
             Request::Sign(SignRequest::Raw {
+                kid: None,
                 did: f.did.clone(),
                 payload: b"anything".to_vec(),
             }),
@@ -422,6 +428,7 @@ mod tests {
             &f.state,
             &f.peer(),
             Request::Unlock {
+                kid: None,
                 did: f.did.clone(),
                 passphrase: "wrong".into(),
             },
@@ -440,6 +447,7 @@ mod tests {
             &f.state,
             &f.peer(),
             Request::Unlock {
+                kid: None,
                 did: "did:wba:example.com:user:bob:e1_zzz".into(),
                 passphrase: PASSPHRASE.into(),
             },
@@ -468,6 +476,7 @@ mod tests {
         };
         let request = Request::Sign(SignRequest::Structured {
             did,
+            kid: None,
             method,
             target_uri,
             headers,

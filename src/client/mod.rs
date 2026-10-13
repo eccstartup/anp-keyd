@@ -72,9 +72,11 @@ impl Client {
         }
     }
 
-    pub fn unlock(&mut self, did: &str, passphrase: &str) -> Result<()> {
+    /// 解锁。`kid` 是 `did#fragment`,不给就是 `did` 名下默认那把(绑定密钥)。
+    pub fn unlock(&mut self, did: &str, kid: Option<&str>, passphrase: &str) -> Result<()> {
         match self.call(Request::Unlock {
             did: did.to_string(),
+            kid: kid.map(str::to_string),
             passphrase: passphrase.to_string(),
         })? {
             Response::Ok => Ok(()),
@@ -82,9 +84,12 @@ impl Client {
         }
     }
 
-    /// 锁上。`None` = 全锁。
-    pub fn lock(&mut self, did: Option<&str>) -> Result<()> {
-        match self.call(Request::Lock { did: did.map(str::to_string) })? {
+    /// 锁上。`did == None` = 全锁;给了 `did` 不给 `kid` = 那个 DID 底下全放。
+    pub fn lock(&mut self, did: Option<&str>, kid: Option<&str>) -> Result<()> {
+        match self.call(Request::Lock {
+            did: did.map(str::to_string),
+            kid: kid.map(str::to_string),
+        })? {
             Response::Ok => Ok(()),
             other => Err(unexpected("lock", &other)),
         }
@@ -102,9 +107,10 @@ impl Client {
     }
 
     /// 原始字节签名。守护进程没开 `--allow-raw-signing` 时会被拒。
-    pub fn sign_raw(&mut self, did: &str, payload: Vec<u8>) -> Result<Vec<u8>> {
+    pub fn sign_raw(&mut self, did: &str, kid: Option<&str>, payload: Vec<u8>) -> Result<Vec<u8>> {
         match self.call(Request::Sign(SignRequest::Raw {
             did: did.to_string(),
+            kid: kid.map(str::to_string),
             payload,
         }))? {
             Response::Signature(bytes) => Ok(bytes),

@@ -499,6 +499,7 @@ mod tests {
 
                 // 锁着的时候签不出来。
                 let locked = client.sign(wire::SignRequest::Structured {
+                    kid: None,
                     did: did.clone(),
                     method: "POST".into(),
                     target_uri: "https://example.com/api".into(),
@@ -509,9 +510,10 @@ mod tests {
 
                 // 解锁。口令就是从这个 socket 上传过去的 —— 这是 v1 的
                 // 解锁仪式,它成立的前提是这条 socket 的另一头一定是我们自己。
-                let unlocked = client.unlock(&did, PASSPHRASE);
+                let unlocked = client.unlock(&did, None, PASSPHRASE);
 
                 let signed = client.sign(wire::SignRequest::Structured {
+                    kid: None,
                     did: did.clone(),
                     method: "POST".into(),
                     target_uri: "https://example.com/api".into(),

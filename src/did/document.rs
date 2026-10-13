@@ -16,6 +16,30 @@ use crate::sign::{LockedSigningKey, Signer};
 /// 根密钥在文档里的 fragment。上游的 `VM_KEY_AUTH` 也是这个值。
 pub const ROOT_FRAGMENT: &str = "key-1";
 
+/// 文档里**除根密钥之外**的一把验证方法。
+///
+/// 上游的 `SuppliedDidKey` 里有一个 `role` 字段,但**它不会写进文档** ——
+/// 落到 JSON 里的只有 `id`/`type`/`controller`/`publicKeyMultibase`,加上
+/// 它在哪几个关系数组里被列过。所以从文档读回来的时候,role 只能重新猜一个
+/// 非根的;好在除此之外它是无损的,而 role 唯一被用到的地方就是"附加密钥
+/// 不得是 RootControl"那一条检查。
+#[derive(Debug, Clone)]
+pub struct ExtraKey {
+    pub fragment: String,
+    pub public_key: ed25519_dalek::VerifyingKey,
+    pub relationships: Vec<anp::authentication::DidVerificationRelationship>,
+}
+
+impl ExtraKey {
+    pub fn new(
+        fragment: impl Into<String>,
+        public_key: ed25519_dalek::VerifyingKey,
+        relationships: Vec<anp::authentication::DidVerificationRelationship>,
+    ) -> Self {
+        Self { fragment: fragment.into(), public_key, relationships }
+    }
+}
+
 /// 一个 did:wba 的"坐标" —— 文档挂在哪、路径是什么。
 #[derive(Debug, Clone)]
 pub struct DidDocumentSpec {
@@ -56,6 +80,28 @@ pub fn build_unsigned(
     spec: &DidDocumentSpec,
     root: &ed25519_dalek::VerifyingKey,
 ) -> Result<(String, Value)> {
+    build_unsigned_with(spec, root, Vec::new())
+}
+
+/// 同上,但允许在根密钥之外再挂几把。热密钥和恢复密钥走这里。
+pub fn build_unsigned_with(
+    spec: &DidDocumentSpec,
+    root: &ed25519_dalek::VerifyingKey,
+    extra: Vec<ExtraKey>,
+) -> Result<(String, Value)> {
+    let additional_keys = extra
+        .into_iter()
+        .map(|key| anp::authentication::SuppliedDidKey {
+            fragment: key.fragment,
+            // 上游拒收 role 为 `RootControl` 的附加密钥(index > 0 时直接
+            // `InvalidDidDocument`)。这不是我们可以绕的:一个 DID 只能有
+            // 一个根,其余的都得是别的角色。
+            role: anp::authentication::DidKeyRole::RequestSigning,
+            public_key: anp::PublicKeyMaterial::Ed25519(key.public_key),
+            relationships: key.relationships,
+        })
+        .collect();
+
     let options = anp::authentication::SuppliedE1DidDocumentOptions {
         port: spec.port,
         path_segments: spec.path_segments.clone(),
@@ -70,7 +116,7 @@ pub fn build_unsigned(
                 anp::authentication::DidVerificationRelationship::AssertionMethod,
             ],
         },
-        additional_keys: Vec::new(),
+        additional_keys,
     };
 
     let document = anp::authentication::build_unsigned_e1_did_document(&spec.host, options)
@@ -126,6 +172,21 @@ pub fn sign_document(
 /// 「我们手上的 DID」和「我们重建出的文档」说的是同一件事;不相等就说明
 /// 这个 DID 不是规范形式(比如被额外百分号编码过),那就别猜,直接失败。
 pub fn rebuild(did: &str, root: &ed25519_dalek::VerifyingKey) -> Result<Value> {
+    rebuild_with(did, root, Vec::new())
+}
+
+/// 同上,但把附加密钥一起挂回去。
+///
+/// **给已经挂了热密钥/恢复密钥的 DID 重发文档时必须走这一条。** 走
+/// [`rebuild`] 等于拿着一份只有根密钥的文档去盖掉线上那份 —— 而
+/// `deactivated`/`successorDid` 也好、热密钥也好、恢复密钥也好,全在
+/// 那次重发里消失。这正是"文档是以 DIDs 为键的、覆盖写"这件事最危险的地方:
+/// 覆盖不会报错,只会静静地少掉东西。
+pub fn rebuild_with(
+    did: &str,
+    root: &ed25519_dalek::VerifyingKey,
+    extra: Vec<ExtraKey>,
+) -> Result<Value> {
     let parts = parse_did_wba(did)?;
     let mut path_segments = parts.path_segments.clone();
     let last = path_segments
@@ -141,7 +202,7 @@ pub fn rebuild(did: &str, root: &ed25519_dalek::VerifyingKey) -> Result<Value> {
         path_segments,
         fragment: ROOT_FRAGMENT.to_string(),
     };
-    let (rebuilt, document) = build_unsigned(&spec, root)?;
+    let (rebuilt, document) = build_unsigned_with(&spec, root, extra)?;
     if rebuilt != did {
         return Err(KeydError::Did(format!(
             "{did} is not in the canonical form this build produces (got {rebuilt})"
