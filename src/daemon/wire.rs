@@ -40,6 +40,20 @@ pub const STATUS: u8 = 0x05;
 pub const OK: u8 = 0x80;
 pub const ERR: u8 = 0x81;
 
+/// **这个守护进程接受的请求类型,到此为止。**
+///
+/// 值得单独列出来,是因为这张表里**没有**导出,而且不该有。导出不是"被拒绝
+/// 的请求",是**根本不存在的一个类型** —— 它只在一个进程自己的 `/dev/tty` 上
+/// 发生,由坐在终端前的人操作(见 `ops::export` 开头那一节)。
+///
+/// 这条性质挡的不是"agent 不知道密码",而是"agent 够不到那条通道":一个被
+/// 注入的 agent 完全可以编一个像样的提示框骗人把密码敲进去,但只要导出不是
+/// socket 上的消息类型,它**送不到守护进程**。
+///
+/// 所以:加一个类型到这张表里,等于改变整个授权模型。它必须是一次看得见的
+/// 决定,而不是顺手写下的第 0x06 号。
+pub const REQUEST_TYPES: [u8; 5] = [LIST_KEYS, SIGN, UNLOCK, LOCK, STATUS];
+
 /// 错误码。
 ///
 /// **这个表比 [`KeydError`] 粗,是故意的。** 对端能看见的只有"哪一类错",
@@ -833,6 +847,52 @@ mod tests {
             headers,
             body: Some(b"{\"hello\":1}".to_vec()),
             covered: vec!["content-type".into()],
+        }
+    }
+
+    /// **导出不是一个 socket 消息类型。这一条是导出策略的地基。**
+    ///
+    /// `ops::export` 那一整套("关掉回显、只走终端、强制先锁、密码不进
+    /// argv")挡的都是**同一条通道上的**攻击。真正让被注入的 agent 无能为力
+    /// 的是这里:它可以让人类把密码敲进任何一个它画的框里,但那个值**没有
+    /// 一条路能到这里来**,因为这里没有这个类型。
+    ///
+    /// 所以这个测试同时干两件事:
+    ///
+    /// 1. 把 256 个字节**逐个**喂进解码器,只允许 [`REQUEST_TYPES`] 里那 5 个
+    ///    不报"没有这个类型"。将来谁顺手加了一个 0x06,这里立刻红。
+    /// 2. 把表本身也数一遍 —— 加成员是一次**看得见的决定**,不是顺手写的
+    ///    一个分支。
+    #[test]
+    fn the_only_message_types_are_the_five_that_do_not_export_anything() {
+        assert_eq!(
+            REQUEST_TYPES.len(),
+            5,
+            "the request table changed. Read the comment on REQUEST_TYPES before \
+             accepting a new one — a type that can hand out key material is a different \
+             product, not a new feature"
+        );
+
+        for byte in 0u8..=0xFF {
+            let refused = matches!(
+                decode_request(&[byte]),
+                Err(KeydError::Protocol(message)) if message.contains("is not a request type")
+            );
+            let listed = REQUEST_TYPES.contains(&byte);
+            assert_eq!(
+                refused, !listed,
+                "0x{byte:02x}: listed={listed}, refused-as-unknown-type={refused}"
+            );
+        }
+
+        // 顺手把几个"最像导出"的编号钉死,好在有人真去加的时候一眼看见自己
+        // 加的是什么。0x06 是这张表顺下来的下一个。
+        for byte in [0x00, 0x06, 0x07, 0x40, 0x7F, 0x90] {
+            assert!(
+                decode_request(&[byte]).is_err(),
+                "0x{byte:02x} must stay unused: an unused code point is what a future \
+                 `EXPORT_SEED` message would need, and there is deliberately no room for it"
+            );
         }
     }
 

@@ -25,7 +25,10 @@
 //! 3. **让人看一眼摘要再点头**。这些操作全都是不可逆的:迁移只写一次、
 //!    摘掉的钥匙的 seed 只在这个文件里。
 
+#[cfg(feature = "seed-export")]
+pub mod export;
 pub mod identity;
+pub mod import;
 pub mod keys;
 
 use std::path::Path;
@@ -60,7 +63,19 @@ impl Session {
         };
         layout.ensure()?;
         let audit = AuditLog::open(&layout.audit_dir())?;
-        Ok(Self { layout, tty: tty::open()?, audit })
+        let session = Self { layout, tty: tty::open()?, audit };
+
+        // 上次导出过就在这里说一句。
+        //
+        // 位置选在"每一条需要终端的命令的开头",而不是守护进程启动的时候:
+        // 守护进程由服务管理器拉起来,人根本看不见它的输出。而人一定会看见
+        // 自己敲的那条命令的输出 —— 家用路由器把"上次登录"印在登录页上,
+        // 正是同一个道理。用得着这个提醒的场合,是那个**正在敲命令的人**
+        // 被 agent 说服了要跑一次导出。
+        if let Some(line) = crate::audit::log::export_tripwire(&session.layout.audit_dir()) {
+            session.say(&format!("\n{line}\n"))?;
+        }
+        Ok(session)
     }
 
     pub fn layout(&self) -> &KeydLayout {
@@ -102,6 +117,29 @@ impl Session {
     /// 问一次秘密。新钥匙的信封要用它。
     pub(crate) fn ask_secret(&self, prompt: &str) -> Result<zeroize::Zeroizing<String>> {
         tty::read_secret(&self.tty, prompt)
+    }
+
+    /// 问一个**新的**秘密,问两遍。
+    ///
+    /// 导入和导出设的都是"这台机器上的新口令":敲错一个字符的代价是以后
+    /// 再也解不开,而那时候人已经在用别的东西了。所以和 `keygen` 走同一条
+    /// 路 —— 不给"我就问一次"这个选项。
+    pub(crate) fn ask_new_secret(
+        &self,
+        prompt: &str,
+        confirm: &str,
+    ) -> Result<zeroize::Zeroizing<String>> {
+        tty::read_secret_twice(&self.tty, prompt, confirm)
+    }
+
+    /// 读一行**看得见**的输入。
+    ///
+    /// 给 24 个词用。它确实是秘密,但这里选看得见:人是照着纸上那份一个词
+    /// 一个词对过去的,不显示等于让他闭着眼睛抄 —— 而校验和只能抓出"错得
+    /// 不巧"的那些,抓不出"两个都是合法词、抄的时候看串了行"。
+    pub(crate) fn ask_line(&self, prompt: &str) -> Result<zeroize::Zeroizing<String>> {
+        write_tty(&self.tty, prompt)?;
+        tty::read_line(&self.tty)
     }
 
     pub(crate) fn confirm(&self, question: &str) -> Result<bool> {

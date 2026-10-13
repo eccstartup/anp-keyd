@@ -3,6 +3,7 @@
 pub mod aead;
 pub mod hygiene;
 pub mod kdf;
+pub mod mnemonic;
 pub mod thumbprint;
 
 use sha2::{Digest, Sha256};

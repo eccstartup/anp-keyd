@@ -346,6 +346,79 @@ fn check_anchor(dir: &Path, records: u64, tail: &[u8; 32]) -> Result<()> {
     Ok(())
 }
 
+/// 上一次导出是什么时候。
+///
+/// 这是"上次登录"那一类的东西,而且比它重要:导出是把整把身份抽出来,抽出来
+/// 之后**没有任何办法撤销**。所以它必须能被事后看见 —— 一个被注入的 agent
+/// 骗着人跑了一次 `export-seed` 之后,唯一会留下的痕迹就是这一条。
+///
+/// 扫的是**整个审计目录**,不只当月那份:导出可能发生在几个月前,而按月的
+/// 分片意味着只看当月等于只回答"这个月有没有",那正好是最没用的那个答案。
+/// 文件名是 `YYYY-MM.jsonl`,字典序就是时间序,所以最后一条命中的就是最新的。
+///
+/// 读不动的行一律跳过,不报错 —— 这个函数的调用点在每一条需要终端的命令的
+/// 开头,而它绝不该成为那条命令失败的原因。链的完整性是 `AuditLog::open`
+/// 的活儿,那是它该报错的地方。
+pub fn last_export(dir: &Path) -> Option<ExportRecord> {
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .collect();
+    files.sort();
+
+    let mut latest = None;
+    for path in files {
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if record.get("event").and_then(serde_json::Value::as_str) != Some("EXPORT_SEED") {
+                continue;
+            }
+            latest = Some(ExportRecord {
+                at: field(&record, "at"),
+                did: field(&record, "did"),
+                form: field(&record, "form"),
+            });
+        }
+    }
+    latest
+}
+
+/// 把上一次导出说成一句人话。从来没有导出过就是 `None`。
+///
+/// 措辞是刻意"不好看"的:这一行是最后一道提醒,它不该长得像一句状态报告。
+pub fn export_tripwire(dir: &Path) -> Option<String> {
+    let last = last_export(dir)?;
+    Some(format!(
+        "last export from this machine: {} — {} ({}).\n\
+         If that was not you, treat every key here as compromised and migrate away from it.",
+        last.at, last.did, last.form
+    ))
+}
+
+/// 一条 `EXPORT_SEED` 记录里我们要的三样东西。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportRecord {
+    pub at: String,
+    pub did: String,
+    pub form: String,
+}
+
+fn field(record: &serde_json::Value, name: &str) -> String {
+    // 缺字段时给一句"不知道",不给一个空串 —— 空串在打印出来的时候什么都
+    // 不说明,而"我不知道"至少是说清楚了的。
+    record
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("(unreadable)")
+        .to_string()
+}
+
 fn current_month() -> String {
     let now = time::OffsetDateTime::now_utc();
     format!("{:04}-{:02}", now.year(), u8::from(now.month()))
@@ -587,6 +660,109 @@ mod tests {
             tags,
             ["DENIED", "UNLOCKED", "LOCKED", "SIGNED", "RAW_SIGNED", "SWEPT"]
         );
+    }
+
+    // —— say-every-export tripwire(家用路由器那句"上次登录")————
+
+    /// 从来没有导出过,就一个字都不说。
+    ///
+    /// **"没有"和"不知道"在这里必须是同一个答案。** 一个刚装好的机器每次
+    /// 敲命令都先被告知"上次导出:无",那句提醒在三天之内就会变成人看不见的
+    /// 背景噪音 —— 而它存在的全部意义是"出现的时候人要停下来看一眼"。
+    #[test]
+    fn a_machine_that_never_exported_says_nothing() {
+        let d = TempDir::new();
+        assert_eq!(last_export(d.path()), None);
+        assert_eq!(export_tripwire(d.path()), None);
+    }
+
+    #[test]
+    fn other_events_are_not_mistaken_for_an_export() {
+        let d = TempDir::new();
+        let mut log = AuditLog::open(d.path()).unwrap();
+        log.append(&Event::Import {
+            did: "did:wba:example.com:u:a:e1_x".into(),
+            kid: "did:wba:example.com:u:a:e1_x#key-1".into(),
+            source: "archive".into(),
+            document_digest: digest_hex(b"doc"),
+        })
+        .unwrap();
+
+        assert_eq!(export_tripwire(d.path()), None);
+    }
+
+    /// 导出了就一直说,而且说的是**最近那一次**。
+    ///
+    /// 扫的是整个目录而不是当月分片,所以几个月前的一次导出也留得下来 ——
+    /// "这个月有没有导出过"正好是最没用的那个答案。
+    #[test]
+    fn the_tripwire_reports_the_most_recent_export() {
+        let d = TempDir::new();
+        let mut log = AuditLog::open(d.path()).unwrap();
+        log.append(&Event::ExportSeed {
+            did: "did:wba:example.com:u:a:e1_first".into(),
+            form: "words".into(),
+        })
+        .unwrap();
+        log.append(&Event::ExportSeed {
+            did: "did:wba:example.com:u:a:e1_second".into(),
+            form: "words+archive".into(),
+        })
+        .unwrap();
+
+        let last = last_export(d.path()).expect("an export happened");
+        assert_eq!(last.did, "did:wba:example.com:u:a:e1_second");
+        assert_eq!(last.form, "words+archive");
+        assert!(!last.at.is_empty(), "the record must carry a timestamp");
+
+        let line = export_tripwire(d.path()).unwrap();
+        assert!(line.contains(&last.did), "{line}");
+        assert!(line.contains(&last.at), "{line}");
+    }
+
+    /// 这一行不是状态报告,是**最后一道提醒** —— 它得说清楚"不是你,就去
+    /// 迁移",而不是只说"上次导出在某时"。
+    #[test]
+    fn the_tripwire_says_what_to_do_about_it() {
+        let d = TempDir::new();
+        let mut log = AuditLog::open(d.path()).unwrap();
+        log.append(&Event::ExportSeed {
+            did: "did:wba:example.com:u:a:e1_x".into(),
+            form: "archive".into(),
+        })
+        .unwrap();
+
+        let line = export_tripwire(d.path()).unwrap();
+        assert!(line.contains("If that was not you"), "{line}");
+        assert!(line.contains("compromised"), "{line}");
+        assert!(line.contains("migrate"), "{line}");
+    }
+
+    /// 坏行不能让这一句消失。
+    ///
+    /// 它的调用点在**每一条需要终端的命令的开头**,所以它绝不能成为那条命令
+    /// 失败的原因 —— 而"审计文件里有一行被写坏了"正是导出之后最可能的状态。
+    #[test]
+    fn a_corrupt_line_does_not_hide_a_real_export() {
+        let d = TempDir::new();
+        let mut log = AuditLog::open(d.path()).unwrap();
+        log.append(&Event::ExportSeed {
+            did: "did:wba:example.com:u:a:e1_real".into(),
+            form: "words".into(),
+        })
+        .unwrap();
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(d.path().join(format!("{}.jsonl", current_month())))
+            .unwrap();
+        use std::io::Write;
+        file.write_all(b"{ this is not json\n").unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+
+        let last = last_export(d.path()).expect("the real export is still readable");
+        assert_eq!(last.did, "did:wba:example.com:u:a:e1_real");
     }
 
     mod tempdir {

@@ -28,6 +28,37 @@ pub fn unlock(
     passphrase: &[u8],
     device_secret: &LockedBytes,
 ) -> Result<LockedSigningKey> {
+    let seed = open_seed(wrapped, passphrase, device_secret)?;
+    let key = LockedSigningKey::from_seed(wrapped.id.clone(), seed)?;
+
+    // ⑤ 信封上写的公钥必须就是这把 seed 的公钥。
+    //
+    // AAD 已经绑住了 `public_multibase`,所以正常路径上这一条不可能不过。
+    // 留着是因为它**从私钥侧重新导出**了公钥:万一哪天信封格式变了、或者
+    // 有人拿到口令重封了一个自相矛盾的信封,这里会在它走出去之前拦住。
+    if key.public_multibase() != wrapped.public_multibase {
+        return Err(KeydError::Protocol(
+            "envelope advertises a public key that is not the one its sealed private key derives"
+                .into(),
+        ));
+    }
+    Ok(key)
+}
+
+/// 只把 seed 解出来,不造签名密钥。
+///
+/// 导出路径要的是**那 32 个字节本身** —— 它要能原样再封回一个信封、能写成
+/// 24 个词、能被搬去另一台机器。这些东西一把 `LockedSigningKey` 都给不了,
+/// 而为了它们去给 `LockedSigningKey` 开一个"吐 seed"的口子,等于让签名层
+/// 也变成一条导出通道 —— 那正是这一整块要避免的事。
+///
+/// 所以分成两条:能签名的那条([`unlock`])对外,能拿到材料的那条只给导出
+/// 用,而且只在 `seed-export` 构建里被调用。
+pub fn open_seed(
+    wrapped: &WrappedKey,
+    passphrase: &[u8],
+    device_secret: &LockedBytes,
+) -> Result<LockedBytes> {
     wrapped.validate()?;
 
     // ① 重算 AAD 摘要并比对。先于任何密码学。
@@ -53,22 +84,7 @@ pub fn unlock(
 
     // ④ DEK 解出 seed。
     let sk_ciphertext = record::decode_b64(&wrapped.sk_ciphertext)?;
-    let seed = exact32(dek.expose(|d| aead::open(d, &nonce, &aad, &sk_ciphertext))?)?;
-
-    let key = LockedSigningKey::from_seed(wrapped.id.clone(), seed)?;
-
-    // ⑤ 信封上写的公钥必须就是这把 seed 的公钥。
-    //
-    // AAD 已经绑住了 `public_multibase`,所以正常路径上这一条不可能不过。
-    // 留着是因为它**从私钥侧重新导出**了公钥:万一哪天信封格式变了、或者
-    // 有人拿到口令重封了一个自相矛盾的信封,这里会在它走出去之前拦住。
-    if key.public_multibase() != wrapped.public_multibase {
-        return Err(KeydError::Protocol(
-            "envelope advertises a public key that is not the one its sealed private key derives"
-                .into(),
-        ));
-    }
-    Ok(key)
+    exact32(dek.expose(|d| aead::open(d, &nonce, &aad, &sk_ciphertext))?)
 }
 
 #[cfg(test)]

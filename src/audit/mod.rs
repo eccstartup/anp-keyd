@@ -5,4 +5,4 @@
 
 pub mod log;
 
-pub use log::{AuditLog, Event};
+pub use log::{export_tripwire, last_export, AuditLog, Event, ExportRecord};

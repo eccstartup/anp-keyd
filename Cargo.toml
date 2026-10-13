@@ -17,6 +17,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macro
 
 # —— 内核凭证 / 文件权限
 nix = { version = "0.31", features = ["socket", "user", "fs", "term"] }
+bip39 = { version = "3", default-features = false, features = ["zeroize"] }
 
 # —— 第三层:可执行文件身份。macOS 上要经 CoreFoundation 调 Security.framework
 # 的 SecCode API,把对端的 audit token 换成 cdhash。

@@ -209,6 +209,88 @@ mod tests {
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
     use nix::pty::openpty;
 
+    /// 子进程自己去探一次"没有终端"这件事,用的就是那条命令行。
+    ///
+    /// 这里之所以要一个**真的子进程**,是因为"控制终端"是**会话**的属性:
+    /// 在一个已经有终端的进程里怎么改 fd 都模拟不出来。`setsid` 让子进程
+    /// 脱离会话,于是它真的没有控制终端 —— 不是假装没有。
+    const NO_TTY_PROBE: &str = "ANP_KEYD_TTY_PROBE";
+
+    fn probe_without_a_terminal() -> ! {
+        match open() {
+            Ok(_) => {
+                eprintln!("PROBE: /dev/tty opened, but this process has no session");
+                std::process::exit(2);
+            }
+            Err(error) => {
+                println!("{error}");
+                let expected = error.to_string().contains("no controlling terminal");
+                std::process::exit(if expected { 0 } else { 3 });
+            }
+        }
+    }
+
+    /// **没有终端 = 失败,没有降级路径。**
+    ///
+    /// 计划把这一条列在导出的验收里。它值得测,是因为它挡的是一整类环境:
+    /// cron、CI、被 agent 拉起来的子进程、systemd 里的 `ExecStartPre`。在这些
+    /// 地方一份"没有终端就换个方式问"的降级代码会**静静地**把私钥交出去,
+    /// 而正确行为是当场拒绝,并且说清楚为什么。
+    #[test]
+    fn without_a_controlling_terminal_there_is_no_prompt_and_no_fallback() {
+        use std::os::unix::process::CommandExt;
+
+        // 子进程会用同一个二进制再跑一次这个测试(带上探针环境变量),
+        // 所以这里必须先把探针分支处理掉。
+        if std::env::var_os(NO_TTY_PROBE).is_some() {
+            probe_without_a_terminal();
+        }
+
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "tty::tests::without_a_controlling_terminal_there_is_no_prompt_and_no_fallback",
+                // 探针的话要走真 stdout 出来 —— libtest 默认把测试里的输出
+                // 收进自己的缓冲区,而这里要看的就是那几行字。
+                "--nocapture",
+            ])
+            .env(NO_TTY_PROBE, "1")
+            // 两头都接管道:证明缺的不是 stdin,而是**控制终端**。
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        unsafe {
+            // 直接走 `setsid(2)` 而不是 `nix::unistd::setsid`:这个闭包跑在
+            // `fork` 之后、`exec` 之前,中间只能用**异步信号安全**的东西,
+            // 而 `setsid` 是裸系统调用里最合适的那一个。也省得为一个测试
+            // 给 nix 多开一个 `process` 特性。
+            command.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let output = command.output().expect("spawn the probe");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "the probe must report the refusal; stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stdout.contains("no controlling terminal"),
+            "the refusal has to say what is missing; got {stdout:?}"
+        );
+        assert!(
+            stdout.contains("must be run by a person at a terminal"),
+            "and it has to say who is supposed to run it; got {stdout:?}"
+        );
+    }
+
     /// 一对真 pty。测试需要一个**真终端**:`tcgetattr` 在管道上是失败的,
     /// 而"回显开关"这件事只在终端上才有意义。
     fn pty() -> (File, File) {

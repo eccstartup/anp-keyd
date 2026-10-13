@@ -86,6 +86,21 @@ pub enum Command {
     Migrate(MigrateArgs),
     /// 永久注销一个 DID,可以顺手指向一个后继。
     Deactivate(DeactivateArgs),
+    /// 从 24 个词恢复一把绑定密钥,并把它重新封进这台机器的信封。
+    ImportMnemonic(ImportMnemonicArgs),
+    /// 从一个加密归档恢复。
+    ImportArchive(ImportArchiveArgs),
+    /// 把一把钥匙的种子导出来 —— **只有带 `seed-export` 特性构建的二进制里
+    /// 有这条命令**。
+    ///
+    /// 默认构建里它不存在,不是"被拒绝",是**没有这段代码**:没有分支、
+    /// 没有环境变量、没有可翻的开关。理由见模块头 —— 简言之,一个能一键
+    /// 把整把身份抽干的接口,是 agent 被注入之后最想找的那个东西。
+    ///
+    /// 这条命令**没有** `--password`:口令只从终端读。argv 会被 `ps` 看到,
+    /// 环境变量会被同 uid 的进程在 `/proc/<pid>/environ` 里读到。
+    #[cfg(feature = "seed-export")]
+    ExportSeed(ExportSeedArgs),
 }
 
 #[derive(Args, Debug)]
@@ -324,6 +339,74 @@ pub struct DeactivateArgs {
     pub to: Option<String>,
 }
 
+#[derive(Args, Debug)]
+pub struct ImportMnemonicArgs {
+    /// 这个 DID。
+    ///
+    /// 词里推不出它:路径段是人选的,公钥只决定最后那一段 `e1_`。所以必须
+    /// 由人给出,而给错会**当场**被指纹对上 —— 不匹配就是拒,不是"打不开"。
+    #[arg(long, value_name = "DID")]
+    pub did: String,
+
+    /// 新信封的标签。
+    #[arg(long, default_value = "imported", value_name = "LABEL")]
+    pub label: String,
+
+    /// 本地已经有同一把钥匙时也照做。
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ImportArchiveArgs {
+    /// 归档文件。
+    #[arg(long, value_name = "PATH")]
+    pub file: PathBuf,
+
+    /// 新信封的标签。
+    #[arg(long, default_value = "imported", value_name = "LABEL")]
+    pub label: String,
+
+    /// 本地已经有同一把钥匙时也照做。
+    #[arg(long)]
+    pub force: bool,
+
+    // 这里**没有** `--password`,而且是刻意的:归档的密码只从终端读。
+    // 一个从 argv 传进来的密码会出现在 `ps` 的输出里,也会出现在 shell
+    // 的历史里 —— 而它保护的是整把私钥。
+}
+
+#[cfg(feature = "seed-export")]
+#[derive(Args, Debug)]
+pub struct ExportSeedArgs {
+    #[arg(long, value_name = "DID")]
+    pub did: String,
+
+    /// 导出哪一把。不给就是绑定密钥。
+    #[arg(long, value_name = "FRAGMENT")]
+    pub kid: Option<String>,
+
+    /// 归档写到哪个目录。
+    #[arg(long, value_name = "DIR")]
+    pub out: Option<PathBuf>,
+
+    /// 输出文件已存在时也照写。
+    #[arg(long)]
+    pub force: bool,
+
+    /// 只要 24 个词,不写归档。
+    #[arg(long, conflicts_with = "archive_only")]
+    pub words_only: bool,
+
+    /// 只要归档,不打那 24 个词。
+    #[arg(long)]
+    pub archive_only: bool,
+
+    // 这里**没有** `--password`:口令只从终端读。argv 会被 `ps` 看到,
+    // 环境变量会被同 uid 的进程读 `/proc/<pid>/environ`。少一个参数就是
+    // 少一条泄露路径,而这个参数一旦存在,迟早会有人把它用起来。
+}
+
 /// 跑一条命令。
 ///
 /// 先把 `Cli` 拆开:命令本身要被移出来交给各自的函数,而 `--root` 又要
@@ -369,6 +452,37 @@ pub fn run(cli: Cli) -> Result<()> {
             root,
             crate::ops::identity::Deactivate { did: args.did, to: args.to },
         ),
+        Command::ImportMnemonic(args) => crate::ops::import::import_mnemonic(
+            root,
+            crate::ops::import::ImportMnemonic {
+                did: args.did,
+                label: args.label,
+                force: args.force,
+            },
+        ),
+        Command::ImportArchive(args) => crate::ops::import::import_archive(
+            root,
+            crate::ops::import::ImportArchive {
+                file: args.file,
+                label: args.label,
+                force: args.force,
+            },
+        ),
+        #[cfg(feature = "seed-export")]
+        Command::ExportSeed(args) => crate::ops::export::export_seed(
+            root,
+            crate::ops::export::ExportSeed {
+                did: args.did,
+                kid: args.kid,
+                out: args.out,
+                force: args.force,
+                form: match (args.words_only, args.archive_only) {
+                    (true, _) => crate::ops::export::Form::Words,
+                    (_, true) => crate::ops::export::Form::Archive,
+                    _ => crate::ops::export::Form::Both,
+                },
+            },
+        ),
     }
 }
 
@@ -397,6 +511,19 @@ fn connect(root: Option<&Path>, socket: Option<&Path>) -> Result<Client> {
 
 fn serve(root: Option<&Path>, args: ServeArgs) -> Result<()> {
     let policy = args.policy()?;
+
+    // 上次导出过就在启动时说一句。
+    //
+    // "家用路由器显示上次登录"那种东西,而这个比它重要:导出是把整把身份
+    // 抽出来,抽出来之后**没有任何办法撤销**。守护进程是那个会被 agent
+    // 够到的东西,所以它每一次被拉起来的时候都该把这件事说清楚 —— 哪怕
+    // 大多数时候它只是进了服务管理器的日志,而人不会去看。
+    //
+    // 真正会被人看到的那一次在 `ops::Session::open` 里:导出这件事最后一定
+    // 是被某个坐在终端前的人做掉的,而那里正是那个人眼前。
+    if let Some(line) = crate::audit::log::export_tripwire(&layout(root)?.audit_dir()) {
+        eprintln!("{line}");
+    }
 
     if policy.allowed_binaries.is_empty() {
         // 这一条不能悄悄放过。只配了 uid 的"多用户"是**假的多用户**:
@@ -817,6 +944,93 @@ fn base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+    use clap::error::ErrorKind;
+
+    fn parse(argv: &[&str]) -> std::result::Result<Cli, clap::Error> {
+        let mut full = vec!["anp-keyd"];
+        full.extend_from_slice(argv);
+        Cli::try_parse_from(full)
+    }
+
+    /// **导出这条命令在默认构建里不存在 —— 不是被拒,是没有。**
+    ///
+    /// 计划 §六·七 的第三道收紧就是这个意思:一个运行期开关可以被补丁、
+    /// 被漏掉的分支、被调试器翻过去;一个编译期不存在的子命令没有可翻的
+    /// 东西。默认二进制里不但没有这条路径,连这个字符串都没有。
+    #[cfg(not(feature = "seed-export"))]
+    #[test]
+    fn the_default_build_has_no_export_subcommand_at_all() {
+        let error = parse(&["export-seed", "--did", "did:wba:example.com:u:a:e1_x"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidSubcommand, "{error}");
+    }
+
+    /// 带上 `seed-export` 构建出来的二进制里,这条命令也没有 `--password`。
+    ///
+    /// 这一条测的**不是**"我们记得检查了密码在不在 argv 里",而是"这个参数
+    /// 根本不存在":少了参数就少了一条泄露路径,而 argv 对同机器上任何用户
+    /// 都是可读的(`ps`)。
+    #[cfg(feature = "seed-export")]
+    #[test]
+    fn the_export_command_has_no_password_flag_even_when_it_exists() {
+        let error = parse(&[
+            "export-seed",
+            "--did",
+            "did:wba:example.com:u:a:e1_x",
+            "--password",
+            "hunter2",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument, "{error}");
+    }
+
+    /// 两条导入路都进默认构建,而且**都没有** `--password` —— 同一条理由:
+    /// 归档的密码只从终端读。
+    #[test]
+    fn neither_import_command_takes_a_password_on_the_command_line() {
+        let mnemonic = parse(&[
+            "import-mnemonic",
+            "--did",
+            "did:wba:example.com:u:a:e1_x",
+            "--password",
+            "hunter2",
+        ])
+        .unwrap_err();
+        assert_eq!(mnemonic.kind(), ErrorKind::UnknownArgument, "{mnemonic}");
+
+        let archive = parse(&["import-archive", "--file", "/tmp/a.json", "--password", "hunter2"])
+            .unwrap_err();
+        assert_eq!(archive.kind(), ErrorKind::UnknownArgument, "{archive}");
+    }
+
+    /// 导入是 v1 必做的一部分 —— 一个打不开的备份不算备份。这条钉住的是
+    /// "它在默认构建里",而不是"它被实现了"(那由别的测试保证)。
+    #[test]
+    fn both_import_commands_are_in_the_default_build() {
+        assert!(parse(&[
+            "import-mnemonic",
+            "--did",
+            "did:wba:example.com:u:a:e1_x",
+        ])
+        .is_ok());
+        assert!(parse(&["import-archive", "--file", "/tmp/a.json"]).is_ok());
+    }
+
+    /// `--words-only` 和 `--archive-only` 一起给是自相矛盾的要求,clap 就该
+    /// 在启动前拒掉 —— 不给"两个都要"和"两个都不要"这两种读法留空间。
+    #[cfg(feature = "seed-export")]
+    #[test]
+    fn asking_for_words_only_and_archive_only_at_once_is_refused() {
+        let error = parse(&[
+            "export-seed",
+            "--did",
+            "did:wba:example.com:u:a:e1_x",
+            "--words-only",
+            "--archive-only",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict, "{error}");
+    }
 
     fn spec(host: &str, path: &str) -> Result<DidDocumentSpec> {
         spec_of(&KeygenArgs {
