@@ -14,8 +14,14 @@ use crate::error::{KeydError, Result};
 
 /// 32 字节的锁定缓冲。
 ///
-/// 底层由 `shrouded` 用 `mlock` 锁页(不许换出到 swap)、加 guard page、
-/// 并请求 `MADV_DONTDUMP`(不许进 core dump);`Drop` 时擦除并 `munlock`。
+/// 底层由 `shrouded` 用 `mlock` 锁页(不许换出到 swap)并加 guard page;
+/// `Drop` 时擦除并 `munlock`。
+///
+/// **core dump 那一层只挡得住在 Linux 上。** `MADV_DONTDUMP` 是 Linux 才有的
+/// 系统调用,`shrouded` 里那一段是 `#[cfg(target_os = "linux")]` —— 在 macOS
+/// 上它整个不编译,这一层就只剩 `RLIMIT_CORE` 挡在中间。所以别把"锁定区不进
+/// dump"当成跨平台成立的话(`ops::probe` 会把这两件事分开报,并且在不成立的
+/// 平台上让体检不通过)。
 ///
 /// 采用 `Policy::Strict`:拿不到内存保护就**失败**,不静默降级。对一个
 /// "私钥不留痕"是唯一产品承诺的工具,降级后的成功比失败更危险。

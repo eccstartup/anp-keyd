@@ -6,8 +6,8 @@
 //! 应该全是 `0x00`。那个验收**换了个做法**,理由有两条,一条技术一条安全:
 //!
 //! **技术上的那一条是硬伤:跨进程做不到。** `probe` 是另一个进程,而锁定区
-//! 被 `mlock` 锁页、前后加了 guard page、并且请求了 `MADV_DONTDUMP` ——
-//! 它读不到守护进程的内存,那不是"没实现",那正是这套保护在起作用。做成
+//! 被 `mlock` 锁页、前后加了 guard page(Linux 上还请求了 `MADV_DONTDUMP`)
+//! —— 它读不到守护进程的内存,那不是"没实现",那正是这套保护在起作用。做成
 //! 进程内自测倒是能读,但那就引出第二条。
 //!
 //! **安全上的那一条:进程内自测会把私钥打到 stdout**,而这个二进制
@@ -22,6 +22,10 @@
 //!   systemd 的 `LimitMEMLOCK` 没调,症状是**启动就失败**,而这里能当场
 //!   说清是哪一条不满足。
 //! - 锁定区建起来之后**读得回来**(不是"分配成功",是"能按字节读回原值")。
+//! - **一次崩溃会不会把种子写到磁盘上。** `memlock` 成功容易被当成"内存这
+//!   一块说完了",但 core dump 是另一条路:`MADV_DONTDUMP` 只管 Linux,别的
+//!   平台上只剩 `RLIMIT_CORE` 挡着 —— 所以这里分开报,而在没有
+//!   `MADV_DONTDUMP` 又不限制 core dump 的机器上**体检不通过**。
 //! - `device.secret` 在不在、模式对不对、长度是不是 32。
 //! - 给了 `--did` 的话,那把**信封**是不是完好的、绑的是不是这个身份 ——
 //!   这些全是公开信息(thumbprint 本来就挂在域名上),不需要口令。
@@ -30,6 +34,15 @@
 //! `tests/negative.rs`(第 8 条)里;而"区域归零"是 `shrouded` 和 `Zeroize`
 //! 的 Drop 保证 —— 验它等于验那两个库,不值得我们用一段自己写的不安全代码
 //! 去读一块已经 free 的内存来假装验过。
+//!
+//! # M4 验收 #3 的另一半,以及为什么它留着手工做
+//!
+//! 那条写的是"`strings /proc/<pid>/mem` 翻不到私钥字节"。**读另一个进程的
+//! 内存**这件事不在任何一段自动化测试里:macOS 上要 root,Linux 上要 ptrace
+//! 许可(`yama/ptrace_scope`)。写一条只有某个平台、某种权限下才跑得起来的
+//! 测试,等于留一段**没人跑过的代码**在仓库里 —— 而它的存在还会让"这一条
+//! 被覆盖了"显得成立。所以这里守的是它的**前提**(能力、限制、失败即拒绝),
+//! 真正那一步留给人拿上面这条命令在真机上做一次。
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -84,11 +97,21 @@ fn memory_hygiene() -> bool {
     // ① 能不能建起一个锁定区。
     //
     // `LockedBytes::generate` 走的是 `Policy::Strict`,`mlock` 拿不到就返回
-    // Err —— **不降级**。所以这一步成功,等于这一整条链路(锁页、guard page、
-    // DONTDUMP)在这台机器上都被接受了。
+    // Err —— **不降级**。所以这一步成功,等于锁页和 guard page 在这台机器上
+    // 都被接受了(`MADV_DONTDUMP` 只有 Linux 上才有,它那一层单独报,见
+    // `core_dump_hygiene`)。
     let locked = match LockedBytes::generate() {
         Ok(locked) => {
-            println!("  locked memory ............ ok (mlock + guard page + DONTDUMP accepted)");
+            // **这句话要按平台说。** `MADV_DONTDUMP` 是 Linux 才有的,`shrouded`
+            // 里那一段就是 `#[cfg(target_os = "linux")]` —— 在 macOS 上照抄
+            // "DONTDUMP accepted" 是一句假话,而体检报告里最不该有的就是假话。
+            // 别的平台上那一层由下面 `core_dump_hygiene` 单独交代。
+            if cfg!(target_os = "linux") {
+                println!("  locked memory ............ ok (mlock + guard page + DONTDUMP accepted)");
+            } else {
+                println!("  locked memory ............ ok (mlock + guard page accepted)");
+                println!("      (MADV_DONTDUMP is Linux-only; see the core-dump line below)");
+            }
             locked
         }
         Err(error) => {
@@ -132,7 +155,65 @@ fn memory_hygiene() -> bool {
     drop(locked);
     println!("  release .................. ok (no error while tearing down)");
 
-    round_trips
+    let core_dumps_safe = core_dump_hygiene();
+
+    round_trips && core_dumps_safe
+}
+
+/// 计划 §九 M4 验收 #3 里"进程内存里翻不到私钥"这一条,在这台机器上靠什么成立。
+///
+/// 两件事**互相独立**,而且特别容易被当成同一件:
+///
+/// - `MADV_DONTDUMP` 把**这一块区域**排除出 core dump —— 但它**只在 Linux
+///   上有**(`shrouded` 里那一段是 `#[cfg(target_os = "linux")]`,在 macOS 上
+///   整个编译掉)。
+/// - `RLIMIT_CORE = 0` 让**整个进程**根本产生不了 core dump。
+///
+/// 所以这里分开报。rlimit 是 0:dump 根本不会发生,后面那句就不用再说了。
+/// 不是 0:Linux 上锁定区自己仍然被排除,别的系统上**没有这一层** —— 那时
+/// 一次崩溃就会把 seed 连同内存一起写到磁盘上,而这正是那条验收要防的事,
+/// 所以那种情况下**体检不通过**,并且说清该改什么。
+fn core_dump_hygiene() -> bool {
+    let mut limit = nix::libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { nix::libc::getrlimit(nix::libc::RLIMIT_CORE, &mut limit) } != 0 {
+        // 问不出来就照实说问不出来,不猜。这不是"通过了",也不是"没通过"。
+        println!("  core dumps ............... UNKNOWN (could not read RLIMIT_CORE)");
+        return true;
+    }
+
+    if limit.rlim_cur == 0 {
+        println!("  core dumps ............... disabled (RLIMIT_CORE is 0)");
+        return true;
+    }
+
+    if cfg!(target_os = "linux") {
+        println!(
+            "  core dumps ............... allowed ({}) but this region is excluded (MADV_DONTDUMP)",
+            describe_limit(limit.rlim_cur)
+        );
+        return true;
+    }
+
+    println!(
+        "  core dumps ............... ALLOWED ({}) AND THIS PLATFORM HAS NO MADV_DONTDUMP",
+        describe_limit(limit.rlim_cur)
+    );
+    println!(
+        "      A crash would write the seed to a core file. This platform cannot\n\
+         \x20     exclude the locked region the way Linux does, so the limit is the\n\
+         \x20     only thing standing there. Set it to 0 for whatever starts the\n\
+         \x20     daemon (`ulimit -c 0`, launchd's `SoftResourceLimits`, systemd's\n\
+         \x20     `LimitCORE=0`)."
+    );
+    false
+}
+
+fn describe_limit(value: u64) -> String {
+    if value == nix::libc::RLIM_INFINITY {
+        "unlimited".to_string()
+    } else {
+        format!("{value} bytes")
+    }
 }
 
 /// 目录和 `device.secret` 的卫生。

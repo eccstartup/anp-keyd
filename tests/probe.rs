@@ -197,3 +197,91 @@ fn a_fresh_machine_without_a_root_is_not_a_failure() {
         "the probe must not create the root directory"
     );
 }
+
+// ————————————————————————————————————————————————————————————
+// 4. core dump 那一层:报告的是真话,而且真的会拦
+// ————————————————————————————————————————————————————————————
+
+/// 体检报告里必须交代 core dump 这一层。
+///
+/// 它容易被漏掉,因为"memlock 成功了"看起来已经把内存保护说完了 —— 而
+/// `MADV_DONTDUMP` 不在,种子就可能跟着一次崩溃落到磁盘上,恰恰是 M4 #3
+/// 要防的那件事。
+#[test]
+fn the_report_accounts_for_core_dumps() {
+    let dir = TempDir::new("coredump-line");
+    let output = probe(&dir.path().join("never-created"), None);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("core dumps"),
+        "the memory section has to account for core dumps, not just mlock: {stdout}"
+    );
+}
+
+/// `MADV_DONTDUMP` 只在 Linux 上有。别的系统上照抄"DONTDUMP accepted"是句
+/// 假话,而一份体检报告里最不该有的就是假话。
+#[test]
+fn the_report_does_not_claim_dontdump_where_it_does_not_exist() {
+    let dir = TempDir::new("dontdump");
+    let output = probe(&dir.path().join("never-created"), None);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    if cfg!(target_os = "linux") {
+        assert!(stdout.contains("DONTDUMP"), "on Linux the region really is excluded: {stdout}");
+    } else {
+        assert!(
+            stdout.contains("Linux-only"),
+            "outside Linux the report must say DONTDUMP is not available: {stdout}"
+        );
+    }
+}
+
+/// **把 core dump 打开,体检必须不通过。**
+///
+/// 这一条挡的是"报告写得像回事、实际什么也没查"。限制只在 Linux 之外才
+/// 致命 —— 那边没有 `MADV_DONTDUMP` 可以把锁定区摘出去,rlimit 是唯一挡在
+/// 中间的东西 —— 所以这一条只在 Linux 之外有意义。
+///
+/// 硬上限不允许抬高的环境里,这个场景**根本构造不出来**,直接跳过:一条因为
+/// 环境而红的测试只是噪音。
+#[cfg(all(unix, not(target_os = "linux")))]
+#[test]
+fn core_dumps_enabled_make_the_probe_fail() {
+    use std::os::unix::process::CommandExt;
+
+    let dir = TempDir::new("coredump-on");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_anp-keyd"));
+    command.arg("probe").arg("--root").arg(dir.path().join("never-created"));
+    unsafe {
+        command.pre_exec(|| {
+            let limit = nix::libc::rlimit {
+                rlim_cur: nix::libc::RLIM_INFINITY,
+                rlim_max: nix::libc::RLIM_INFINITY,
+            };
+            if nix::libc::setrlimit(nix::libc::RLIMIT_CORE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let Ok(output) = command.output() else {
+        // 抬不动 RLIMIT_CORE —— 这台机器上构造不出这个场景。
+        return;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // 先说它**确实跑到了那一行**。少了这一句,"非零退出"也可能是因为别的
+    // 原因失败,而那和这条测试想守的东西毫无关系。
+    assert!(
+        stdout.contains("core dumps ............... ALLOWED"),
+        "the child should have seen a raised limit and said so: {stdout}"
+    );
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "with core dumps enabled and no MADV_DONTDUMP to exclude the region, a \
+         crash would write the seed to disk — the probe must not call that ok: {stdout}"
+    );
+}
+
