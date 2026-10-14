@@ -641,8 +641,11 @@ connectx 有两个接缝,要挑对的那一个:
 1. **DID 推导 —— 已核,两边逐字节一致。** connectx 的 `ed25519Fingerprint`
    (`src/core/crypto/fingerprint.ts`:RFC 7638 JWK → SHA-256 → base64url 无填充)和守护
    进程走的 `anp` 上游 `compute_multikey_fingerprint` 是同一串字节 —— 拿 connectx 自己的
-   测试向量独立算过,对上(`e1_UDDReOZl1ipXAfp9wYsm13sDBMK5og--QWdBjzuf6o4`)。剩下的
-   是**在仓库里加一条向量测试把它钉住**,免得哪一边以后悄悄改了编码。
+   测试向量独立算过,对上(`e1_UDDReOZl1ipXAfp9wYsm13sDBMK5og--QWdBjzuf6o4`)。**已经
+   钉住了**(2026-10-14):`tests/vectors/anp_sdk_ed25519_fingerprint.json` —— 种子、
+   公钥、JWK 的 `x`、规范化 JSON、SHA-256、`e1_` 段逐项比。只比最后那 46 个字符是
+   不够的:两边各错一处、恰好抵消,看上去照样是绿的。记录在
+   [TODO-archive.md](TODO-archive.md) 的「追加二」。
 2. **awiki-cli-rs2 的接缝 —— 已核,结论在 §八。** 它已有一层 `IdentitySigner`,方法
    形状就是 §3.1 / §3.2 那两条;而且 `AnpIdentitySigner` 已经是"custody 在别处"的
    现成先例,keyd 照它再做一份即可。注册不发 `challenge_signature`。**剩下要单独想
