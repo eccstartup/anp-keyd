@@ -109,3 +109,15 @@ security-framework-sys = { version = "2.14", optional = true }
 # 说话,别的平台上那个设备不存在。目标门控是必须的,不是整洁。
 [target.'cfg(target_os = "linux")'.dependencies]
 tss-esapi = { version = "7.7", optional = true }
+
+# ————————————————————————————————————————————————————————————————————————
+# 构建产物的大小。**同样放在末尾是有意的** —— 理由和上面那段一样。
+# ————————————————————————————————————————————————————————————————————————
+
+# 只压依赖,不压自己:anp-keyd 的帧照旧带完整的类型和变量,依赖的帧退到
+# 行号表(文件 + 行号还在,`args` 之类没了)。实测全新默认构建的 deps 从
+# 762M 掉到 626M。目标目录里更大的那几 G 不在这里,而是历次特性组合攒下的
+# 变体(`cargo clean --profile dev` 才是那一刀)。
+# 想连依赖的变量也留,把 "line-tables-only" 换成 2;想一个字节都不留,换成 false。
+[profile.dev.package."*"]
+debug = "line-tables-only"
