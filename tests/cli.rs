@@ -949,6 +949,25 @@ fn signing_without_a_daemon_says_it_cannot_connect() {
     outcome.expect_failure();
 }
 
+/// `audit/` 里那些日志行的原文,按月份文件拼起来。
+///
+/// 只收 `.jsonl`:同一个目录里还躺着 `.anchor`(累计条数 + 末行哈希),
+/// 把它当日志读会得到一行解不出来的 JSON。
+fn audit_text(dir: &TempDir) -> String {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir.path().join("audit"))
+        .expect("audit/ exists")
+        .map(|entry| entry.expect("a readable directory entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .collect();
+    files.sort();
+    files
+        .iter()
+        .map(|path| {
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        })
+        .collect()
+}
+
 /// 审计日志里**没有密钥材料**,而且记下了刚才那次签名。
 ///
 /// 这一条和 `tests/no_key_material_on_disk.rs` 是一对:那一份扫的是整棵
@@ -966,23 +985,34 @@ fn the_audit_log_records_the_signature_and_holds_no_secrets() {
     unlock(&dir, &did).expect_ok();
     sign(&dir, &did).expect_ok();
 
-    let log = std::fs::read_dir(dir.path().join("audit"))
-        .expect("audit/ exists")
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
-        .expect("a monthly shard");
-    let text = std::fs::read_to_string(&log).unwrap();
+    let text = audit_text(&dir);
 
     assert!(
         text.contains("\"event\":\"SIGNED\""),
         "the signature must be recorded:\n{text}"
     );
     assert!(text.contains(&did), "and it must say which key signed:\n{text}");
+
+    // 这条路走下来一共四件事,**一件都不能少**:身份是什么时候生的、文档是
+    // 什么时候写下去的、什么时候被解锁、什么时候签的。少一件就是一条事后
+    // 答不上来的问题 —— 生成和发布这两条以前恰好是少的。
+    for event in ["KEYGEN", "PUBLISHED", "UNLOCKED", "SIGNED"] {
+        assert!(
+            text.contains(&format!("\"event\":\"{event}\"")),
+            "{event} must be recorded as well:\n{text}"
+        );
+    }
+    assert!(
+        text.contains("\"hardware\":\"none\""),
+        "the keygen record must say what the envelope is bound to — an unbound\n\
+         envelope and one bound to a chip are not the same thing:\n{text}"
+    );
+
     assert!(!text.contains(PASSPHRASE), "the passphrase must never reach the log");
 
     // 字段名是一个**封闭集合**,这就是"日志里没有秘密"的测法 —— 一个能装
     // 种子的字段一旦被加进来,这里立刻红,而不是等谁去想到它。
-    const FIELDS: [&str; 9] = [
+    const FIELDS: [&str; 11] = [
         "seq",
         "at",
         "prev",
@@ -992,6 +1022,11 @@ fn the_audit_log_records_the_signature_and_holds_no_secrets() {
         "kid",
         "covered",
         "signature_base_digest",
+        // 后加的两个:一个是硬件根的名字(`none` / `secure-enclave` …),
+        // 一个是文档规范化之后那 43 个字符的摘要。两个都是**算出来的短值**,
+        // 装不下密钥材料 —— 这正是加进这个集合的门槛。
+        "hardware",
+        "document_digest",
     ];
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         let event: serde_json::Value = serde_json::from_str(line).expect("one event per line");
@@ -1003,6 +1038,81 @@ fn the_audit_log_records_the_signature_and_holds_no_secrets() {
             );
         }
     }
+}
+
+/// **一份文档的一生:写下去的那条、和取件那条,摘要是同一个算出来的。**
+///
+/// 这是 `document_digest` 这个字段全部的用处 —— 一个摘要能在整份日志里被
+/// 搜出来,把"什么时候写的、谁什么时候取走的"串成一条线。两处各自算各自的
+/// 摘要(一个从内存里那份签好的文档,一个从磁盘上读回来的字节),对不上
+/// 就等于这条线从一开始是断的,而症状是"事后比对时发现对不上",那时候
+/// 已经没人能回头查了。
+#[test]
+fn the_same_digest_links_the_publish_to_the_read() {
+    let dir = TempDir::new("digest-life");
+    let did = keygen(&dir, "bot");
+    let published = run_in_terminal(dir.path(), &["publish", "--did", &did], &default_rules());
+    let published = published.expect_ok();
+
+    // 拿 `publish` 自己说的路径去读,不在测试里重算内部布局 —— 布局是内部
+    // 的事(和 `document_prints_the_published_bytes_without_unlocking` 同一个理由)。
+    let path = published
+        .lines()
+        .find_map(|line| line.strip_prefix("wrote "))
+        .expect("publish says where it wrote the document")
+        .trim()
+        .to_string();
+    let on_disk: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("the published document")).unwrap();
+    let expected = anp_keyd::did::lifecycle::document_digest(&on_disk).expect("a digest");
+
+    let _daemon = Daemon::start(&dir);
+    run(dir.path(), &["document", "--did", &did]).expect_ok();
+
+    let text = audit_text(&dir);
+    let line_with = |event: &str| {
+        text.lines()
+            .find(|line| line.contains(&format!("\"event\":\"{event}\"")))
+            .unwrap_or_else(|| panic!("no {event} record:\n{text}"))
+            .to_string()
+    };
+
+    assert!(
+        line_with("PUBLISHED").contains(&expected),
+        "the publish record must carry the digest of the bytes it wrote:\n{text}"
+    );
+    assert!(
+        line_with("DOCUMENT_READ").contains(&expected),
+        "and the read record must carry the digest of the bytes it handed back — \n\
+         same document, same digest:\n{text}"
+    );
+}
+
+/// **`publish --out` 在本机什么都没改,所以日志里一个字都不该多出来。**
+///
+/// 它只产出一个文件给别人去部署,`dids/` 里那份还是旧的就还是旧的。记成
+/// 一次"发布"会让人以为本地那份文档是它 —— 而本地那一份正是别人验签时
+/// 比对的对象。
+#[test]
+fn publishing_to_a_file_leaves_no_record_on_this_machine() {
+    let dir = TempDir::new("publish-out");
+    let did = keygen(&dir, "bot");
+    let before = audit_text(&dir);
+
+    let out = dir.path().join("out");
+    let published = run_in_terminal(
+        dir.path(),
+        &["publish", "--did", &did, "--out", out.to_str().expect("a UTF-8 temp path")],
+        &default_rules(),
+    );
+    published.expect_ok();
+
+    assert!(out.join("did.json").exists(), "前提:文件确实写出来了");
+    assert_eq!(
+        audit_text(&dir),
+        before,
+        "a document written to a directory that is not the store changes nothing here"
+    );
 }
 
 // ========================================================================

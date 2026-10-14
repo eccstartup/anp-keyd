@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::audit::{AuditLog, Event};
 use crate::client::Client;
 use crate::crypto::kdf::Argon2Config;
 use crate::daemon::peer::{BinaryIdentity, PeerPolicy};
@@ -33,6 +34,7 @@ use crate::did::did_url_path;
 use crate::did::SpecFile;
 use crate::error::{KeydError, Result};
 use crate::keystore::layout::KeydLayout;
+use crate::keystore::record::HardwareRoot;
 use crate::keystore::{device, store};
 use crate::tty;
 
@@ -1094,6 +1096,22 @@ fn keygen(root: Option<&Path>, args: KeygenArgs) -> Result<()> {
         args.hardware.choice,
     )?;
 
+    // 落审计:这台机器上多出来一把身份。**和 `import` 那条对称** —— 那条
+    // 记的是"别人那份身份搬到了这里",这条记的是"这里自己生了一把";只记
+    // 前者,事后问"这个 DID 什么时候出现的"就漏掉最常走的那条路。
+    //
+    // 位置在**打印之前**:先落账,再告诉人它成了。反过来的话,一条记录写不
+    // 下去的机器上,人照样会拿到一个 DID 去发布 —— 而那个 DID 在日志里不
+    // 存在,正是这个文件要防的那种"说不清"。
+    //
+    // `hardware` 取自**刚写下去的那个信封**,不是命令行上要的那个。
+    let mut audit = AuditLog::open(&layout.audit_dir())?;
+    audit.append(&Event::Keygen {
+        did: created.did.clone(),
+        kid: created.verification_method.clone(),
+        hardware: created.wrapped.hardware.as_ref().map_or("none", HardwareRoot::kind).to_string(),
+    })?;
+
     // 只打印 DID,不打印文档。文档还没签名,落盘只会让人以为它已经发布了;
     // 签名是 `publish` 的事,因为它需要私钥在场 —— 而这里已经没有私钥了。
     println!("{}", created.did);
@@ -1209,6 +1227,16 @@ fn publish(root: Option<&Path>, args: PublishArgs) -> Result<()> {
         }
         None => {
             store::write_did_document(&layout, &args.did, &signed)?;
+            // 文档落了本地那一份,才算一次本机状态变更 —— 所以记在**写之后**,
+            // 而且记的是写下去的那串字节的摘要(规范化 JSON 的 SHA-256,和
+            // 取件那条 `DOCUMENT_READ` 同一个函数,两者事后能对上)。
+            // `--out` 那一支不记,理由见 `Event::Published`。
+            let digest = lifecycle::document_digest(&signed)?;
+            let mut audit = AuditLog::open(&layout.audit_dir())?;
+            audit.append(&Event::Published {
+                did: args.did.clone(),
+                document_digest: digest,
+            })?;
             layout.did_path(&args.did)
         }
     };

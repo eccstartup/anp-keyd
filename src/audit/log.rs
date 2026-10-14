@@ -22,9 +22,15 @@
 //! 的文件在数学上不存在，总得有一个链外的锚。所以旁边多放了一个
 //! `.anchor`，记着行数和末行哈希，每次追加后一起落盘。
 //!
-//! 于是**能检出**：文件被截断、被回滚到某个旧版本（只要锚没被一起改）。
-//! **不能检出**：有人同时改了 `.jsonl` 和 `.anchor` —— 那需要把锚放到
-//! 这台机器之外（另一台主机、或者一个只可追加的远端），v1 不做。
+//! 链是**跨月**的（一份日志就是一条链，不是每个月各一条），所以上面第一条
+//! 对**已经过去的月份**同样成立 —— 前提是有人真去走那一段。[`AuditLog::open`]
+//! 每次打开都从最早那份月份文件一路走到现在，走的就是整条链；早先它只验当
+//! 前这个月，"改掉一个旧月份"因此在没人看的那一段上溜过去。
+//!
+//! 于是**能检出**：某一行被改、被删、被挪位（链断）；文件被截断或被回滚到
+//! 某个旧版本（锚对不上）；某个更早的月份被整份删掉（链接不回它该接的那
+//! 一行）。**不能检出**：有人同时改了 `.jsonl` 和 `.anchor` —— 那需要把锚
+//! 放到这台机器之外（另一台主机、或者一个只可追加的远端），v1 不做。
 //! 所以这里给的是**篡改留痕**，不是**篡改免疫**。把话说清楚比给一个
 //! 听起来更强、实际做不到的承诺要好。
 
@@ -164,6 +170,37 @@ pub enum Event {
         source: String,
         document_digest: String,
     },
+    /// 这台机器自己生出来一把绑定密钥。
+    ///
+    /// 和 [`Event::Import`] 是同一个问题的两面:那条记的是"**别人那份**身份
+    /// 被搬到了这台机器上",这条记的是"**这台机器自己**凭空多出来一把"。
+    /// 只记导入等于留一个洞 —— 事后问"这个 DID 是什么时候在这儿出现的",
+    /// 最常走的那条路(本地 `keygen`)反而答不上来。
+    ///
+    /// `hardware` 是**信封里实际落地的那一份**(没绑就是 `"none"`),不是
+    /// 命令行上要的那个 —— 和 [`Event::Signed`] 的 `covered` 同一个道理:
+    /// 记的是结果,不是意图。它用的词和 `--hardware` 的取值逐字相同
+    /// ([`crate::keystore::record::HardwareRoot::kind`])。
+    Keygen {
+        did: String,
+        kid: String,
+        /// `none` / `secure-enclave` / `tpm` / `software`。
+        hardware: String,
+    },
+    /// 一份文档被写成了本机发布的那一份(`dids/<did>.json`)。
+    ///
+    /// **记摘要,而且和 [`Event::DocumentRead`] / [`Event::RotateHot`] 那几条
+    /// 用的是同一个函数**(规范化 JSON 的 SHA-256)—— 于是把一个摘要在整份
+    /// 日志里搜一遍,得到的就是这份文档的一生:谁什么时候写下去的、谁什么
+    /// 时候取走的、什么时候被改的。
+    ///
+    /// **`publish --out DIR` 不记。** 那条路只产出一个文件、本机一个字节都
+    /// 没变(本地 `dids/` 里那份还是旧的就还是旧的),记下来会让人以为本地
+    /// 那份文档是它。
+    Published {
+        did: String,
+        document_digest: String,
+    },
 }
 
 /// `.anchor` 的内容。
@@ -214,21 +251,22 @@ pub struct AuditLog {
 }
 
 impl AuditLog {
-    /// 打开（或新建）审计目录，并**先把整个链验一遍**。
+    /// 打开（或新建）审计目录，并**先把整条链走一遍**。
     ///
     /// 校验放在打开时而不是某个定时任务里：一份被改过的审计日志必须在
     /// 守护进程开始往上追加之前就被发现，否则新的记录会接在一个断掉的
     /// 链后面，把断点掩盖成"看起来一直是这样"。
     ///
-    /// # 链是**跨月**延续的，所以起点不总是 `GENESIS`
+    /// # 走的是**整份历史**，不只是这个月
     ///
-    /// [`AuditLog::rotate_if_needed`] 换月不重置链 —— 于是本月那个文件的第一
-    /// 行的 `prev` 指向的是**上个月最后一行**，不是 `GENESIS`。从 `GENESIS`
-    /// 硬验会把一次正常的换月读成"第 1 行断了"，也就是一次假篡改警报。起点
-    /// 因此要从上一个存在过的月份文件里取（没有上个月文件才是 `GENESIS`）。
+    /// 链跨月延续（[`AuditLog::rotate_if_needed`] 换月不重置），所以起点是
+    /// **最早那份月份文件的第一行** —— 那里必须是链的头（`prev = GENESIS`），
+    /// 之后每一份都接上前一份的末行，一直走到这个月。见 [`verify_history`]。
     ///
-    /// 覆盖面和以前一样：只验当前这个月的文件，历史上的月份文件在它们自己的
-    /// 那个月里被验过。变的只是起点，不是验了多少。
+    /// 早先这里只验当前这个月那个文件、起点取上个月末行，于是"改掉一个**已经
+    /// 过去的**月份"是看不见的：那一刀落在没人看的那一段上。走完整条链是有
+    /// 代价的（每次打开读一遍全部历史），但**这个代价躲不掉**：要发现旧月份
+    /// 被改过，就得把旧月份读一遍，没有更便宜的办法。
     pub fn open(dir: &Path) -> Result<Self> {
         fs::create_dir_all(dir)?;
         fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
@@ -242,22 +280,12 @@ impl AuditLog {
         let (records, tail, written) = {
             let _guard = exclusive_lock(dir)?;
 
-            // `(0, GENESIS)` 就是"上个月之前什么都没有"，也正是新目录的起点。
-            let start = match previous_month_file(dir, &month) {
-                Some(previous) => last_record(&previous)?,
-                None => (0, GENESIS),
-            };
-
-            let existing = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-            let (records, tail) = match existing {
-                // 这个月还没有记录：接着上个月的状态往下走，否则本月的第一条
-                // 会拿到一个 `prev = GENESIS` 的、谁都能伪造的新起点。
-                0 => start,
-                _ => verify_chain_from(&path, start)?,
-            };
-            // 锚文件对不上 = 上次之后这个文件被截断或被回滚过。
+            let (records, tail) = verify_history(dir, &month)?;
+            // 锚文件对不上 = 上次之后这个文件被截断或被回滚过（或者最后那几个
+            // 月份文件没了）。
             check_anchor(dir, records, &tail)?;
-            (records, tail, existing)
+            let written = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+            (records, tail, written)
         };
 
         let file = open_append(&path)?;
@@ -419,12 +447,14 @@ fn exclusive_lock(dir: &Path) -> Result<Flock<File>> {
 ///
 /// **不从头验链，两件事都刻意不做。**
 ///
-/// 一是不验链：那是 [`AuditLog::open`] 的活儿，只在打开时付一次；这里是
-/// 热路径上每写一行都要过的对账。
+/// 一是不验链：那是 [`AuditLog::open`] 的活儿（一次 [`verify_history`]），只在
+/// 打开时付一次；这里是热路径上每写一行都要过的对账。
 ///
 /// 二是**不从 GENESIS 验**：链跨月延续（见 [`AuditLog::rotate_if_needed`]），
 /// 所以一个非首月的文件第一行的 `prev` 指的不是 GENESIS。拿 GENESIS 当起点
-/// 去验一个换过月的文件，第一行就会"断链"——那是把一次正常的换月读成篡改。
+/// 去验**单独一份**换过月的文件，第一行就会"断链"——那是把一次正常的换月读成
+/// 篡改。（整条链是可以从 GENESIS 验的，因为那时候手上还有它前面那些文件；
+/// 这里没有。）
 ///
 /// 末行哈希就是下一条的 `prev`，`seq` 就是下一条的前一号，两个都在这一行里，
 /// 所以这里不需要别处再记一份状态。
@@ -464,8 +494,10 @@ fn last_record(path: &Path) -> Result<(u64, [u8; 32])> {
 /// `seq` 因此是**被验过的一环**：每一行必须正好比前一行大 1。今天不改这个
 /// 字段的编辑检不出来（行数不变），加上它之后检得出来。
 ///
-/// 任何一行对不上就报**第几行** —— "审计日志坏了"这种消息没法查。
+/// 任何一行对不上就报**是哪一份文件的第几行** —— "审计日志坏了"这种消息没法
+/// 查，而链现在跨好几份文件，"第 3 行"不说清是哪一份也一样没法查。
 fn verify_chain_from(path: &Path, start: (u64, [u8; 32])) -> Result<(u64, [u8; 32])> {
+    let file = file_name(path);
     let text = fs::read_to_string(path)?;
     let mut prev = start.1;
     let mut records = start.0;
@@ -474,32 +506,43 @@ fn verify_chain_from(path: &Path, start: (u64, [u8; 32])) -> Result<(u64, [u8; 3
         let number = index + 1;
         if line.trim().is_empty() {
             return Err(KeydError::Protocol(format!(
-                "audit line {number} is blank; a gap in an append-only log means it was rewritten"
+                "{file} line {number} is blank; a gap in an append-only log means it was rewritten"
             )));
         }
 
         let parsed: serde_json::Value = serde_json::from_str(line).map_err(|e| {
-            KeydError::Protocol(format!("audit line {number} is not readable JSON: {e}"))
+            KeydError::Protocol(format!("{file} line {number} is not readable JSON: {e}"))
         })?;
         let claimed = parsed
             .get("prev")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| KeydError::Protocol(format!("audit line {number} has no prev")))?;
+            .ok_or_else(|| KeydError::Protocol(format!("{file} line {number} has no prev")))?;
 
         if claimed != hex(&prev) {
-            return Err(KeydError::Protocol(format!(
-                "the audit chain breaks at line {number}: it links to a record that is not \
-                 the one before it, so a line was changed, removed, or moved"
-            )));
+            // 断在第一行是**另一类事故**：不是"中间哪一行被改了"，而是它该接的
+            // 那一整段不在（更早的月份文件没了，或者它该接的那条记录被重写了）。
+            // 两种原因说在一起 —— 它们在这份文件里长得一模一样，而这里不该替
+            // 人猜。
+            return Err(KeydError::Protocol(if number == 1 {
+                format!(
+                    "the audit chain breaks at line 1 of {file}: either an earlier month's file \
+                     is missing, or the record it should link to was rewritten"
+                )
+            } else {
+                format!(
+                    "the audit chain breaks at line {number} of {file}: it links to a record that \
+                     is not the one before it, so a line was changed, removed, or moved"
+                )
+            }));
         }
 
         let seq = parsed
             .get("seq")
             .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| KeydError::Protocol(format!("audit line {number} has no seq")))?;
+            .ok_or_else(|| KeydError::Protocol(format!("{file} line {number} has no seq")))?;
         if seq != records + 1 {
             return Err(KeydError::Protocol(format!(
-                "audit line {number} is record {seq} but {records} records come before it; \
+                "{file} line {number} is record {seq} but {records} records come before it; \
                  a line was removed or a record was given the wrong number"
             )));
         }
@@ -511,23 +554,52 @@ fn verify_chain_from(path: &Path, start: (u64, [u8; 32])) -> Result<(u64, [u8; 3
     Ok((records, prev))
 }
 
-/// 这个月**之前**最后一个有记录的月份文件。
+/// 报错时用的文件名。链跨好几份文件,"第几行"必须说清是哪一份里的。
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// **从最早那份月份文件一路走到 `upto`**,把整条链验一遍。
 ///
-/// 文件名是 `YYYY-MM.jsonl`，所以按字节序排就是按时间排，取"比当前月小的
-/// 里面最大的那个"即可。跳过没有记录的月份不影响正确性 —— 链只在写的时候
-/// 延续，没写的月份本来就没有文件。
-fn previous_month_file(dir: &Path, month: &str) -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = fs::read_dir(dir)
-        .ok()?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
+/// 返回（末条 `seq`，末行哈希）—— 也就是下一条记录该接的那个状态。
+///
+/// # 起点是链的头,不是"上个月末行"
+///
+/// 链跨月延续（见 [`AuditLog::rotate_if_needed`]）,所以中间每一份文件的起点
+/// 都是前一份的末行;而**最早那份的起点只能是 `GENESIS`**。它不是的话,要么
+/// 更早的月份文件被人删了,要么整条链是重写出来的 —— 两种都要报,而不是当成
+/// "这份日志就是从这个月开始的"。
+///
+/// 这正是"改掉一个已经过去的月份"能被看见的地方:那些文件不属于"这个月",
+/// 但它们在链上,走一遍就躲不过去。
+///
+/// `upto` **之后**的月份文件不参与:那是时钟跳到未来留下的东西,把它接进链里
+/// 会让"哪一头是新的"变得可疑。这个函数回答的是"到现在为止这段历史对不对"。
+fn verify_history(dir: &Path, upto: &str) -> Result<(u64, [u8; 32])> {
+    let mut state = (0u64, GENESIS);
+    for path in history_files(dir, upto)? {
+        state = verify_chain_from(&path, state)?;
+    }
+    Ok(state)
+}
+
+/// `upto` 这个月（含）之前的全部月份文件,按时间排。
+///
+/// 文件名是 `YYYY-MM.jsonl`,所以按字节序排就是按时间排。**只收 `.jsonl`** ——
+/// 同一个目录里还躺着 `.anchor` 和 `.lock`,把它们当月份文件读进来会得到一行
+/// 解不出来的东西,而那会被报成"日志被改写",是一次假警报。
+fn history_files(dir: &Path, upto: &str) -> Result<Vec<PathBuf>> {
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| {
             let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
-            name.ends_with(".jsonl") && name.trim_end_matches(".jsonl") < month
+            name.strip_suffix(".jsonl").is_some_and(|stamp| stamp <= upto)
         })
         .collect();
-    candidates.sort();
-    candidates.pop()
+    files.sort();
+    Ok(files)
 }
 
 /// 锚和文件对不对得上。
@@ -1134,73 +1206,75 @@ mod tests {
     // 换月
     // ————————————————————————————————————————————————————————————
 
-    /// 造出"上个月写了 `before` 条，这个月又写了 `this_month` 条"之后的磁盘状态。
+    /// 造出一段**跨好几份月份文件**的历史，链是连续的，锚也一起落好。
     ///
-    /// 返回（上个月文件的末条 `seq`，它的哈希）。这**就是**换月之后的真实
-    /// 磁盘样子，不用等一个月：链跨文件延续，所以本月文件第一行的 `prev`
-    /// 指的不是 `GENESIS`。
-    fn roll_over(d: &TempDir, before: u64, this_month: u64) -> (u64, [u8; 32]) {
-        let last_month = "2001-01.jsonl";
-        let mut tail = GENESIS;
-        let mut seq = 0;
-        let mut previous = String::new();
-        for uid in 0..before {
-            let line = format!(
-                r#"{{"seq":{},"at":"2001-01-01T00:00:00Z","prev":"{}","event":"UNLOCKED","uid":{},"did":"d"}}"#,
-                seq + 1,
-                hex(&tail),
-                500 + uid
-            );
-            tail = sha256(line.as_bytes());
-            seq += 1;
-            previous.push_str(&line);
-            previous.push('\n');
-        }
-        fs::write(d.path().join(last_month), previous).unwrap();
-        let last_month_tail = (seq, tail);
+    /// 参数是（月份，条数），按时间排。返回每个月**写完之后**的状态 ——
+    /// （末条 `seq`，末行哈希）。0 条的月份不落文件：链只在写的时候延续，
+    /// 那个月本来就没有文件。
+    ///
+    /// 这**就是**真跑几个月之后的磁盘样子，不用等几个月：链跨文件延续，所以
+    /// 非首月文件的第一行 `prev` 指的不是 `GENESIS`。
+    fn write_history(d: &TempDir, months: &[(&str, u64)]) -> Vec<(u64, [u8; 32])> {
+        let mut state = (0u64, GENESIS);
+        let mut states = Vec::new();
 
-        let mut this = String::new();
-        for uid in 0..this_month {
-            let line = format!(
-                r#"{{"seq":{},"at":"2001-02-01T00:00:00Z","prev":"{}","event":"UNLOCKED","uid":{},"did":"d"}}"#,
-                seq + 1,
-                hex(&tail),
-                600 + uid
-            );
-            tail = sha256(line.as_bytes());
-            seq += 1;
-            this.push_str(&line);
-            this.push('\n');
+        for (month, count) in months {
+            let mut text = String::new();
+            for _ in 0..*count {
+                let line = format!(
+                    r#"{{"seq":{},"at":"{month}-01T00:00:00Z","prev":"{}","event":"UNLOCKED","uid":{},"did":"d"}}"#,
+                    state.0 + 1,
+                    hex(&state.1),
+                    500 + state.0
+                );
+                state = (state.0 + 1, sha256(line.as_bytes()));
+                text.push_str(&line);
+                text.push('\n');
+            }
+            if !text.is_empty() {
+                fs::write(d.path().join(format!("{month}.jsonl")), text).unwrap();
+            }
+            states.push(state);
         }
-        if !this.is_empty() {
-            // 本月文件叫这个名字，`open()` 才找得到它。
-            fs::write(d.path().join(format!("{}.jsonl", current_month())), this).unwrap();
-        }
+
         fs::write(
             d.path().join(".anchor"),
-            serde_json::to_vec(&Anchor { records: seq, tail: hex(&tail) }).unwrap(),
+            serde_json::to_vec(&Anchor { records: state.0, tail: hex(&state.1) }).unwrap(),
         )
         .unwrap();
 
-        last_month_tail
+        states
     }
 
-    /// **`previous_month_file` 挑的是比当前月小的里面最大的那个。**
+    /// 造出"上个月写了 `before` 条，这个月又写了 `this_month` 条"之后的磁盘状态。
+    ///
+    /// 返回（上个月文件的末条 `seq`，它的哈希）。
+    fn roll_over(d: &TempDir, before: u64, this_month: u64) -> (u64, [u8; 32]) {
+        let month = current_month();
+        write_history(d, &[("2001-01", before), (month.as_str(), this_month)])[0]
+    }
+
+    /// **`history_files` 收的是到 `upto` 为止的全部月份文件，按时间排。**
     #[test]
-    fn the_previous_month_file_is_the_latest_one_before_now() {
+    fn the_history_files_are_every_month_up_to_now() {
         let d = dir();
-        for name in ["1999-01.jsonl", "2001-01.jsonl", "2001-06.jsonl", "2001-09.jsonl"] {
+        for name in ["2001-06.jsonl", "1999-01.jsonl", "2001-09.jsonl", "2001-01.jsonl"] {
             fs::write(d.path().join(name), b"").unwrap();
         }
-        // 不是月份文件的不算，哪怕名字排在后面 —— 换月的起点必须是审计文件。
+        // 不是月份文件的不算 —— 同一个目录里躺着 `.anchor` 和 `.lock`。
         fs::write(d.path().join("notes.txt"), b"x").unwrap();
-        fs::write(d.path().join("2026-10.anchor"), b"x").unwrap();
+        fs::write(d.path().join(".anchor"), b"x").unwrap();
 
-        let picked = previous_month_file(d.path(), "2001-10").unwrap();
-        assert_eq!(picked.file_name().unwrap(), "2001-09.jsonl");
+        let files = history_files(d.path(), "2001-10").unwrap();
+        let names: Vec<&str> = files
+            .iter()
+            .map(|path| path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, ["1999-01.jsonl", "2001-01.jsonl", "2001-06.jsonl", "2001-09.jsonl"]);
 
-        // 比它大的一个都不该被选中。
-        assert_eq!(previous_month_file(d.path(), "1998-12"), None);
+        // 比它大的一个都不算：那是时钟跳到未来留下的东西，接进链里只会让
+        // "哪一头是新的"变得可疑。
+        assert!(history_files(d.path(), "1998-12").unwrap().is_empty());
     }
 
     /// **跨过一次月边界，`open()` 照样通过，链接着走。**
@@ -1262,6 +1336,79 @@ mod tests {
 
         let err = AuditLog::open(d.path()).unwrap_err();
         assert!(err.to_string().contains("breaks at line 1"), "{err}");
+    }
+
+    /// **改掉一个**更早**的月份 —— 这一刀以前是看不见的。**
+    ///
+    /// 三个月份文件，改的是**最早**那份里的**第一行**：同一份文件里的第二行
+    /// 立刻会对不上。以前 `open()` 只从上个月末行起验本月那份文件，那个文件
+    /// 从头到尾没人看。
+    ///
+    /// 报错要说清是**哪一份文件**的第几行 —— "第 2 行"在一份跨月的日志里
+    /// 什么都不说明。
+    #[test]
+    fn editing_a_record_in_an_old_month_is_caught() {
+        let d = dir();
+        write_history(&d, &[("2001-01", 2), ("2001-02", 2), ("2001-03", 2)]);
+        // 前提：这份历史本身是干净的（不然下面红的原因可能是别的）。
+        assert_eq!(AuditLog::open(d.path()).unwrap().records(), 6);
+
+        let old = d.path().join("2001-01.jsonl");
+        let text = fs::read_to_string(&old).unwrap();
+        let edited = text.replacen("\"uid\":500", "\"uid\":999", 1);
+        assert_ne!(text, edited, "the fixture did not actually change anything");
+        fs::write(&old, edited).unwrap();
+
+        let err = AuditLog::open(d.path()).unwrap_err().to_string();
+        assert!(err.contains("breaks at line 2 of 2001-01.jsonl"), "{err}");
+    }
+
+    /// **整份旧月份文件被删掉，也检得出来。**
+    ///
+    /// 两条路各管一种：删的是**中间**那份，后面那份的第一行接不上它；删的是
+    /// **最早**那份，剩下的第一行接不回链的头。
+    #[test]
+    fn deleting_a_whole_old_month_is_caught() {
+        let history: [(&str, u64); 3] = [("2001-01", 2), ("2001-02", 2), ("2001-03", 2)];
+        let d = dir();
+        write_history(&d, &history);
+        assert_eq!(AuditLog::open(d.path()).unwrap().records(), 6);
+
+        // 中间那份：断在它后面那份的第一行。
+        fs::remove_file(d.path().join("2001-02.jsonl")).unwrap();
+        let err = AuditLog::open(d.path()).unwrap_err().to_string();
+        assert!(err.contains("breaks at line 1 of 2001-03.jsonl"), "{err}");
+
+        // 最早那份：链的头整个没了 —— 剩下的第一行接的是一条谁都看不见的记录。
+        write_history(&d, &history);
+        fs::remove_file(d.path().join("2001-01.jsonl")).unwrap();
+        let err = AuditLog::open(d.path()).unwrap_err().to_string();
+        assert!(err.contains("breaks at line 1 of 2001-02.jsonl"), "{err}");
+        assert!(
+            err.contains("an earlier month's file is missing"),
+            "the message must offer the reason that fits, not just 'the chain broke': {err}"
+        );
+    }
+
+    /// **打开之后接着写，写下去的那条接的是整段历史的末尾。**
+    ///
+    /// 守的是 [`verify_history`] 的返回值：它给的是**走得最远的那个状态**，
+    /// 不是第一份文件的、也不是"本月还算空所以就从头开始"。
+    #[test]
+    fn opening_a_multi_month_history_continues_from_its_end() {
+        let d = dir();
+        write_history(&d, &[("2001-01", 2), ("2001-02", 3)]);
+
+        let mut log = AuditLog::open(d.path()).unwrap();
+        assert_eq!(log.records(), 5, "the two months add up");
+        log.append(&sample(701)).unwrap();
+        drop(log);
+
+        let text = fs::read_to_string(d.path().join(format!("{}.jsonl", current_month()))).unwrap();
+        let record: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(record["seq"], 6, "{text}");
+        assert_ne!(record["prev"], hex(&GENESIS), "it must continue the chain, not restart it");
+        assert_eq!(AuditLog::open(d.path()).unwrap().records(), 6);
     }
 
     /// 记录里的 `seq` 也是被验的一环：凭空插一条编号不对的会被拦下。

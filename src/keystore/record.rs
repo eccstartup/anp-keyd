@@ -176,6 +176,21 @@ pub enum HardwareRoot {
     Software { tag: String },
 }
 
+impl HardwareRoot {
+    /// 这一根的名字 —— **和 `--hardware` 的取值、以及
+    /// [`crate::keystore::hardware::known_names`] 那套逐字相同**。
+    ///
+    /// 审计里记的是这个词。同一个东西在两个地方有两个名字,事后拿日志去
+    /// 对照命令行的人会对不上;所以这里的字面量和 `FromStr` 那一侧同源。
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::SecureEnclave { .. } => "secure-enclave",
+            Self::Tpm { .. } => "tpm",
+            Self::Software { .. } => "software",
+        }
+    }
+}
+
 /// v1:口令 + `device.secret`,两路熵。
 pub const RECORD_VERSION: u8 = 1;
 
