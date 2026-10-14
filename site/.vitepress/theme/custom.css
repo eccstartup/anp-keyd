@@ -1,0 +1,48 @@
+/*
+ * 默认主题的字体栈是照西文排的,中文落回系统默认后行高和字号都偏小。
+ * 这里只补两件事:中文优先的字体栈,和正文行高。
+ */
+
+:root {
+  --vp-font-family-base: 'Inter', -apple-system, BlinkMacSystemFont, 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', 'Source Han Sans SC', 'Noto Sans CJK SC',
+    system-ui, sans-serif;
+  --vp-font-family-mono: 'JetBrains Mono', 'SF Mono', Menlo, Consolas,
+    'Liberation Mono', monospace;
+
+  /* 正文里的粗体在中文下容易糊成一团,降一点色阶让它退成强调而不是墙。 */
+  --vp-c-brand-1: #0b6b5e;
+  --vp-c-brand-2: #0e8a78;
+  --vp-c-brand-3: #12a48f;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+/* 中英混排时标点两侧天然偏紧,给正文一点呼吸。 */
+.vp-doc p,
+.vp-doc li {
+  line-height: 1.85;
+}
+
+.vp-doc h2 {
+  margin-top: 2.75rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--vp-c-divider);
+}
+
+.vp-doc h3 {
+  margin-top: 2rem;
+}
+
+/* 文档里规格和默认值那几页表格多,给单元格加一点内边距别挤在一起。 */
+.vp-doc th,
+.vp-doc td {
+  padding: 8px 14px;
+}
+
+/* 首页 hero 里那条签名头是整页的门面,别让它被右边框截断。 */
+.home .vp-doc div[class*='language-'] {
+  overflow-x: auto;
+}

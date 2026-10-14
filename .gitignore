@@ -3,3 +3,10 @@
 # 崩溃留下的 core dump。容器里的 cwd 就是挂进来的仓库根,所以守护进程一崩,
 # 它就落在仓库根上 —— 而一份 `anp-keyd` 的 core 里可能有信封的半边秘密。
 core
+node_modules/
+
+# 文档站的产物。`design/index.md` 是从 `docs/DESIGN.md` 引出来的,
+# 不进版本库 —— 进了就等于那两份说法又变成两份了。
+site/.vitepress/dist
+site/.vitepress/cache
+site/design/index.md
