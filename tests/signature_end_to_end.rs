@@ -19,6 +19,7 @@ use anp_keyd::daemon::state::{autolock_from_secs, DaemonState, Roots, SigningGat
 use anp_keyd::daemon::wire::{SignRequest, MAX_CHALLENGE_LEN};
 use anp_keyd::daemon::{self, server, ServerConfig};
 use anp_keyd::did::document::{self, DidDocumentSpec};
+use anp_keyd::did::proof_value;
 use anp_keyd::keystore::layout::KeydLayout;
 use anp_keyd::keystore::hardware::HardwareChoice;
 use anp_keyd::keystore::{create, device, store};
@@ -382,8 +383,14 @@ async fn the_document_that_verified_the_signature_is_bound_to_the_did() {
 
     // 而且它真的是一份**签过的**文档,不是裸文档。
     assert!(running.document.get("proof").is_some(), "the document carries no proof");
+    // 上游那一版验签只读得懂裸 base64url,而我们从 2026-10-14 起发的是
+    // ANP-03 §2.5.5 要的 multibase(见 `did::proof_value`)。换回去之后它验的
+    // 还是同一批字节 —— `proofValue` 本来就不进签名输入。
     assert!(
-        anp::authentication::validate_did_document_method(&running.document, true),
+        anp::authentication::validate_did_document_method(
+            &proof_value::as_upstream_reads_it(&running.document).unwrap(),
+            true
+        ),
         "upstream rejects this document"
     );
 }

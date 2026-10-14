@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::crypto::thumbprint::e1_segment;
 use crate::did::parse::parse_did_wba;
+use crate::did::proof_value;
 use crate::error::{KeydError, Result};
 use crate::sign::{LockedSigningKey, Signer};
 
@@ -155,6 +156,12 @@ pub fn build_unsigned_with(
 /// 私钥只在 `Signer::sign` 里露一次面,而且是借出去的;`complete_w3c_proof`
 /// 会**自己拿公钥验一遍**我们刚签出来的签名,所以"签错钥匙"这种事在这里
 /// 就会当场炸掉,不会流到磁盘上。
+///
+/// **交出去之前换一次 `proofValue` 的字母表。** 上游给的是裸 base64url,
+/// 而对端(awiki-open-server、anp-sdk)只认 ANP-03 §2.5.5 那个 multibase
+/// base58btc —— 换的是同一批字节,不是重签,理由在
+/// [`crate::did::proof_value`] 的头一段。这条不换,发布出去的东西在注册
+/// 那一步会被对端原样拒掉。
 pub fn sign_document(
     document: &Value,
     key: &LockedSigningKey,
@@ -177,8 +184,10 @@ pub fn sign_document(
 
     let signature = key.sign(prepared.signing_input())?;
 
-    anp::proof::complete_w3c_proof(prepared, &signature)
-        .map_err(|e| KeydError::Upstream(format!("completing the DID document proof failed: {e}")))
+    let mut signed = anp::proof::complete_w3c_proof(prepared, &signature)
+        .map_err(|e| KeydError::Upstream(format!("completing the DID document proof failed: {e}")))?;
+    proof_value::into_multibase(&mut signed)?;
+    Ok(signed)
 }
 
 /// 从 DID 字符串 + 公钥**重建**出那份文档。
@@ -274,7 +283,8 @@ pub fn verify_path_binding(did: &str, document: &Value) -> Result<()> {
         )));
     }
 
-    if !anp::authentication::validate_did_document_binding(document, true) {
+    if !anp::authentication::validate_did_document_binding(&proof_value::as_upstream_reads_it(document)?, true)
+    {
         return Err(KeydError::Did(format!(
             "the document for {did} failed the normative did:wba binding check"
         )));
@@ -364,9 +374,24 @@ mod tests {
         assert_eq!(proof["proofPurpose"], "assertionMethod");
         assert_eq!(proof["verificationMethod"], format!("{did}#{ROOT_FRAGMENT}"));
 
-        // 上游的规范性检查会连 proof 一起验。
-        assert!(anp::authentication::validate_did_document_binding(&doc, true));
+        // 上游的规范性检查会连 proof 一起验 —— 但它只读得懂裸 base64url,
+        // 而我们发的是 multibase,所以要先把字母表换回去。
+        assert!(anp::authentication::validate_did_document_binding(
+            &proof_value::as_upstream_reads_it(&doc).unwrap(),
+            true
+        ));
         assert!(verify_path_binding(&did, &doc).is_ok());
+    }
+
+    /// 发出去的那一份必须是 ANP-03 §2.5.5 要的 multibase base58btc。
+    /// 对端只认这一种:换成别的,注册那一步会原样被拒。
+    #[test]
+    fn a_published_proof_value_is_multibase_base58btc() {
+        let (_, doc) = signed_document(9);
+        let proof_value = doc["proof"]["proofValue"].as_str().unwrap();
+        assert!(proof_value.starts_with('z'), "got {proof_value:?}");
+        let decoded = bs58::decode(&proof_value[1..]).into_vec().unwrap();
+        assert_eq!(decoded.len(), 64);
     }
 
     /// 核心攻击面:拿一份**别的钥匙**签出来的文档,冒充成这个 DID 的文档。
