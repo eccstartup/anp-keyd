@@ -441,6 +441,7 @@ mod tests {
     use crate::daemon::state::Roots;
     use crate::did::DidDocumentSpec;
     use crate::error::KeydError;
+    use crate::keystore::hardware::HardwareChoice;
     use crate::keystore::layout::{KeydLayout, SECRET_FILE_MODE};
     use crate::keystore::{create, store};
 
@@ -467,6 +468,7 @@ mod tests {
                 "default",
                 PASSPHRASE.as_bytes(),
                 Argon2Config { m_cost: 1024, t_cost: 1, p_cost: 1 },
+                HardwareChoice::None,
             )
             .unwrap();
             let wrapped = store::load(&layout, &created.wrapped.id.thumbprint).unwrap();

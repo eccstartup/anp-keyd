@@ -25,6 +25,11 @@ Signature: sig1=:VwRcADsdxfIJ5rQAXCXX3ygFsAP3l1ho+gdpNxcHzlZCdx/mef9yKzHgy9P1QzV
 方案和归档格式已经冻结,因为它们决定了别人手里那份备份打得开还是打不开。
 动这两样东西之前请先读 [docs/DESIGN.md](docs/DESIGN.md) 第三节。
 
+**硬件根(信封的第三路熵)已经写好了,但默认构建里没有。** macOS 那一半在真
+芯片上验过 ECDH;Linux/TPM 那一半**从来没有被编译过**。细节在下面的
+[硬件根](#硬件根)一节、[docs/DESIGN.md](docs/DESIGN.md) 第九节,以及还没做完
+的部分(第十节)。
+
 ## 安装
 
 需要 Rust 1.88 或更新,目前只能从源码构建:
@@ -182,16 +187,22 @@ anp-keyd sign --did … --method POST --url https://… \
 
 `--help` 是完整的参数参考。
 
-### 只在特定构建里存在的两个
+### 只在特定构建里存在的几个
 
 ```bash
-cargo install --path . --features seed-export   # 多出 export-seed
-cargo install --path . --features mcp           # 多出 mcp
+cargo install --path . --features seed-export    # 多出 export-seed
+cargo install --path . --features mcp            # 多出 mcp
+cargo install --path . --features hardware-se    # macOS:钥匙可以绑到 Secure Enclave
+cargo install --path . --features hardware-tpm   # Linux:钥匙可以绑到 TPM 2.0
 ```
 
 `export-seed` 把一把钥匙的种子导出来。默认构建里它**不存在** —— 不是"被
 拒绝",是**没有这段代码**:没有分支、没有环境变量、没有可翻的开关。理由见
 [docs/DESIGN.md](docs/DESIGN.md) 第六节。导入则相反,默认构建里就有。
+
+`--hardware` 那个开关也只在对应构建里认那几种取值 —— 一个在这个平台上压根
+不成立的取值**不会被列出来**。这正是[硬件根](#硬件根)那一节的原则:
+不给"看起来在保护、其实没有"的中间态。
 
 ### 几个不显然的默认值
 
@@ -220,19 +231,85 @@ cargo install --path . --features mcp           # 多出 mcp
   多用户,那就不过。**不知道值该填什么?** 先拿一个匹配不上的 pin 起一次,
   守护进程会把每一条被拒的连接连同**可以直接抄进命令行**的那个 pin 写进
   `log/serve.log`。
+- **`--hardware` 默认 `none`。** 硬件根是要的人开口要的东西。要了而没有,
+  是错误,不是降级 —— 见[硬件根](#硬件根)。
 
 ## 它挡什么,不挡什么
 
 **挡的:** agent 被注入之后拿不到私钥字节;同一个 uid 下的另一个进程读不到
 口令;磁盘被偷(信封的熵一半在口令、一半在 `device.secret`);审计日志被
-事后编辑。
+事后编辑;**绑了硬件根的话,连"把整个目录拷到另一台机器 + 知道口令"也不成**
+(见[硬件根](#硬件根))。
 
 **不挡的:** 同一个 uid 下的另一个 agent 冒充你(uid 是授权模型的地基,粒度
 就是 uid,要再细一层得靠可执行文件身份);你亲手把 `export-seed` 敲了一遍;
-归档文件本身的离线爆破。
+归档文件本身的离线爆破;**没绑硬件根的信封,今天仍然是一个拷贝就走得掉的
+东西**。
 
 每一条是怎么成立的、为什么某些做法被**故意**排除,见
 [docs/DESIGN.md](docs/DESIGN.md)。
+
+## 硬件根
+
+**它解决什么。** 今天信封里那两个秘密都是软件的:口令(在人脑子里)+
+`device.secret`(磁盘上 32 字节)。把 `~/.anp-keyd/` 整个拷到另一台机器、又
+知道口令,就能拿到私钥;一份离线备份也能慢慢爆破。硬件根补的是这一路:
+**再插一个不可导出、拷不走的熵源进去。**
+
+```
+HS  = 32 随机字节,由硬件封装后存进信封(hs_ciphertext)
+KEK = HKDF-SHA256( argon2id(口令) ‖ device.secret ‖ HS, salt )
+```
+
+三路少任何一路都开不了。硬件是**第三层**,不替代 `device.secret`:后者管
+"备份被拷走没用",前者管"拷到别的机器没用"。
+
+**怎么开:**
+
+```bash
+cargo install --path . --features hardware-se    # 或 --features hardware-tpm
+anp-keyd keygen --spec mybot.spec.json --hardware secure-enclave
+```
+
+认这个开关的还有 `add-recovery-key`、`rotate-hot-key`、`import-mnemonic`、
+`import-archive`。**默认是 `none`** —— 硬件是**要的人开口要**的东西,不是
+悄悄加上去的东西。v1 的信封一个字节都没改,旧信封照旧能开。
+
+**没有可用硬件根,就是拒绝生成,不降级。** 要硬件绑定而没有硬件,是一条
+错误,不是悄悄退回纯软件信封:一个看起来在保护、其实没有的信封,比一个
+老实说自己是明文的口令加 `device.secret` 更糟。
+
+**两条纪律,是有意的代价:**
+
+1. **导出现在必须在本机做。** 导出要先解信封,而解信封要硬件。所以
+   "把磁盘拷到别的机器上再导出"这条路**被硬件根关掉了** —— 这正是它的目的,
+   但代价是:**趁机器活着把那 24 个词抄下来。** 芯片坏了、机器丢了,没有第二
+   条路。
+2. **`--hardware` 绑的是这台机器。** 把绑定过的信封整个目录拷到另一台机器,
+   打不开,而且报的错会指明是少了这台机器 —— 不是"口令错"。两者可区分是
+   刻意的。
+
+**助记词和归档这两侧永远不碰硬件。** 不然芯片坏了就等于钥匙没了,等于没
+备份。导出/导入是唯一允许的搬家路径,而且那条路径的产物是一把**硬件无关**的
+钥匙。
+
+**macOS 有一条发行前置。** SE 私钥唯一的持久化机制就是钥匙串,而写钥匙串
+需要 `application-identifier` 这个 entitlement —— **它只有 Apple 签发的证书
+能给**。所以:
+
+- 未签名的二进制建**永久** SE key → `errSecMissingEntitlement`(芯片在,
+  是钥匙串拒绝)
+- ad-hoc 签名 + 手写 `keychain-access-groups` → 进程**被内核 SIGKILL**
+- ad-hoc 签名**不带**那个 entitlement → 正常运行,但 SE key 一退出就没了
+
+也就是说 SE 版本**必须以签名身份分发**,`cargo build` 的产物做不到。这是
+发行决策,不是代码里能补的一环 —— `probe` 会替你把这件事说出来,而不是
+报一个假的"通过"。
+
+**Linux/TPM 没有这道门槛。** 走 `/dev/tpmrm0`,不要 entitlement,可选绑 PCR
+(**默认不绑** —— 绑了的话内核或固件一升级就把用户锁在门外)。`swtpm` 能在
+本机把它模拟出来,所以那条代码路径是可以真测的 —— 但**它到目前为止还没有在
+任何 Linux 机器上编译过**,见 [docs/DESIGN.md](docs/DESIGN.md) 第十节。
 
 ## 磁盘布局
 
@@ -242,9 +319,10 @@ cargo install --path . --features mcp           # 多出 mcp
 ```
 ~/.anp-keyd/
 ├── device.secret              0600  这台机器的第二个因子。丢了 = 信封全废
-├── keys/<thumbprint>.json     0600  信封,一把一个
+├── keys/<thumbprint>.json     0600  信封,一把一个(v1 或绑了硬件的 v2)
 ├── dids/<did>.json            0644  已发布的文档(含自签 proof),给外面看
 ├── audit/YYYY-MM.jsonl        0600  审计日志。按月分片,链 + 锚
+├── audit/.lock                0600  串行化追加的那把跨进程锁
 ├── log/serve.log              0600  守护进程的日志,给人排查用
 └── run/
     ├── keyd.sock                    守护进程的 Unix socket
@@ -256,9 +334,16 @@ cargo install --path . --features mcp           # 多出 mcp
 `log/` 和 `audit/` 是两件事,别混:审计是哈希链加锚,是对外的证据;serve
 日志是给人看的运行记录,随时可以删。
 
+`audit/.lock` 是一把 `flock`,只包住**一次**追加(读尾哈希 → 写记录 → 写锚
+那三步)。审计日志的写者不止守护进程一个 —— 每一条 CLI 命令各自开一份
+`AuditLog`,而它们完全跑得起来的时间正是守护进程正忙的时候。两个写者各写各
+的行会让链断掉,而链断正是我们用来发现篡改的信号:让一次合法的并发造出一个
+假警报,比日志乱一点糟得多。锁是 `.lock` 那个文件而不是某一份 `.jsonl`,
+因为后者换月会换成另一个。
+
 **整份 `~/.anp-keyd/` 拷到另一台机器上是打不开的**,这是设计不是缺陷 ——
-一半的熵是这台机器的 `device.secret`。要在别的机器上用同一把身份,走下面
-那条路。
+一半的熵是这台机器的 `device.secret`,绑了硬件根的话还多一路。要在别的机器
+上用同一把身份,走下面那条路。
 
 ## 出事的时候
 
@@ -294,6 +379,10 @@ anp-keyd import-archive --file x.anpkeyd.json
 
 所以:**趁机器活着,把 24 个词抄下来。**
 
+绑了硬件根的话,这一条从"该做"变成"只能这么做":导出要先解信封,解信封要
+硬件,所以那台机器一旦不在,**就没有第二条路** —— 也不能把磁盘搬到别的机器
+上再导出。那正是硬件根要的性质,代价也就在这儿。
+
 ### 怀疑哪里不对劲
 
 ```bash
@@ -304,7 +393,9 @@ anp-keyd probe --did did:wba:…
 它报告这台机器能不能兑现这个工具给出的承诺:内存锁定建不建得起来(容器里
 `ulimit -l` 太小、systemd 的 `LimitMEMLOCK` 没调,症状是**启动就失败**,而
 这里能当场说清是哪一条不满足)、一次崩溃会不会把种子写到磁盘上、
-`device.secret` 在不在、模式对不对。
+`device.secret` 在不在、模式对不对,以及**这台机器有没有可用的硬件根、是哪
+一种、能不能真的用**(SE 那一侧最容易被看出来:芯片在、框架也编进去了,但
+没有 Apple 签发的证书就建不出持久的 SE 私钥,于是"绑了硬件"根本兑现不了)。
 
 **它一个字节的密钥材料都不打印。** 走 stdout 就是为了让你能放心把输出贴到
 issue 里。
@@ -355,9 +446,18 @@ cp -r skills/anp-keyd .claude/skills/            # 给这个项目里的会话�
 
 ```bash
 cargo test                    # 单元 + 集成 + 负例 + 外部向量
-cargo test --all-features     # 连导出和 MCP 一起
+cargo test --all-features     # 连导出、MCP 和软件硬件后端一起
 cargo clippy --all-targets --all-features
 ```
+
+`--all-features` 里的 `hardware-software` 是一个**假后端**:它把"封起来的
+熵"存在一个文件里,而不是芯片里。它存在的唯一理由是让 v2 记录格式在没有硬件
+的机器上真的能被测(版本分派、AAD、拒绝降级那一整块)。它自己承认自己不是
+硬件,所以 `probe` 不会拿它当"这台机器有硬件根"的证据。
+
+`hardware-se` / `hardware-tpm` 那两条路不在 `--all-features` 里,因为
+`#[cfg(target_os)]` 挡着:一台机器只能编出其中一条。SE 的 ECDH 在真芯片上
+验过;**TPM 那条从来没被编译过**,见 [docs/DESIGN.md](docs/DESIGN.md) 第十节。
 
 五类测试,失败的含义不一样:
 
@@ -369,9 +469,14 @@ cargo clippy --all-targets --all-features
 | `tests/negative.rs` | **产品承诺的那十件事今天还成立吗** | **有人把一道墙拆了** |
 | `tests/vectors/` + `tests/vectors.rs` | 外部标准还认不认我们的实现 | 先怀疑实现,别改向量 |
 
-另有三个单一命题,每个一个文件:`tests/probe.rs`(体检说的都是真的)、
-`tests/mcp.rs`(MCP 那四个工具就是全部)、`tests/no_key_material_on_disk.rs`
-(走完一遍之后,磁盘上扫不出任何密钥材料)。
+另有四个单一命题,每个一个文件:`tests/probe.rs`(体检说的都是真的)、
+`tests/mcp.rs`(MCP 那四个工具就是全部)、`tests/hardware.rs`(硬件绑定那
+条路的**形状**:版本分派、AAD、硬件不在、口令错、拒绝降级)、
+`tests/no_key_material_on_disk.rs`(走完一遍之后,磁盘上扫不出任何密钥材料)。
+
+`tests/hardware.rs` 用软件替身跑,所以它验的是形状而不是"HS 真的出不了这台
+机器" —— 最后那一条只有真后端能验,文件头把这条缺口写明了。它在默认构建里
+只跑三条(拒绝降级那几条),开了 `hardware-software` 才是七条。
 
 `tests/vectors/` 里的 JSON 是**权威文本的抄本**,取自 RFC 8032、7638、8037、
 9421、8785,每个文件都带 `_source` 写明抄自哪一节。**如果向量测试红了,先

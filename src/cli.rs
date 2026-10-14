@@ -286,6 +286,37 @@ impl ServeArgs {
     }
 }
 
+#[derive(Args, Debug, Clone)]
+pub struct HardwareArgs {
+    /// Bind this envelope to a hardware root.
+    ///
+    /// `none` (the default) leaves the envelope exactly as it has always been:
+    /// the passphrase plus this machine's `device.secret`. The other values add a
+    /// **third** source of entropy that cannot be copied off the machine — so a
+    /// stolen disk, or the whole `~/.anp-keyd/` directory on another computer,
+    /// stops being enough.
+    ///
+    /// Which names exist depends on the build and the platform:
+    ///
+    /// - `secure-enclave` — macOS, `--features hardware-se`
+    /// - `tpm` — Linux, `--features hardware-tpm`
+    /// - `software` — `--features hardware-software`; a **test stand-in**, not
+    ///   hardware, and `probe` will not count it as one
+    ///
+    /// **There is no silent downgrade.** Asking for a root this build or this
+    /// machine does not have is an error, never a fallback to `none`: an envelope
+    /// that looks protected and is not is worse than one that is honestly plain.
+    ///
+    /// (The flag is `--hardware`, not `--root` — `--root` is already the global
+    /// one that points at `~/.anp-keyd`, and two different `--root`s in one
+    /// command line is a trap.)
+    // 字段叫 `choice` 而不是 `root`:clap 的 arg **id** 取字段名,而顶层那个
+    // `--root` 是 `global = true`、会铺进每一个子命令 —— 这里再有一个 id 叫
+    // `root` 的 arg,两个同名 id 会撞在一起(长名不同也没用)。
+    #[arg(long = "hardware", value_name = "ROOT", default_value = "none")]
+    pub choice: crate::keystore::hardware::HardwareChoice,
+}
+
 #[derive(Args, Debug)]
 pub struct KeygenArgs {
     /// The document spec file (JSON). Coordinates and service declarations come
@@ -302,6 +333,9 @@ pub struct KeygenArgs {
     /// re-wrapping — it is not a comment.
     #[arg(long, default_value = "default", value_name = "LABEL")]
     pub label: String,
+
+    #[command(flatten)]
+    pub hardware: HardwareArgs,
 }
 
 #[derive(Args, Debug)]
@@ -475,6 +509,9 @@ pub struct AddRecoveryKeyArgs {
     /// re-wrapping — it is not a comment.
     #[arg(long, default_value = "recovery", value_name = "LABEL")]
     pub label: String,
+
+    #[command(flatten)]
+    pub hardware: HardwareArgs,
 }
 
 #[derive(Args, Debug)]
@@ -491,6 +528,9 @@ pub struct RotateHotKeyArgs {
     /// means "stop using it".
     #[arg(long)]
     pub keep_old: bool,
+
+    #[command(flatten)]
+    pub hardware: HardwareArgs,
 }
 
 #[derive(Args, Debug)]
@@ -565,6 +605,9 @@ pub struct ImportMnemonicArgs {
     /// Do it anyway when this machine already has the same key.
     #[arg(long)]
     pub force: bool,
+
+    #[command(flatten)]
+    pub hardware: HardwareArgs,
 }
 
 #[derive(Args, Debug)]
@@ -580,6 +623,9 @@ pub struct ImportArchiveArgs {
     /// Do it anyway when this machine already has the same key.
     #[arg(long)]
     pub force: bool,
+
+    #[command(flatten)]
+    pub hardware: HardwareArgs,
 
     // 这里**没有** `--password`,而且是刻意的:归档的密码只从终端读。
     // 一个从 argv 传进来的密码会出现在 `ps` 的输出里,也会出现在 shell
@@ -640,7 +686,11 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Sign(args) => sign(root, args),
         Command::AddRecoveryKey(args) => crate::ops::keys::add_recovery_key(
             root,
-            crate::ops::keys::AddRecoveryKey { did: args.did, label: args.label },
+            crate::ops::keys::AddRecoveryKey {
+                did: args.did,
+                label: args.label,
+                hardware: args.hardware.choice,
+            },
         ),
         Command::RotateHotKey(args) => crate::ops::keys::rotate_hot_key(
             root,
@@ -648,6 +698,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 did: args.did,
                 label: args.label,
                 keep_old: args.keep_old,
+                hardware: args.hardware.choice,
             },
         ),
         Command::RemoveKey(args) => crate::ops::keys::remove_key(
@@ -672,6 +723,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 did: args.did,
                 label: args.label,
                 force: args.force,
+                hardware: args.hardware.choice,
             },
         ),
         Command::ImportArchive(args) => crate::ops::import::import_archive(
@@ -680,6 +732,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 file: args.file,
                 label: args.label,
                 force: args.force,
+                hardware: args.hardware.choice,
             },
         ),
         #[cfg(feature = "seed-export")]
@@ -977,6 +1030,7 @@ fn keygen(root: Option<&Path>, args: KeygenArgs) -> Result<()> {
         &args.label,
         passphrase.as_bytes(),
         Argon2Config::default(),
+        args.hardware.choice,
     )?;
 
     // 只打印 DID,不打印文档。文档还没签名,落盘只会让人以为它已经发布了;

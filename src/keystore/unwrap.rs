@@ -1,7 +1,13 @@
-//! 信封解开:口令 + `device.secret` → 内存里的一把签名密钥。
+//! 信封解开:口令 + `device.secret`(+ 硬件根) → 内存里的一把签名密钥。
 //!
-//! 顺序是刻意的:**AAD 自检 → 派生 KEK → 解 DEK → 解 seed**。任何一步不过
-//! 就停在原地,不往下走。
+//! 顺序是刻意的:**AAD 自检 → (v2)取出硬件那一趟的熵 → 派生 KEK → 解 DEK →
+//! 解 seed**。任何一步不过就停在原地,不往下走。
+//!
+//! 硬件那一步放在 Argon2 **之前**,有两个理由:
+//! 1. 硬件根不在的时候要立刻说。先花掉 64 MiB 和三轮 Argon2 再报错,人拿到的
+//!    是一句"口令错",而真相是"这台机器上没有那把根"—— 那是最坏的一种错。
+//! 2. 它**碰得到外部状态**(钥匙串、`/dev/tpmrm0`),所以要放在一个"头已经被
+//!    认证过"的位置上:顺序反了,就成了让一个没被认证的字符串去指路。
 
 use zeroize::Zeroize;
 
@@ -9,14 +15,18 @@ use crate::crypto::aead;
 use crate::crypto::hygiene::LockedBytes;
 use crate::crypto::kdf;
 use crate::error::{KeydError, Result};
-use crate::keystore::record::{self, WrappedKey};
+use crate::keystore::hardware;
+use crate::keystore::record::{self, WrappedKey, RECORD_VERSION, RECORD_VERSION_HARDWARE};
 use crate::keystore::wrap::exact32;
 use crate::sign::{LockedSigningKey, Signer};
 
 /// 解开一个信封。
 ///
 /// 失败时给什么错**是有讲究的**:
-/// - `AadMismatch` —— 信封的头被人动过(改名/改标)。这不是口令问题。
+/// - `AadMismatch` —— 信封的头被人动过(改名/改标/换硬件根)。这不是口令问题。
+/// - `HardwareMissing` —— 信封绑的硬件根**这台机器上没有**。这是"少了这台
+///   机器",不是"口令错" —— 混起来的话,一个换了机器的人会一遍遍重敲自己
+///   那个明明没错的口令。
 /// - `BadPassphrase` —— 口令错,**或者** `device.secret` 存在但内容不对。
 /// - `BadDeviceSecret` —— `device.secret` 根本不在了(由调用方判定)。
 ///
@@ -54,10 +64,28 @@ pub fn unlock(
 fn seed_of(wrapped: &WrappedKey, passphrase: &[u8], device_secret: &LockedBytes) -> Result<LockedBytes> {
     wrapped.validate()?;
 
-    // ① 重算 AAD 摘要并比对。先于任何密码学。
+    // ① 重算 AAD 摘要并比对。先于任何密码学 —— 也先于**任何外部调用**,
+    //    所以钥匙串或者 TPM 只会被一个已经被认证过的定位符指到。
     let aad = wrapped.verify_aad()?;
 
-    // ② 口令 + device.secret → KEK。
+    // ② 绑了硬件就先把它那一趟的 32 字节取回来。这一步碰外部状态,所以它
+    //    要求 ① 已经过了。v1 的信封在这里什么都不做。
+    //
+    //    **不写 `_ => None` 兜底**:那样一来一个认不出来的版本号会静默地走
+    //    纯软件的推导,也就是悄悄降级。`validate()` 已经拦过一道,这里再
+    //    拦一道,因为这一处正是降级会发生的地方。
+    let hs = match wrapped.version {
+        RECORD_VERSION => None,
+        RECORD_VERSION_HARDWARE => Some(hardware::open_hs(wrapped)?),
+        other => {
+            return Err(KeydError::Protocol(format!(
+                "unsupported envelope version {other} (this build speaks {RECORD_VERSION} and \
+                 {RECORD_VERSION_HARDWARE})"
+            )))
+        }
+    };
+
+    // ③ 口令 + device.secret (+ HS)→ KEK。
     let salt = wrapped.kdf.salt_bytes()?;
     let mut pass_key = kdf::argon2id(
         passphrase,
@@ -66,16 +94,19 @@ fn seed_of(wrapped: &WrappedKey, passphrase: &[u8], device_secret: &LockedBytes)
         wrapped.kdf.t_cost,
         wrapped.kdf.p_cost,
     )?;
-    let kek = kdf::derive_kek(&pass_key, device_secret, &salt);
+    let kek = match &hs {
+        Some(hs) => kdf::derive_kek_bound(&pass_key, device_secret, &salt, hs),
+        None => kdf::derive_kek(&pass_key, device_secret, &salt),
+    };
     pass_key.zeroize();
 
     let nonce = wrapped.aead.nonce_bytes()?;
 
-    // ③ KEK 解出 DEK。
+    // ④ KEK 解出 DEK。
     let dek_ciphertext = record::decode_b64(&wrapped.dek_ciphertext)?;
     let dek = exact32(aead::open(&kek, &nonce, &aad, &dek_ciphertext)?)?;
 
-    // ④ DEK 解出 seed。
+    // ⑤ DEK 解出 seed。
     let sk_ciphertext = record::decode_b64(&wrapped.sk_ciphertext)?;
     exact32(dek.expose(|d| aead::open(d, &nonce, &aad, &sk_ciphertext))?)
 }
@@ -143,6 +174,7 @@ mod tests {
             device_secret: &device(7),
             seed: &seed,
             argon: fast(),
+            hardware: None,
         })
         .unwrap();
         (wrapped, seed_bytes, seed)

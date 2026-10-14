@@ -22,6 +22,13 @@ use crate::error::{KeydError, Result};
 /// HKDF 的用途域分隔。换版本时必须改这个串,否则新旧 KEK 会撞。
 const KEK_INFO: &[u8] = b"anp-keyd/v1/kek";
 
+/// 硬件绑定信封(v2)的用途域串。
+///
+/// 和 v1 不同串是**照上面那条注释办事**,不是碰巧:两版的 IKM 长度本来就不同
+/// (64 vs 96 字节),撞不上,但一个能被指认出来的 KEK 域比"反正概率上不会撞"
+/// 更值得依赖。
+const KEK_INFO_BOUND: &[u8] = b"anp-keyd/v2/kek";
+
 /// 生成信封时要求 Argon2id 用的参数。
 ///
 /// 默认值按计划 §五:`m_cost = 65536` KiB(64 MiB)、`t_cost = 3`、`p_cost = 1`。
@@ -94,6 +101,45 @@ pub fn random_locked() -> Result<LockedBytes> {
     LockedBytes::generate()
 }
 
+/// 硬件绑定信封的 KEK —— **三路**熵。
+///
+/// ```text
+/// passphrase ──Argon2id──┐
+/// device.secret ─────────┼─ HKDF-SHA256(salt, "anp-keyd/v2/kek") ──> KEK (32B)
+/// HS(硬件封装) ──────────┘
+/// ```
+///
+/// 单独一个函数、单独一个 INFO 串,而不是给 [`derive_kek`] 加一个
+/// `Option<HS>` 参数:后者的签名允许了"v2 的信封、走 v1 的派生"这种调用,
+/// 而那正是这一整块要防的降级。两条路在类型上就是两条路。
+///
+/// 三路都必须在场。`HS` 由硬件封装、由信封携带 —— 少了这台机器上的硬件就打
+/// 不开,这正是设计;`device.secret` 那一层没被替代,它管的是"备份拷走没用"。
+pub fn derive_kek_bound(
+    pass_key: &[u8; 32],
+    device_secret: &LockedBytes,
+    salt: &[u8],
+    hs: &LockedBytes,
+) -> [u8; 32] {
+    hs.expose(|hs_bytes| {
+        device_secret.expose(|dev| {
+            // ikm = 口令派生物 ‖ device.secret ‖ HS
+            let mut ikm = [0u8; 96];
+            ikm[..32].copy_from_slice(pass_key);
+            ikm[32..64].copy_from_slice(dev);
+            ikm[64..].copy_from_slice(hs_bytes);
+
+            let hk = Hkdf::<Sha256>::new(Some(salt), &ikm);
+            let mut kek = [0u8; 32];
+            hk.expand(KEK_INFO_BOUND, &mut kek)
+                .expect("32 is a valid HKDF-SHA256 output length");
+
+            ikm.zeroize();
+            kek
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +177,42 @@ mod tests {
         let other_pass = argon2id(b"pw2", b"salt-salt-salt-1", M, T, P).unwrap();
         let kek_c = derive_kek(&other_pass, &device(1), b"salt-salt-salt-1");
         assert_ne!(kek_a, kek_c, "a different passphrase must change the KEK");
+    }
+
+    #[test]
+    fn bound_kek_needs_all_three_paths() {
+        let pass = argon2id(b"pw", b"salt-salt-salt-1", M, T, P).unwrap();
+        let hs = |b: u8| LockedBytes::fill(|d| *d = [b; 32]).unwrap();
+        let salt = b"salt-salt-salt-1";
+
+        let base = derive_kek_bound(&pass, &device(1), salt, &hs(0x11));
+        assert_ne!(base, derive_kek_bound(&pass, &device(2), salt, &hs(0x11)));
+        assert_ne!(base, derive_kek_bound(&pass, &device(1), salt, &hs(0x12)));
+        assert_ne!(
+            base,
+            derive_kek_bound(
+                &argon2id(b"pw2", salt, M, T, P).unwrap(),
+                &device(1),
+                salt,
+                &hs(0x11)
+            )
+        );
+        // 定值性:同样的三路熵,KEK 必须逐字节相同。
+        assert_eq!(base, derive_kek_bound(&pass, &device(1), salt, &hs(0x11)));
+    }
+
+    /// v1 和 v2 必须是两个域 —— 否则一个信封能被另一版的推导打开。
+    #[test]
+    fn the_two_versions_do_not_share_a_kek() {
+        let pass = argon2id(b"pw", b"salt-salt-salt-1", M, T, P).unwrap();
+        let salt = b"salt-salt-salt-1";
+        let hs = LockedBytes::fill(|d| *d = [0u8; 32]).unwrap();
+
+        // 故意让 HS 全零 —— 即便这样,两版也不能撞。
+        assert_ne!(
+            derive_kek(&pass, &device(1), salt),
+            derive_kek_bound(&pass, &device(1), salt, &hs),
+            "v1 and v2 must be separate HKDF domains"
+        );
     }
 }

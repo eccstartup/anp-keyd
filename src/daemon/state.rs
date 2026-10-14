@@ -476,6 +476,7 @@ mod tests {
     use crate::daemon::wire::Request;
     use crate::did::DidDocumentSpec;
     use crate::keystore::create;
+    use crate::keystore::hardware::HardwareChoice;
     use crate::keystore::record::KeyAlgorithm;
     use crate::sign::rfc9421::SignRequest;
     use crate::sign::Signer;
@@ -516,6 +517,7 @@ mod tests {
                 "default",
                 PASSPHRASE.as_bytes(),
                 fast(),
+                HardwareChoice::None,
             )
             .unwrap();
 

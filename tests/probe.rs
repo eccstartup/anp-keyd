@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anp_keyd::crypto::kdf::Argon2Config;
 use anp_keyd::did::document::DidDocumentSpec;
 use anp_keyd::keystore::layout::KeydLayout;
+use anp_keyd::keystore::hardware::HardwareChoice;
 use anp_keyd::keystore::{create, device};
 
 const PASSPHRASE: &[u8] = b"probe passphrase";
@@ -63,31 +64,61 @@ fn machine(tag: &str) -> (TempDir, KeydLayout, String) {
     let layout = KeydLayout::at(dir.path().join("root"));
     layout.ensure().unwrap();
     let spec = DidDocumentSpec::new("example.com", vec!["agents".into(), tag.into()]);
-    let created = create::create(&layout, &spec, "probe", PASSPHRASE, fast()).unwrap();
+    let created = create::create(&layout, &spec, "probe", PASSPHRASE, fast(), HardwareChoice::None).unwrap();
     (dir, layout, created.did)
 }
 
 // ————————————————————————————————————————————————————————————
-// 1. 健康的机器:报告 ok,退出码 0
+// 1. 装了钥匙的机器:每一节都报出来,而硬件那一节决定成不成
 // ————————————————————————————————————————————————————————————
 
-/// 装了钥匙的机器体检通过 —— 而且顺带把 `--did` 那条路走通(它要解析信封)。
+/// 装了钥匙的机器:内存、目录、信封三节都得报出真话来,而**结论**由硬件那一
+/// 节决定。
+///
+/// # 这条原来是"退出码必须是 0"
+///
+/// M5 改了它。`probe` 回答的是"这台机器**能不能兑现**这个工具给出的承诺",
+/// 而 M5 把那句承诺改了:在那之前,"拷走目录 + 知道口令 = 拿到私钥"是已知缺口;
+/// 硬件根就是补它的那一层。一台没有可用硬件根的机器只能兑现**旧的**承诺 ——
+/// 报成通过的话,"体检过了"这四个字会让人觉得缺口已经补上了。
+///
+/// 所以现在的断言是:**别的每一节都照常报真话,而整体不通过,理由指名道姓
+/// 地写在屏幕上**。默认构建在这台机器上一根真后端都没有,于是这一条在默认
+/// 构建和 `hardware-*` 构建里都成立。
 #[test]
-fn a_machine_with_a_key_probes_clean() {
+fn a_machine_with_a_key_reports_every_section_and_fails_on_the_hardware_root() {
     let (_dir, layout, did) = machine("clean");
     let output = probe(layout.root(), Some(&did));
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert_eq!(
+    assert_ne!(
         output.status.code(),
         Some(0),
-        "a healthy machine must exit 0; stdout={stdout:?} stderr={:?}",
-        String::from_utf8_lossy(&output.stderr)
+        "a machine with no usable hardware root must not report success: {stdout}"
     );
+
+    // 内存那一节照常报,而且这篇报告里没有假话。
     assert!(stdout.contains("locked memory"), "{stdout}");
-    assert!(stdout.contains("ok"), "{stdout}");
+
     // `--did` 那一段要真的说出信封是谁的。
     assert!(stdout.contains(&did), "the envelope report must name the DID: {stdout}");
+
+    // 硬件那一节必须**指名道姓地说出该装什么、该改什么** —— "不通过"而
+    // 不说怎么做,等于把人丢在原地。
+    assert!(stdout.contains("hardware root (M5)"), "{stdout}");
+    assert!(
+        stdout.contains("This machine has no usable hardware root"),
+        "the report must say, in words, what the conclusion is: {stdout}"
+    );
+    assert!(
+        stdout.contains("--features hardware-se") || stdout.contains("--features hardware-tpm"),
+        "the report must name the feature to build with: {stdout}"
+    );
+    assert!(
+        stdout.contains("signed with an Apple-issued certificate"),
+        "on macOS the SE side has a distribution prerequisite, and the report must say it: \
+         {stdout}"
+    );
 }
 
 // ————————————————————————————————————————————————————————————
@@ -176,22 +207,19 @@ fn a_machine_that_lost_its_device_secret_fails_the_probe() {
     );
 }
 
-/// 还没生成过钥匙的机器:根目录都不在,**这不算失败**。
+/// 还没生成过钥匙的机器:根目录都不在,报告要照实说,而且**不创建**它。
 ///
-/// 一台刚装好的机器就跑一次体检,是这条命令最正常的用法之一。
+/// 一次体检不该改变被体检的东西 —— 这一条和 M5 无关,是 `probe` 一开始就
+/// 定下的。所以就算整篇报告的结论因为"没有硬件根"而不通过,这一段的行为
+/// 也不能跟着变。
 #[test]
-fn a_fresh_machine_without_a_root_is_not_a_failure() {
+fn a_fresh_machine_reports_an_absent_root_without_creating_it() {
     let dir = TempDir::new("fresh");
     let output = probe(&dir.path().join("never-created"), None);
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "a machine with no keys yet has nothing wrong with it: {stdout}"
-    );
     assert!(stdout.contains("absent"), "{stdout}");
-    // 而且体检**不创建**它 —— 一次体检不该改变被体检的东西。
+    // 体检**不创建**它。
     assert!(
         !dir.path().join("never-created").exists(),
         "the probe must not create the root directory"

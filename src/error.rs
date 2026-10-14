@@ -15,6 +15,22 @@ pub enum KeydError {
     BadDeviceSecret,
     #[error("envelope aad mismatch: record does not belong to this identity")]
     AadMismatch,
+    /// 信封绑了一根硬件根,而这台机器上没有它(或者这个构建里没有那个后端)。
+    ///
+    /// **和 `BadPassphrase` 分开是有意的。** 把两者合并,一个合法用户在换了
+    /// 机器之后会看到"口令错",然后一遍遍重敲自己那个明明没错的口令。分辨得出来
+    /// 不泄露任何东西:`hardware` 字段本来就明文躺在信封文件里,这颗磁盘的读者
+    /// 一定能看见,而口令的**内容**一个字都没说。
+    ///
+    /// 载荷是一整句话(照 [`KeydError::Misuse`] 的先例),因为它要在终端上直接
+    /// 被人读,并且要说清该做什么。
+    #[error("{0}")]
+    HardwareMissing(String),
+    /// 要求硬件绑定,但这台机器上没有一根**能用的**根。
+    ///
+    /// 这条只出现在**生成**那一侧:没有硬件根就拒绝生成,不做静默降级。
+    #[error("{0}")]
+    HardwareUnavailable(String),
     #[error("key not found: {0}")]
     KeyNotFound(String),
     #[error("key already exists: {0}")]

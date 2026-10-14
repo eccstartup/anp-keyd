@@ -20,6 +20,7 @@ use anp_keyd::daemon::wire::SignRequest;
 use anp_keyd::daemon::{self, server, ServerConfig};
 use anp_keyd::did::document::{self, DidDocumentSpec};
 use anp_keyd::keystore::layout::KeydLayout;
+use anp_keyd::keystore::hardware::HardwareChoice;
 use anp_keyd::keystore::{create, device, store};
 use serde_json::Value;
 
@@ -89,7 +90,7 @@ impl Running {
         let layout = KeydLayout::at(root.clone());
 
         let spec = DidDocumentSpec::new("example.com", vec!["agents".into(), "e2e".into()]);
-        let created = create::create(&layout, &spec, "e2e", PASSPHRASE, fast()).unwrap();
+        let created = create::create(&layout, &spec, "e2e", PASSPHRASE, fast(), HardwareChoice::None).unwrap();
 
         // 走一遍 `publish` 的路径:把公钥从信封里解出来、重建文档、盖 proof、
         // 落盘。之后验签用的就是磁盘上这一份 —— 不是内存里的那个半成品。

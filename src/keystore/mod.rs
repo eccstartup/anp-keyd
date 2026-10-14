@@ -3,6 +3,7 @@
 pub mod archive;
 pub mod create;
 pub mod device;
+pub mod hardware;
 pub mod layout;
 pub mod record;
 pub mod store;
@@ -10,6 +11,7 @@ pub mod unwrap;
 pub mod wrap;
 
 pub use create::{create, generate, Created};
+pub use hardware::{HardwareChoice, SealedHardware};
 pub use layout::KeydLayout;
 pub use record::{KeyAlgorithm, KeyId, WrappedKey};
 pub use unwrap::unlock;

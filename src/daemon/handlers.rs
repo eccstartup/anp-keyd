@@ -171,6 +171,7 @@ mod tests {
     use crate::daemon::state::Roots;
     use crate::did::DidDocumentSpec;
     use crate::keystore::layout::KeydLayout;
+    use crate::keystore::hardware::HardwareChoice;
     use crate::keystore::{create, store};
     use std::collections::BTreeMap;
     use std::time::Duration;
@@ -201,6 +202,7 @@ mod tests {
                 "default",
                 PASSPHRASE.as_bytes(),
                 fast(),
+                HardwareChoice::None,
             )
             .unwrap();
 

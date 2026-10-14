@@ -27,6 +27,7 @@ use anp_keyd::daemon::state::{DaemonState, Roots};
 use anp_keyd::did::document::DidDocumentSpec;
 use anp_keyd::error::KeydError;
 use anp_keyd::keystore::layout::KeydLayout;
+use anp_keyd::keystore::hardware::HardwareChoice;
 use anp_keyd::keystore::{create, device, store, unwrap};
 use anp_keyd::sign::rfc9421::SignRequest;
 use serde_json::Value;
@@ -72,7 +73,7 @@ impl TempDir {
         layout.ensure().unwrap();
         let spec = DidDocumentSpec::new("example.com", vec!["agents".into(), tag.into()]);
         let created =
-            create::create(&layout, &spec, "default", PASSPHRASE, fast()).expect("create a key");
+            create::create(&layout, &spec, "default", PASSPHRASE, fast(), HardwareChoice::None).expect("create a key");
 
         let device_secret = device::load(&layout).unwrap();
         let key = unwrap::unlock(&created.wrapped, PASSPHRASE, &device_secret).unwrap();

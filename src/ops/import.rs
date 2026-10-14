@@ -53,6 +53,7 @@ use crate::did::lifecycle;
 use crate::did::parse::parse_did_wba;
 use crate::error::{KeydError, Result};
 use crate::keystore::archive::Archive;
+use crate::keystore::hardware::{self, HardwareChoice};
 use crate::keystore::layout::KeydLayout;
 use crate::keystore::record::{KeyAlgorithm, KeyId};
 use crate::keystore::{device, store, wrap};
@@ -67,6 +68,13 @@ pub struct ImportMnemonic {
     pub label: String,
     /// 本地已经有同一把钥匙时也照做。
     pub force: bool,
+    /// 新的那几个信封要不要绑一根硬件根。
+    ///
+    /// **导入是重封,不是接回来**:`place` 走的是和 `keygen` 同一条封装路径。
+    /// 所以一台**没有**硬件根的新机器上,`--root tpm` 会在这里失败 —— 而不是
+    /// 悄悄给一个纯软件的信封。要的就是这个:一台不满足条件的机器不该假装
+    /// 自己满足。
+    pub hardware: HardwareChoice,
 }
 
 /// 从加密归档恢复。
@@ -74,6 +82,9 @@ pub struct ImportArchive {
     pub file: PathBuf,
     pub label: String,
     pub force: bool,
+    /// 同 [`ImportMnemonic::hardware`]。归档自己那套字节一个都没变 ——
+    /// 硬件绑定是**落地时**才加上的,不是归档格式的一部分。
+    pub hardware: HardwareChoice,
 }
 
 pub fn import_mnemonic(root: Option<&Path>, args: ImportMnemonic) -> Result<()> {
@@ -119,6 +130,7 @@ pub fn import_mnemonic(root: Option<&Path>, args: ImportMnemonic) -> Result<()> 
             source: "mnemonic",
         },
         args.force,
+        args.hardware,
     )
 }
 
@@ -163,6 +175,7 @@ pub fn import_archive(root: Option<&Path>, args: ImportArchive) -> Result<()> {
             source: "archive",
         },
         args.force,
+        args.hardware,
     )
 }
 
@@ -185,7 +198,12 @@ struct Recovered {
 }
 
 /// 七步。两条路都走这里。
-fn place(session: &mut Session, recovered: Recovered, force: bool) -> Result<()> {
+fn place(
+    session: &mut Session,
+    recovered: Recovered,
+    force: bool,
+    hardware: HardwareChoice,
+) -> Result<()> {
     let Recovered {
         did,
         fragment,
@@ -265,6 +283,11 @@ fn place(session: &mut Session, recovered: Recovered, force: bool) -> Result<()>
     let fresh_device_secret = !device::exists(session.layout());
     let device_secret = device::load_or_create(session.layout())?;
 
+    // 导入不只是"把 seed 接回来",还是一次**新的封装**(见模块头),所以硬件
+    // 绑定也在这里重新做一遍:和 `keygen` 一样,要硬件而这里没有就拒绝,
+    // 不悄悄退回纯软件的信封。
+    let hardware = hardware::seal_new(hardware, &thumbprint)?;
+
     let wrapped = wrap::seal(wrap::SealRequest {
         id: KeyId {
             kid: format!("{did}#{fragment}"),
@@ -278,6 +301,7 @@ fn place(session: &mut Session, recovered: Recovered, force: bool) -> Result<()>
         device_secret: &device_secret,
         seed: &seed,
         argon: Argon2Config::default(),
+        hardware,
     })?;
 
     if force {
@@ -597,6 +621,7 @@ mod tests {
             device_secret: &device,
             seed: &seed,
             argon: Argon2Config { m_cost: 1024, t_cost: 1, p_cost: 1 },
+            hardware: None,
         })
         .unwrap()
     }
@@ -784,6 +809,7 @@ mod tests {
                 did: "did:wba:example.com:user:alice".into(),
                 label: "x".into(),
                 force: false,
+                hardware: HardwareChoice::None,
             },
         )
         .unwrap_err();

@@ -76,6 +76,15 @@ pub enum ErrorCode {
     /// 帧本身不合法(长度、类型、字段编码)。
     Protocol = 0x0009,
     Did = 0x000A,
+    /// 这把钥匙绑了一根**这台机器上没有的**硬件根(SE 密钥被删了、信封是从
+    /// 别的机器拷来的、或者这个构建里没有那个后端)。
+    ///
+    /// 为什么不为它复用一个已有的码:`BadCredential` 是**谎话**(口令没错),
+    /// `Internal` 按它自己的约定要求消息对调用方无信息量(而这一条的全部价值
+    /// 就在那句话里)。加一个码是**加**,不是改:老客户端收到认不出来的码会
+    /// 报 "0x… is not an error code this client knows",而它同时拿得到
+    /// `message` —— 那是安全的降级,不是静默的错误答案。
+    HardwareUnavailable = 0x000B,
     /// 守护进程自己出了问题。**消息文本要对调用方无信息量。**
     Internal = 0x00FF,
 }
@@ -98,6 +107,7 @@ impl std::fmt::Display for ErrorCode {
             ErrorCode::CoveredSetRejected => "covered set rejected",
             ErrorCode::Protocol => "protocol",
             ErrorCode::Did => "did",
+            ErrorCode::HardwareUnavailable => "hardware root unavailable",
             ErrorCode::Internal => "internal",
         })
     }
@@ -121,6 +131,7 @@ impl ErrorCode {
             0x0008 => CoveredSetRejected,
             0x0009 => Protocol,
             0x000A => Did,
+            0x000B => HardwareUnavailable,
             0x00FF => Internal,
             _ => return None,
         })
@@ -142,6 +153,8 @@ impl KeydError {
             CoveredSetRejected(_) => ErrorCode::CoveredSetRejected,
             Protocol(_) => ErrorCode::Protocol,
             Did(_) => ErrorCode::Did,
+            // 硬件根的消息**要**原样过去 —— 那一句话就是这条错误码存在的理由。
+            HardwareMissing(_) | HardwareUnavailable(_) => ErrorCode::HardwareUnavailable,
             // `Misuse` 到不了线上:它只由 `serve` / `stop` 这些本地命令产生。
             // 真要到了,那就是我们自己的 bug,所以是 `Internal`。
             Crypto(_) | Upstream(_) | Io(_) | Json(_) | Misuse(_) => ErrorCode::Internal,

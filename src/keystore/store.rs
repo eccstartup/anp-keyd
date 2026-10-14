@@ -255,6 +255,7 @@ mod tests {
             device_secret: &device,
             seed: &seed,
             argon: fast(),
+            hardware: None,
         })
         .unwrap()
     }

@@ -180,6 +180,7 @@ impl Machine {
             device_secret: &device_secret,
             seed: &seed,
             argon: fast(),
+            hardware: None,
         })
         .unwrap();
         store::save_new(&layout, &wrapped).unwrap();

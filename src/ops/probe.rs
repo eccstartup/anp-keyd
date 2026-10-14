@@ -29,6 +29,23 @@
 //! - `device.secret` 在不在、模式对不对、长度是不是 32。
 //! - 给了 `--did` 的话,那把**信封**是不是完好的、绑的是不是这个身份 ——
 //!   这些全是公开信息(thumbprint 本来就挂在域名上),不需要口令。
+//! - **这台机器有没有一根能用的硬件根**(M5)。这一节是**会失败的**,理由见
+//!   下面。
+//!
+//! # 为什么"没有硬件根"是一次体检不通过
+//!
+//! 这个模块的头一句话定义了这个命令:`probe` 回答的是"这台机器**能不能兑现**
+//! 这个工具给出的承诺"。M5 把那句承诺改了:在今天之前,"磁盘拷走 + 知道口令"
+//! 就能拿到私钥是**已知的缺口**,而硬件根就是补它的那一层。补完之后,
+//! "磁盘上的东西不够"才成立。
+//!
+//! 所以一台没有可用硬件根的机器,能兑现的是**旧的**承诺 —— 它不该被报成
+//! 通过,否则"体检过了"这四个字会让人觉得缺口已经补上了。这一节失败时说的
+//! 是**该装什么、该改什么**(编哪个 feature、签什么证书),不是一句"不对"。
+//!
+//! 这和"不绑硬件的部署完全合法"并不矛盾:`keygen` 不带 `--hardware` 照样
+//! 生成 v1 信封,照样能用。**这一节说的是"这台机器还不够好",不是"你不能
+//! 这么用"** —— 体检报告本来就说的是前者。
 //!
 //! "`lock` 之后密钥从内存里消失"这条**行为**上不变量,测在
 //! `tests/negative.rs`(第 8 条)里;而"区域归零"是 `shrouded` 和 `Zeroize`
@@ -69,6 +86,7 @@ pub fn probe(root: Option<&Path>, did: Option<&str>) -> Result<()> {
 
     let memory_ok = memory_hygiene();
     let layout_ok = layout_hygiene(&layout)?;
+    let hardware_ok = hardware_hygiene();
 
     let envelope_ok = match did {
         Some(did) => envelope_report(&layout, did)?,
@@ -76,7 +94,7 @@ pub fn probe(root: Option<&Path>, did: Option<&str>) -> Result<()> {
     };
 
     println!();
-    if memory_ok && layout_ok && envelope_ok {
+    if memory_ok && layout_ok && envelope_ok && hardware_ok {
         println!("memory: ok — this machine can keep the promises the daemon makes");
         Ok(())
     } else {
@@ -86,6 +104,71 @@ pub fn probe(root: Option<&Path>, did: Option<&str>) -> Result<()> {
             "one or more checks failed; see the report above".into(),
         ))
     }
+}
+
+/// 这台机器的硬件根:有没有、是哪种、现在能不能用。
+///
+/// 三件事分开说,因为它们能各自独立地坏:
+/// - **这个构建里有没有那个后端**(发行决策:少编了一个 feature);
+/// - **这台机器有没有那根根**(硬件在不在、设备节点在不在);
+/// - **那根根现在真的能用吗**(SE 私钥能不能持久化 —— 那要签名身份)。
+///
+/// 最后一条是最容易被漏掉的一条:`security-framework` 编得进去、SE 芯片也
+/// 真的在,但一个**没有 Apple 签发证书**的二进制造不出持久的 SE 私钥,
+/// 于是"绑了硬件"这件事根本兑现不了。只报前两条的话,那台机器会被报成通过。
+fn hardware_hygiene() -> bool {
+    use crate::keystore::hardware::{probe_real_roots, uncompiled_roots};
+
+    println!();
+    println!("hardware root (M5)");
+
+    let roots = probe_real_roots();
+    if roots.is_empty() {
+        println!("  compiled ................. none (this build has no real hardware backend)");
+    } else {
+        println!(
+            "  compiled ................. {}",
+            roots.iter().map(|r| r.kind).collect::<Vec<_>>().join(", ")
+        );
+    }
+
+    for root in &roots {
+        if root.compiled && root.usable {
+            println!("  {} ... USABLE", root.kind);
+            println!("      {}", root.detail);
+        } else {
+            println!("  {} ... NOT USABLE", root.kind);
+            println!("      {}", root.detail);
+            if let Some(remedy) = &root.remedy {
+                for line in remedy.lines() {
+                    println!("      {line}");
+                }
+            }
+        }
+    }
+
+    // **没编进来的那几根也要印出来**,否则"compiled: none"看起来像"检查过了,
+    // 没事",而事实是"根本没检查"。
+    let missing = uncompiled_roots();
+    if !missing.is_empty() {
+        println!("  not compiled in this build:");
+        for (kind, remedy) in &missing {
+            println!("    {kind} — {remedy}");
+        }
+    }
+
+    let usable = roots.iter().any(|root| root.compiled && root.usable);
+    if !usable {
+        println!();
+        println!(
+            "      This machine has no usable hardware root, so an envelope bound to one\n\
+             \x20     cannot be opened here — and an envelope that is NOT bound to one can\n\
+             \x20     still be opened by anyone who copies the disk and knows the passphrase.\n\
+             \x20     That is the gap M5 exists to close. Until this line reads USABLE, the\n\
+             \x20     tool cannot keep that promise on this machine."
+        );
+    }
+    usable
 }
 
 /// 内存保护能不能建起来、读不读得回来。

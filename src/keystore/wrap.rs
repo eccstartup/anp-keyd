@@ -5,8 +5,9 @@
 //! DEK ──XChaCha20-Poly1305(nonce, aad)──> seed (存密文)
 //! ```
 //!
-//! 两层不是装饰。DEK 那一层就是**给硬件留的位置**:将来 SE/TPM 里的 P-256
-//! 密钥可以改去包 KEK,而 seed 那一层的结构一个字都不用动(计划 §2.4)。
+//! 两层不是装饰。DEK 那一层就是**硬件根插进来的地方**:绑了硬件之后,KEK 的
+//! 熵从两路变成三路(`crypto::kdf::derive_kek_bound`),而 seed 那一层的结构
+//! 一个字都不用动。信封的分层正是为了这个。
 
 use rand::RngCore;
 use zeroize::Zeroize;
@@ -15,8 +16,10 @@ use crate::crypto::aead::{self, NONCE_LEN};
 use crate::crypto::hygiene::LockedBytes;
 use crate::crypto::kdf::{self, Argon2Config};
 use crate::error::{KeydError, Result};
+use crate::keystore::hardware::SealedHardware;
 use crate::keystore::record::{
     self, AeadParams, KeyAlgorithm, KeyId, KdfParams, WrappedKey, RECORD_VERSION,
+    RECORD_VERSION_HARDWARE,
 };
 
 /// 封装一个信封所需的全部输入。
@@ -34,6 +37,13 @@ pub struct SealRequest<'a> {
     pub device_secret: &'a LockedBytes,
     pub seed: &'a LockedBytes,
     pub argon: Argon2Config,
+    /// 硬件那一趟的结果。`None` = 不绑硬件,写 v1。
+    ///
+    /// **由调用方先跑**([`crate::keystore::hardware::seal_new`]),而不是在这里
+    /// 收一个 `HardwareChoice`:封装需要的是那 32 字节 HS 本身,而拿到它的过程
+    /// 会碰钥匙串或 TPM。把它挡在这个纯函数外面,`seal` 就仍然是一个不碰任何
+    /// 外部状态、随便测的东西。
+    pub hardware: Option<SealedHardware>,
 }
 
 /// 把一个 seed 封成信封。
@@ -47,6 +57,7 @@ pub fn seal(req: SealRequest<'_>) -> Result<WrappedKey> {
         device_secret,
         seed,
         argon,
+        hardware,
     } = req;
 
     let mut salt = [0u8; 32];
@@ -54,10 +65,21 @@ pub fn seal(req: SealRequest<'_>) -> Result<WrappedKey> {
     let mut nonce = [0u8; NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
 
+    // 版本由"有没有硬件那一趟"决定,**没有第三个来源**。这样就不可能出现
+    // 一个 v2 的信封配一条没跑的硬件路径。
+    let (version, root, hs_ciphertext) = match &hardware {
+        Some(sealed) => (
+            RECORD_VERSION_HARDWARE,
+            Some(sealed.root.clone()),
+            Some(record::encode_b64(&sealed.ciphertext)),
+        ),
+        None => (RECORD_VERSION, None, None),
+    };
+
     // 先搭出信封骨架 —— 它的头字段就是 AAD 的全部输入。
     // 走和 `unlock` **同一个** `aad_digest()`,所以两边不可能算岔。
     let mut wrapped = WrappedKey {
-        version: RECORD_VERSION,
+        version,
         id,
         algorithm,
         public_multibase,
@@ -77,7 +99,8 @@ pub fn seal(req: SealRequest<'_>) -> Result<WrappedKey> {
         dek_ciphertext: String::new(),
         sk_ciphertext: String::new(),
         created_at: now_rfc3339(),
-        hardware: None,
+        hardware: root,
+        hs_ciphertext,
     };
 
     let aad = wrapped.aad_digest()?;
@@ -85,7 +108,12 @@ pub fn seal(req: SealRequest<'_>) -> Result<WrappedKey> {
 
     // 口令派生物用完立刻擦掉,绝不带出这个函数。
     let mut pass_key = kdf::argon2id(passphrase, &salt, argon.m_cost, argon.t_cost, argon.p_cost)?;
-    let kek = kdf::derive_kek(&pass_key, device_secret, &salt);
+
+    // ②/③ KEK —— 分版。绑了硬件就是三路熵,没绑就是两路。
+    let kek = match &hardware {
+        Some(sealed) => kdf::derive_kek_bound(&pass_key, device_secret, &salt, &sealed.hs),
+        None => kdf::derive_kek(&pass_key, device_secret, &salt),
+    };
     pass_key.zeroize();
 
     // 每把 key 一把自己的 DEK,随机生成、不落盘。
@@ -99,7 +127,7 @@ pub fn seal(req: SealRequest<'_>) -> Result<WrappedKey> {
     })?;
     wrapped.sk_ciphertext = record::encode_b64(&sk_ciphertext);
 
-    // dek 随 `LockedBytes` 的 Drop 擦除并 munlock。
+    // dek 随 `LockedBytes` 的 Drop 擦除并 munlock;`hardware.hs` 同样。
     wrapped.validate()?;
     Ok(wrapped)
 }
@@ -176,6 +204,7 @@ mod tests {
             device_secret: &device(),
             seed: &seed,
             argon: fast(),
+            hardware: None,
         })
         .unwrap();
 
@@ -199,6 +228,7 @@ mod tests {
             device_secret: &device(),
             seed: &seed,
             argon: fast(),
+            hardware: None,
         })
         .unwrap();
 

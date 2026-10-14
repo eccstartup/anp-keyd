@@ -28,6 +28,7 @@ use anp_keyd::daemon::peer::PeerPolicy;
 use anp_keyd::daemon::state::{autolock_from_secs, DaemonState, Roots};
 use anp_keyd::daemon::{server, ServerConfig};
 use anp_keyd::did::document::{self, DidDocumentSpec};
+use anp_keyd::keystore::hardware::HardwareChoice;
 use anp_keyd::keystore::layout::KeydLayout;
 use anp_keyd::keystore::{create, device, store, unwrap};
 use serde_json::{json, Value};
@@ -83,7 +84,9 @@ impl Daemon {
         let layout = KeydLayout::at(root.clone());
 
         let spec = DidDocumentSpec::new("example.com", vec!["agents".into(), "mcp".into()]);
-        let created = create::create(&layout, &spec, "mcp", PASSPHRASE, fast()).unwrap();
+        let created =
+            create::create(&layout, &spec, "mcp", PASSPHRASE, fast(), HardwareChoice::None)
+                .unwrap();
 
         // 走一遍 publish 那条路,把带 proof 的文档落盘 —— 和外面从 did.json
         // 抓到的一模一样。

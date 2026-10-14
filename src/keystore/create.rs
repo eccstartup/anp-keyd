@@ -15,6 +15,7 @@ use crate::crypto::thumbprint::e1_segment;
 use crate::did::document::{DidDocumentSpec, ExtraKey};
 use crate::did::spec::compose_did_wba;
 use crate::error::Result;
+use crate::keystore::hardware::{self, HardwareChoice};
 use crate::keystore::layout::KeydLayout;
 use crate::keystore::record::{KeyAlgorithm, KeyId, WrappedKey};
 use crate::keystore::{device, store, wrap};
@@ -29,12 +30,20 @@ pub struct Created {
 }
 
 /// 只生成,不碰磁盘。
+///
+/// `hardware` 在这里才用得上,而不是由调用方先跑:硬件根的定位符**就是这把
+/// 钥匙的指纹**,而指纹要等 seed 和公钥都算出来才有。所以顺序只能是
+/// seed → 指纹 → 封硬件 → 封信封。
+///
+/// 硬件那一趟失败会**整个连带失败**,不会留下"信封写了一半"的状态:信封由
+/// 调用方在本函数返回之后才落盘。
 pub fn generate(
     spec: &DidDocumentSpec,
     label: &str,
     passphrase: &[u8],
     device_secret: &LockedBytes,
     argon: Argon2Config,
+    hardware: HardwareChoice,
 ) -> Result<Created> {
     // seed 从生到封一直待在锁定区里,中途不出现裸副本。
     let seed = LockedBytes::generate()?;
@@ -45,6 +54,9 @@ pub fn generate(
     // 「DID 里的公钥」和「信封里的公钥」必然自洽,不需要事后核对。
     let did = compose_did_wba(spec, &verifying)?;
     let verification_method = format!("{did}#{}", spec.fragment);
+
+    // 要硬件绑定而没有硬件根 → 这里是**拒绝**发生的地方,不是降级发生的地方。
+    let hardware = hardware::seal_new(hardware, &thumbprint)?;
 
     let wrapped = wrap::seal(wrap::SealRequest {
         id: KeyId {
@@ -59,6 +71,7 @@ pub fn generate(
         device_secret,
         seed: &seed,
         argon,
+        hardware,
     })?;
 
     Ok(Created { wrapped, did, verification_method })
@@ -74,11 +87,12 @@ pub fn create(
     label: &str,
     passphrase: &[u8],
     argon: Argon2Config,
+    hardware: HardwareChoice,
 ) -> Result<Created> {
     layout.ensure()?;
     let device_secret = device::load_or_create(layout)?;
 
-    let created = generate(spec, label, passphrase, &device_secret, argon)?;
+    let created = generate(spec, label, passphrase, &device_secret, argon, hardware)?;
     store::save_new(layout, &created.wrapped)?;
     Ok(created)
 }
@@ -98,6 +112,11 @@ pub fn create(
 /// `relationships` 由调用方给:热密钥是 `authentication`,恢复密钥是
 /// `assertionMethod`。上游把"关系"和"角色"做成了一对一,所以这个选择决定
 /// 了这把钥匙在文档里能干什么,不能事后补。
+// 八个参数,每一个都是这条路上必须有人说的一个决定,而且调用点大多在 CLI 的
+// 解析层 —— 打成一个 `struct` 只会把同一批字段搬个地方,再多一层解构。这
+// 个 allow 和 `tss-esapi` 在同样的函数上打的是同一个(`create`/`create_primary`
+// 也都是七八个 `Option` 参数)。
+#[allow(clippy::too_many_arguments)]
 pub fn generate_extra(
     did: &str,
     fragment: &str,
@@ -106,11 +125,14 @@ pub fn generate_extra(
     passphrase: &[u8],
     device_secret: &LockedBytes,
     argon: Argon2Config,
+    hardware: HardwareChoice,
 ) -> Result<(WrappedKey, ExtraKey)> {
     let seed = LockedBytes::generate()?;
     let (verifying, public_multibase) = wrap::seed_to_public(&seed);
     // 指纹算的是**这把**钥匙,不是 DID 最后一段。
     let thumbprint = e1_segment(&verifying)?;
+
+    let hardware = hardware::seal_new(hardware, &thumbprint)?;
 
     let wrapped = wrap::seal(wrap::SealRequest {
         id: KeyId {
@@ -125,6 +147,7 @@ pub fn generate_extra(
         device_secret,
         seed: &seed,
         argon,
+        hardware,
     })?;
 
     Ok((wrapped, ExtraKey::new(fragment, verifying, relationships)))
@@ -132,6 +155,7 @@ pub fn generate_extra(
 
 /// [`generate_extra`] 再落盘。钥匙先写、文档后写 —— 反过来的话,一份
 /// 指向"本机没有的钥匙"的文档会先落地,而那是一份**谁也签不出来的**文档。
+#[allow(clippy::too_many_arguments)] // 见 `generate_extra` 上面那一段
 pub fn create_extra(
     layout: &KeydLayout,
     did: &str,
@@ -140,6 +164,7 @@ pub fn create_extra(
     label: &str,
     passphrase: &[u8],
     argon: Argon2Config,
+    hardware: HardwareChoice,
 ) -> Result<(WrappedKey, ExtraKey)> {
     layout.ensure()?;
     let device_secret = device::load_or_create(layout)?;
@@ -152,6 +177,7 @@ pub fn create_extra(
         passphrase,
         &device_secret,
         argon,
+        hardware,
     )?;
     // `save_new`:同一个指纹再生成一次是不可能的(除非运气好到撞上 2^-256),
     // 但万一撞上,盖掉的是**这个文件里唯一一份** seed。
@@ -181,7 +207,7 @@ mod tests {
 
     #[test]
     fn the_did_binds_the_envelope_public_key() {
-        let c = generate(&spec(), "alice", b"pw", &device(), fast()).unwrap();
+        let c = generate(&spec(), "alice", b"pw", &device(), fast(), HardwareChoice::None).unwrap();
         let root = c.wrapped.verifying_key().unwrap();
 
         // DID 最后一段 == e1_ 段 == KeyId.thumbprint
@@ -210,8 +236,8 @@ mod tests {
 
     #[test]
     fn two_generated_keys_never_collide() {
-        let a = generate(&spec(), "alice", b"pw", &device(), fast()).unwrap();
-        let b = generate(&spec(), "alice", b"pw", &device(), fast()).unwrap();
+        let a = generate(&spec(), "alice", b"pw", &device(), fast(), HardwareChoice::None).unwrap();
+        let b = generate(&spec(), "alice", b"pw", &device(), fast(), HardwareChoice::None).unwrap();
         assert_ne!(a.did, b.did, "each key must get its own DID");
         assert_ne!(a.wrapped.sk_ciphertext, b.wrapped.sk_ciphertext);
     }
@@ -221,7 +247,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("keyd-create-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let layout = KeydLayout::at(dir.clone());
-        let created = create(&layout, &spec(), "alice", b"pw", fast()).unwrap();
+        let created = create(&layout, &spec(), "alice", b"pw", fast(), HardwareChoice::None).unwrap();
 
         // 信封在,设备密钥也在(create 顺手建的)。
         let loaded = store::load(&layout, &created.wrapped.id.thumbprint).unwrap();

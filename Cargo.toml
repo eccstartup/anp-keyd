@@ -25,11 +25,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-st
 nix = { version = "0.31", features = ["socket", "user", "fs", "term"] }
 bip39 = { version = "3", default-features = false, features = ["zeroize"] }
 
-# —— 第三层:可执行文件身份。macOS 上要经 CoreFoundation 调 Security.framework
-# 的 SecCode API,把对端的 audit token 换成 cdhash。
-[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
-core-foundation-sys = "0.8"
-
 # —— 密码学(版本对齐 anp 1.0.6,避免同一 crate 出现两份)
 ed25519-dalek = { version = "=2.1.1", features = ["zeroize", "rand_core"] }
 argon2 = "0.5"
@@ -65,3 +60,52 @@ default = []
 seed-export = []
 # MCP 前端(stdin/stdout 上的 4 个工具)。单独开,免得不用 MCP 的人也把 rmcp 拖进来。
 mcp = ["dep:rmcp"]
+# —— M5 硬件根。三根各自一个特性,都不进默认构建。
+#
+# `hardware-software` 是**测试替身**,不是硬件:它把 HS 写成一个文件,好让
+# v2 记录格式在任何机器上都测得了。`probe` 不会把它算成一根根
+# (`is_hardware()` 返回 false)。
+hardware-software = []
+# macOS Secure Enclave。**注意:要分发给别人就得有 Apple 签发的证书** ——
+# SE 私钥只能靠钥匙串持久化,而写钥匙串要 `application-identifier` 这个
+# entitlement,那个只有正式签名才给得起。详见 README。
+hardware-se = [
+    "dep:core-foundation",
+    "dep:security-framework",
+    "dep:security-framework-sys",
+]
+# Linux TPM 2.0。没有上面那道门槛:不需要 entitlement,`swtpm` 还能本地模拟。
+hardware-tpm = ["dep:tss-esapi"]
+
+# ————————————————————————————————————————————————————————————————————————
+# 平台相关的依赖。**放在文件末尾是有意的** —— TOML 的 `[table]` 一直管到
+# 下一个表头,把 `[target...]` 插在 `[dependencies]` 中间会让后面那些行
+# 悄悄落进目标表里,在本机上就"找不到 crate"了。
+# ————————————————————————————————————————————————————————————————————————
+
+# 第三层:可执行文件身份。macOS 上要经 CoreFoundation 调 Security.framework
+# 的 SecCode API,把对端的 audit token 换成 cdhash。
+#
+# 另外三个是 M5 的 SE 后端(`hardware-se`)。**可选**:不绑 SE 的人不该被拖进
+# 这些依赖。
+#
+# - `core-foundation` 是安全封装(Enums 而不是裸指针),拼
+#   `SecKeyCreateWithData` 那个属性字典要用它。
+# - `security-framework-sys` 是必要的 —— 安全封装 crate **没有**包
+#   `SecKeyCreateWithData`,而 SE 的 ECDH 要拿一把临时公钥去算,那把钥匙必须
+#   从信封里的原始字节建出来。
+# - `OSX_10_15` 那个特性也是必要的,而且很容易漏:SE 私钥必须存在**数据保护
+#   钥匙串**里,而 `Location::DataProtectionKeychain` 和
+#   `kSecUseDataProtectionKeychain` 两个名字都在这个特性后面。少了它,造钥匙
+#   和按标签找回会**落在两个不同的钥匙串上**,症状是"刚存的钥匙找不到"。
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+core-foundation = { version = "0.10", optional = true }
+core-foundation-sys = "0.8"
+security-framework = { version = "3.7", optional = true, features = ["OSX_10_15"] }
+security-framework-sys = { version = "2.14", optional = true }
+
+# M5 的 TPM 后端(`hardware-tpm`)。**只对 Linux 成立** —— `tss-esapi-sys`
+# 的构建脚本在别的平台上会直接 panic,而且它本来就是在跟 `/dev/tpmrm0`
+# 说话,别的平台上那个设备不存在。目标门控是必须的,不是整洁。
+[target.'cfg(target_os = "linux")'.dependencies]
+tss-esapi = { version = "7.7", optional = true }

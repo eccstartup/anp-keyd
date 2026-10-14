@@ -33,6 +33,7 @@ use crate::crypto::kdf::Argon2Config;
 use crate::did::lifecycle;
 use crate::error::Result;
 use crate::keystore::create;
+use crate::keystore::hardware::HardwareChoice;
 use crate::ops::{hosting_notice, sign_confirm_and_write, Session};
 
 /// 加一把恢复密钥。
@@ -40,6 +41,12 @@ pub struct AddRecoveryKey {
     pub did: String,
     /// 人读的标签。它进 AAD,所以改它要重封,不是改个注释。
     pub label: String,
+    /// 新信封要不要绑一根硬件根。见 [`crate::cli::HardwareArgs`]。
+    ///
+    /// 恢复密钥尤其值得绑:它的用途是"别的都没了的时候用它搬家",所以它比
+    /// 任何一把钥匙都更可能被抄到 U 盘或者备份盘上 —— 而硬件绑定的作用恰恰
+    /// 就是让那份拷贝在别的机器上打不开。
+    pub hardware: HardwareChoice,
 }
 
 pub fn add_recovery_key(root: Option<&Path>, args: AddRecoveryKey) -> Result<()> {
@@ -71,6 +78,7 @@ pub fn add_recovery_key(root: Option<&Path>, args: AddRecoveryKey) -> Result<()>
         &args.label,
         passphrase.as_bytes(),
         Argon2Config::default(),
+        args.hardware,
     )?;
 
     let updated =
@@ -114,6 +122,12 @@ pub struct RotateHotKey {
     pub label: String,
     /// 把旧的那把留在文档里(默认不留)。
     pub keep_old: bool,
+    /// 新信封要不要绑一根硬件根。
+    ///
+    /// **只影响新生成的那把。** 退休的那一把信封原样留在磁盘上,它绑没绑
+    /// 硬件、绑的是哪一根,都由它自己那个文件说了算 —— 轮换不该、也不能
+    /// 悄悄重封一把别人已经用过的钥匙。
+    pub hardware: HardwareChoice,
 }
 
 pub fn rotate_hot_key(root: Option<&Path>, args: RotateHotKey) -> Result<()> {
@@ -152,6 +166,7 @@ pub fn rotate_hot_key(root: Option<&Path>, args: RotateHotKey) -> Result<()> {
         &args.label,
         passphrase.as_bytes(),
         Argon2Config::default(),
+        args.hardware,
     )?;
 
     let mut updated =
