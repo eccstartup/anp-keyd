@@ -230,8 +230,9 @@ public_key.verify(b64u_decode(signature), challenge.encode("utf-8"))
 
 **这不是理论上的。** awiki 自己的两个浏览器扩展正是这么做的
 (`signChallenge = ed25519.sign(utf8(challenge), priv)`),注释写的是 "proving possession
-of the key *right now* by signing a server-issued challenge"。也就是说这类调用方**今天
-就在**。
+of the key *right now* by signing a server-issued challenge"。**但要说准:那两个扩展
+不是 keyd 的客户端** —— 它们的私钥在浏览器里。所以这一类调用方今天就在,可**今天要用
+keyd 去驱动注册的工具,一个都没有**。
 
 **所以 §3.1 那句"缺的是一个不透明字符串和一条长度上限"对注册不成立。** 按 §十,能做这件事
 的只有 `sign --raw`,而 §十 明确不为适配打开它。**这不是一个疏漏,是一个必须由人拍的岔口。**
@@ -249,9 +250,10 @@ of the key *right now* by signing a server-issued challenge"。也就是说这�
 3. **承认注册不在适配范围内。** 和 §4.3「注册与发现不进守护进程」是一条线:守护进程只签
    "这条注册请求",签不出的那部分不做,留给客户端自己实现。
 
-**在挑定之前,connectx 那条路不受影响** —— connectx 自己的 `register` 走的是共享的
-"签名 + 401 挑战重签"管线,不发 `challenge_signature`。所以 §十一 的验收剧本能不能撞上它,
-取决于对端那一刻要不要那层绑定。
+**在挑定之前,两个已知客户端都不受影响** —— connectx 的 `register` 走共享的"签名 +
+401 挑战重签"管线,awiki-cli-rs2 的注册 RPC 里根本没有这个字段(§八,两条都核过)。
+**所以三条路里"不签"那条,今天一分钱不花**:它唯一的价格是**将来** —— 对端可以把它
+从"可选"翻成"必需",到那天 keyd 驱动的注册就断了。这是**前瞻性的线,不是眼下的拦路石**。
 
 ### 3.4 够用的:`LIST_KEYS`
 
@@ -400,14 +402,52 @@ connectx 有两个接缝,要挑对的那一个:
 不出现钱包知识、不出现协议知识,**只做转发和错误翻译**。一个 keyd connector 里
 出现 "ANP" 这个词,就是边界划错了地方。
 
-### awiki-cli-rs2:同一条路,不同的接缝
+### awiki-cli-rs2:接缝已经在了,而且它的形状就是 keyd 的形状
 
-它已经在 `anp` crate 上,所以"把本地密钥那一步换成 socket 调用"在原理上是同一件
-事。**但它的源码不在这台机器上,我没有读过它的接缝长什么样** —— 所以这一节
-只给出契约(keyd 提供 §3.1 / §3.2 那两条原语,`LIST_KEYS` 已经有了),不给出改法。
-**它会不会也撞上 §3.3 的挑战签名,是核实它的源码时要一并回答的问题** —— 如果它
-的 `register` 也发 `challenge_signature`,那 §3.3 的三选一就不只关系到一个工具。
-§十二 记着这条。
+**源码核过了(2026-10-14,`~/code/claude/awiki-cli-rs2`)。** 结论比预期的好:
+它不是"要不要为它抽象一层"的问题 —— **那层已经在了,而且已经插过第二种 custody。**
+
+那层叫 `IdentitySigner`(`crates/im-core/src/internal/key_provider/mod.rs`),同步,
+方法正好是 §三 那两条原语的形状:
+
+- `did_document()` / `optional_did_document()` —— 就是 §3.2 的 `GET_DOCUMENT`。
+- `http_signature_headers(kid, url, method, headers, body, options)` —— 就是 §3.1
+  的结构化 `SIGN`,而且 `options`(`anp::authentication::HttpSignatureOptions`)
+  **本来就带 `nonce` / `created` / `expires` / `covered_components` 四个字段。**
+
+关键是它**已经有好几个实现**,而**其中两个正是"custody 在别处"的做法**:
+
+| 实现 | custody 在哪 |
+|---|---|
+| `FileBackedIdentitySigner` / `HostedIdentitySigner` / `VaultBackedIdentitySigner` | 本进程,私钥 PEM 在手里 |
+| **`AnpIdentitySigner`** | **转手给 `anp-identity` crate**:`identity.prepare_http_signature(ExactHttpRequest{…})` |
+| `ProviderIdentitySigner` | 转手给一个异步 `IdentitySession`(外部进程) |
+
+`AnpIdentitySigner` 把 `http_signature_headers`、`sign_object_proof`、
+`sign_document_proof`、`sign_origin_proof`、`legacy_did_wba_header` **逐个覆盖**,
+每一个都转手给 custody 层,im-core 这层手里没有私钥材料。**这就是 keyd 要照抄的
+模板**:再写一个 `KeydIdentitySigner`,同样那几个覆盖,把结构化请求发给守护进程。
+
+**为什么不能接在那个 `sign` 上。** trait 里确实有一个底层原语
+`sign(kid, message: &[u8])`,而那几段默认实现都落在它上面 —— **那正是 `Raw` 的形状**,
+接上去等于 §十 那条线白划。所以落点是**覆盖那几个结构化方法**,不是实现那个最底层的。
+(它旁边还有一层异步的 `IdentitySession` / `IdentityCustody`,是给"custody 在另一个
+进程"准备的;`export_root_for_legacy_envelope` 的默认实现返回 `CapabilityUnavailable`
+—— **做不到的能力声明做不到,不假装**,和 keyd 的 `probe` 是同一种脾气。)
+
+**一处要留意的错位。** `sign_document_proof` 收的是**调用方构造的文档**。keyd 不签
+调用方给的文档(不变量 3、§3.2),这边对应的答案是"文档由 `publish` 造、客户端用
+`GET_DOCUMENT` 取"。所以这个方法在 keyd 后端里要么不实现,要么转成取文档 ——
+**注册那一段的改法和其余几段不一样**,这一点在动手时要单独想。
+
+**§3.3 那个挑战签名,它不发。** `challenge_signature` 在这个仓库里一次都没出现
+(Rust / TS / Dart / 文档全查过);注册 RPC 的 payload 是
+`did_document / handle / name / phone / otp_code / email / invite_code`
+(`crates/im-core/src/internal/identity_wire/registration.rs`)。
+
+**顺带一条和 §12.3 对上号的:** 它钉死 `anp = "=1.0.3"`(path 依赖 `../anp/anp/rust`,
+配 `anp-release.lock.json` 的 `candidateVersion: 1.0.3`)—— **和 Python 服务端
+`anp==1.0.3` 同版**。所以那道错位是"整条 awiki 都在 1.0.3,只有 keyd 在 1.0.6"。
 
 ---
 
@@ -532,39 +572,49 @@ connectx 有两个接缝,要挑对的那一个:
    一样"。签名基是跨语言拼出来的(守护进程 Rust / 服务端 Python),**跨语言验过一次
    才算** —— 见 §12.4。
 
-**这条剧本有一个前提,现在要写出来:** connectx 的 `register` 今天**不发**
-`challenge_signature`(§3.3),所以它能在这个剧本里跑到绿。**如果 §3.3 的答案是
-路子 2(开一条窄路),剧本要加一步** —— 用扩展那条同样的挑战签名过一遍注册;
-**如果答案是路子 1(不签),这一条要写成一条明说的缺口**:剧本证明的是"这条
-注册路径能走通",不是"注册这件事整个被抽出来了"。**别让一个绿的剧本冒充比它
-更宽的结论。**
+**这条剧本有一个前提,现在写出来:** connectx 和 awiki-cli-rs2 的 `register` **都不发**
+`challenge_signature`(§八),所以剧本能跑到绿。**话也要说全** —— 它证明的是"这条注册
+路径能走通",**不是**"注册这件事整个被抽出来了":对端一旦把挑战签名翻成必需,
+剧本里那一步就得补(§3.3)。**别让一个绿的剧本冒充比它更宽的结论。**
 
 ---
 
 ## 十二、未决 / 动手前要先核实的
 
-按"不核实就会做错"的次序:
+按"不核实就会做错"的次序 —— **已经核掉的,结论写在条目里,不再挂着**:
 
-1. **DID 推导必须逐字节一致。** connectx 的 `identityDid` 是它**自己实现**的指纹
-   推导(`src/core/identity.ts`),而 anp-keyd 走 `anp` crate 的
-   `build_unsigned_e1_did_document`。两者是不是同一个结果,**必须实测**,不能靠
-   "都按 ANP-03 写的"来推。不一致的话,§五 代价 1 从"最好从守护进程读"变成
-   "只能从守护进程读"。
-2. **awiki-cli-rs2 的接缝未核实。** 源码不在本机。要确认:它怎么拼签名基、有没有
-   一个相当于 `IWallet` / `AnpConnector` 的抽象层,**以及它的 `register` 发不发
-   `challenge_signature`**(§3.3 —— 发的话,那个三选一就不只关系到一个工具)。
-3. **上游版本错位。** anp-keyd 钉死 `anp = "=1.0.6"`;之前那份 connectx↔awiki 的
-   对接记录里写的是 Python 侧 `anp==1.0.3`。nonce 与窗口语义在版本间是否一致,
-   动手前要核。
-4. **签名基必须逐字节一致,而它是跨语言拼出来的。** 守护进程用 Rust(`anp` crate)
-   拼基;对端是 Python 的 awiki-open-server;connectx 那份是 JS 自己实现的
-   (`src/core/crypto/signatureBase.ts`)。RFC 9421 的基是**按行**拼的文本,
-   **差一个空格就是另一条签名**。这是整条路上最硬的一处一致性要求,而且跨了三种语言
-   —— 必须拿真对端跑一次,不能靠"大家都按 RFC 9421 写的"来推。
-5. **§3.3 那个岔口要由人拍。** 注册的挑战签名是三条路上的哪一条(不签 / 开一条
-   比 `Raw` 窄的路 / 承认注册不在范围内),**在动手写 connector 之前要定下来**。
-   它是这份文档里唯一一处会碰到 §十 那条线的地方,而它有一个倒计时:对端今天把
-   那层绑定当可选,**但它可以变成必需** —— 到那天,今天这个"不签也能过"的答案
-   会变成一条拦在做了一半的适配前面的路。
-6. **`LIST_KEYS` 要不要报出密钥角色。** 见 §3.4 —— 现在判断是"不加",但没有证据
-   说过客户端不会需要它。等真的需要时再加,比现在猜一个结构要好。
+1. **DID 推导 —— 已核,两边逐字节一致。** connectx 的 `ed25519Fingerprint`
+   (`src/core/crypto/fingerprint.ts`:RFC 7638 JWK → SHA-256 → base64url 无填充)和守护
+   进程走的 `anp` 上游 `compute_multikey_fingerprint` 是同一串字节 —— 拿 connectx 自己的
+   测试向量独立算过,对上(`e1_UDDReOZl1ipXAfp9wYsm13sDBMK5og--QWdBjzuf6o4`)。剩下的
+   是**在仓库里加一条向量测试把它钉住**,免得哪一边以后悄悄改了编码。
+2. **awiki-cli-rs2 的接缝 —— 已核,结论在 §八。** 它已有一层 `IdentitySigner`,方法
+   形状就是 §3.1 / §3.2 那两条;而且 `AnpIdentitySigner` 已经是"custody 在别处"的
+   现成先例,keyd 照它再做一份即可。注册不发 `challenge_signature`。**剩下要单独想
+   的只有一处**:`sign_document_proof` 收调用方构造的文档,和 keyd 的不变量 3 错位。
+   另外 `../anp` 这个 path 依赖本机没有 checkout,**1.0.3 ↔ 1.0.6 的签名基逐字节比对
+   还没跑过** —— 见下一条。
+3. **上游版本错位,现在量准了。** 整条 awiki(Rust CLI 的 path 依赖 `=1.0.3` +
+   Python 服务端的 wheel `anp-1.0.3`)都在 **1.0.3**,只有 anp-keyd 钉的是
+   **`=1.0.6`**。差的是**一个 minor 里的补丁版**,但不能靠"补丁版不会动签名基"来推
+   —— 要把 1.0.3 的 `serialize_signature_params` / `build_signature_base` 和 1.0.6 摆
+   一起看一遍,或者直接拿 1.0.3 拼出来的基和 keyd 拼的比一次。**这是 §十二 里现在最
+   实的一条未核实项。**
+4. **签名基 —— 已核到序列化这一层;还差拿真对端跑一次。** 覆盖面、参数顺序
+   (`created;expires;nonce;keyid`,两边都不带 `alg`)、`@signature-params` 那一行的拼法、
+   行分隔 `\n`,以及 300 秒的 `expires`,四种拼法(Rust `anp` crate / Python 服务端 /
+   connectx 的 JS)逐字节相同。**已知一处分岔**:`@authority` 对显式默认端口 `:443` 的
+   处理不一致(connectx 用 WHATWG `URL.host`,吃掉它;keyd 从 URL 文本切,保留它)。
+   加上上面第 3 条那道版本差 —— **必须拿真对端(以及 1.0.3 那份)跑一次,不能靠
+   "都按 RFC 9421 写的"来推。**
+5. **§3.3 那个岔口 —— 是一条前瞻性的线,不是眼下的拦路石。** 核过两个客户端
+   (connectx、awiki-cli-rs2),**没有一个发那个挑战签名**,所以三条路里"不签"这条
+   今天零成本。要拍的不是"现在怎么办",是"**将来对端把它翻成必需时怎么办**" ——
+   到那天再拍也不迟,但**先把它写下来**(§3.3)的价值在于:别让它在写 connector
+   的那天以"顺手开个口子"的形式自己冒出来。
+6. **`LIST_KEYS` 要不要报出密钥角色。** 见 §3.4 —— 现在判断是"不加"。**新证据削弱
+   了"加"的理由,不是加强:`IdentitySigner` 里确实有一套角色词表**
+   (`DeviceAssertion` / `Authentication` / `KeyAgreement` / `RootControl`),但它
+   **从文档里推**(`root_control_key_id` 读 `proof.verificationMethod`,
+   `agreement_key_id` 读 `keyAgreement`),不从密钥列表里要。也就是说客户端要的
+   是 §3.2 那份文档,不是 `LIST_KEYS` 多几个字段。
