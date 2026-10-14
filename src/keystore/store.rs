@@ -216,6 +216,27 @@ pub fn read_did_document(layout: &KeydLayout, did: &str) -> Result<serde_json::V
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// 读一份 DID 文档的**原始字节** —— 就是 `publish` 写下去的那一份。
+///
+/// 和 [`read_did_document`] 的区别是它不经过 `serde_json::Value`:那份文档是
+/// 一件**签好名的成品**,它的字节就是被签的那些字节,而 `Value` 一来一回会
+/// 把键重排(默认的 `Map` 是有序的),交出去就不再是发布出去的那一份了。
+/// 调用方要内联它、要拿它和服务端手里那份比,所以这里给的是原文。
+///
+/// 仍然解析一遍 —— 不是为了用它,是为了**不把一份读不懂的文件当文档交出去**。
+pub fn read_did_document_bytes(layout: &KeydLayout, did: &str) -> Result<Vec<u8>> {
+    let path = layout.did_path(did);
+    let bytes = fs::read(&path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            KeydError::KeyNotFound(did.to_string())
+        } else {
+            KeydError::Io(e)
+        }
+    })?;
+    serde_json::from_slice::<serde_json::Value>(&bytes)?;
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

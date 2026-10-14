@@ -94,6 +94,17 @@ pub enum Event {
         payload_len: usize,
         payload_digest: String,
     },
+    /// 有人取走了一份 DID 文档。
+    ///
+    /// 这条**不是**"授权"的记录，是"取件"的记录：文档本来就躺在一个 0644
+    /// 的文件里，可公开。记它是因为"谁在什么时候把哪一版的文档取走了"事后
+    /// 要查得出来 —— 摘要记的是**那一刻磁盘上那一份**，不是这个 DID 恒定的
+    /// 某个值。
+    DocumentRead {
+        uid: u32,
+        did: String,
+        document_digest: String,
+    },
     /// 空闲超时收走了钥匙。
     Swept {
         dropped: usize,
@@ -857,6 +868,7 @@ mod tests {
                 signature_base_digest: "ab".into(),
             },
             Event::RawSigned { uid: 1, did: "d".into(), payload_len: 3, payload_digest: "cd".into() },
+            Event::DocumentRead { uid: 1, did: "d".into(), document_digest: "ef".into() },
             Event::Swept { dropped: 1 },
         ];
 
@@ -868,7 +880,7 @@ mod tests {
             .collect();
         assert_eq!(
             tags,
-            ["DENIED", "UNLOCKED", "LOCKED", "SIGNED", "RAW_SIGNED", "SWEPT"]
+            ["DENIED", "UNLOCKED", "LOCKED", "SIGNED", "RAW_SIGNED", "DOCUMENT_READ", "SWEPT"]
         );
     }
 

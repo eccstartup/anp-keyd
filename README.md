@@ -147,6 +147,30 @@ anp-keyd sign --did … --method POST --url https://… \
 给了 `--body`,`content-digest` 一定进覆盖面,而且**由守护进程自己算** ——
 请求里带的同名头会被忽略。
 
+有的服务要求请求认证里的 `nonce` 和请求体里那个**是同一个值**(防重放),
+那就由调用方给:
+
+```bash
+anp-keyd sign --did … --method POST --url https://… \
+  --header 'content-type: application/json' \
+  --body request.json \
+  --nonce "$(jq -r .nonce request.json)"
+```
+
+它同时出现在两处,所以守护进程没法替你挑:它只会把你给的这个值原样放进
+`@signature-params`。不给就一个都不放,不会自己编一个。
+
+agent 要证明自己是谁,手上得有 `publish` 出来的那份文档。它也从 socket 上
+取,而且**不用解锁** —— 那份文档本来就是给外面看的:
+
+```bash
+anp-keyd document --did did:wba:example.com:agents:mybot:e1_abc…
+```
+
+打出来的是磁盘上那一份的**原文**,逐字节。这份文档是签过名的,内联进别处
+靠的就是这一点,所以中间不会有人替你重排键或补空白。答得出来的是**本机
+发布过的**那几个 DID,别人的答不出来 —— 守护进程不联网,那是客户端自己的事。
+
 试的时候建议加 `--root DIR`,免得真钥匙和实验钥匙混在一起。
 
 ## 命令
@@ -155,13 +179,14 @@ anp-keyd sign --did … --method POST --url https://… \
 
 ### 走 socket 的(给 agent 用)
 
-连上守护进程,拿签名,**从始至终不碰私钥字节**。
+连上守护进程要它做事,**从始至终不碰私钥字节**。
 
 | 命令 | 干什么 |
 |---|---|
 | `sign` | 签一条 RFC 9421 请求,把签名头打到 stdout |
 | `list` | 列出这台机器上的钥匙 |
 | `status` | 列出当前已解锁的钥匙,以及各自解锁了多久 |
+| `document` | 打出一份本机发布过的 DID 文档,**原样**——不用解锁 |
 | `unlock` | 解锁一把钥匙(这一步是人做的,要敲口令) |
 | `lock` | 上锁 |
 
@@ -403,9 +428,9 @@ issue 里。
 
 ## 接到 agent 上
 
-`mcp` 子命令在 stdin/stdout 上说 MCP,把四个工具(`list_my_keys` /
-`status` / `sign_request` / `unlock`)转发给守护进程。它自己不开密钥库,
-也不碰密码学。
+`mcp` 子命令在 stdin/stdout 上说 MCP,把几个工具(`list_my_keys` /
+`status` / `sign_request` / `unlock` / `get_did_document`)转发给守护进程。
+它自己不开密钥库,也不碰密码学。
 
 ```bash
 cargo install --path . --features mcp
@@ -421,7 +446,7 @@ MCP 客户端的配置里,那一行 `command` 就指向这个子命令,参数是
 }
 ```
 
-四个工具里只有 `unlock` 会把口令带过那条通道,而它是个**权衡不是免费的
+五个工具里只有 `unlock` 会把口令带过那条通道,而它是个**权衡不是免费的
 东西**:口令只是两个因子之一(`device.secret` 从不经手 MCP),而且它给的
 不是新能力 —— `sign_request` 本来就能签。不想要就别构建这个特性。
 
@@ -439,9 +464,9 @@ cp -r skills/anp-keyd ~/.claude/skills/          # 只给自己用
 cp -r skills/anp-keyd .claude/skills/            # 给这个项目里的会话用
 ```
 
-自己写客户端也可以 —— 线上是 `u32_be(len) || payload`,消息类型只有五种
-(`LIST_KEYS` `SIGN` `UNLOCK` `LOCK` `STATUS`)。[`src/client/mod.rs`](src/client/mod.rs)
-就是一份可以直接抄的最小实现。
+自己写客户端也可以 —— 线上是 `u32_be(len) || payload`,消息类型只有六种
+(`LIST_KEYS` `SIGN` `UNLOCK` `LOCK` `STATUS` `GET_DOCUMENT`)。
+[`src/client/mod.rs`](src/client/mod.rs) 就是一份可以直接抄的最小实现。
 
 ## 测试
 
@@ -474,7 +499,7 @@ cargo clippy --all-targets --all-features
 | `tests/vectors/` + `tests/vectors.rs` | 外部标准还认不认我们的实现 | 先怀疑实现,别改向量 |
 
 另有四个单一命题,每个一个文件:`tests/probe.rs`(体检说的都是真的)、
-`tests/mcp.rs`(MCP 那四个工具就是全部)、`tests/hardware.rs`(硬件绑定那
+`tests/mcp.rs`(MCP 那五个工具就是全部)、`tests/hardware.rs`(硬件绑定那
 条路的**形状**:版本分派、AAD、硬件不在、口令错、拒绝降级)、
 `tests/no_key_material_on_disk.rs`(走完一遍之后,磁盘上扫不出任何密钥材料)。
 

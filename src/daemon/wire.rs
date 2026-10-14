@@ -37,6 +37,7 @@ pub const SIGN: u8 = 0x02;
 pub const UNLOCK: u8 = 0x03;
 pub const LOCK: u8 = 0x04;
 pub const STATUS: u8 = 0x05;
+pub const GET_DOCUMENT: u8 = 0x06;
 pub const OK: u8 = 0x80;
 pub const ERR: u8 = 0x81;
 
@@ -51,8 +52,18 @@ pub const ERR: u8 = 0x81;
 /// socket 上的消息类型,它**送不到守护进程**。
 ///
 /// 所以:加一个类型到这张表里,等于改变整个授权模型。它必须是一次看得见的
-/// 决定,而不是顺手写下的第 0x06 号。
-pub const REQUEST_TYPES: [u8; 5] = [LIST_KEYS, SIGN, UNLOCK, LOCK, STATUS];
+/// 决定,而不是顺手写下的下一个编号。
+///
+/// **这个决定真做过一次,[`GET_DOCUMENT`] 是那一次,而它一次授权都没有改。**
+/// 加它是因为适配层要让客户端内联一份 DID 文档(`docs/ADAPTER.md` §3.2):
+/// 它只读、不进覆盖面、不碰私钥、不产生签名。开放的是**一次读**,不是一次
+/// **授权** —— 读得到的东西本来就躺在 `dids/` 里的 0644 文件里,而那是这台
+/// 机器**自己发布过**的那些 DID,别人的一个都够不到。
+///
+/// 上面那句话("加一个类型等于改变整个授权模型")因此并没有被推翻:它说的是
+/// **会签名的**类型,而这一条不签。真正要守住的那条线还是"不许出现一个能把
+/// 密钥材料交出去的类型" —— 下一个往这里加类型的人,读的还是这一段。
+pub const REQUEST_TYPES: [u8; 6] = [LIST_KEYS, SIGN, UNLOCK, LOCK, STATUS, GET_DOCUMENT];
 
 /// 错误码。
 ///
@@ -216,6 +227,16 @@ pub enum SignRequest {
         /// 调用方**额外**要求覆盖的分量。只能加,不能减 —— 见
         /// [`crate::sign::rfc9421::SignRequest::covered`]。
         covered: Vec<String>,
+        /// 调用方指定的 nonce。不给/给空 = 由守护进程随机生成一个(`anp`
+        /// 上游在 `None` 时的行为)。
+        ///
+        /// **它是不透明的。** 守护进程只查长度和"能不能写进签名基",不判断
+        /// 它是不是一个"合法"的 nonce —— 那是服务端的事。为什么它必须由
+        /// 调用方传、而不是守护进程自己挑,见 `docs/ADAPTER.md` §3.1。
+        ///
+        /// 空串按"没给"处理,和这个协议里其它可选字符串(`LOCK` 的 `did`、
+        /// 这里的 `kid`)是同一个约定。
+        nonce: Option<String>,
     },
     /// 受限路径:原始字节。默认关,`--allow-raw-signing` 才开,且必留审计。
     Raw { did: String, kid: Option<String>, payload: Vec<u8> },
@@ -240,6 +261,11 @@ pub enum Request {
     /// 解锁着的全放掉;再给 `kid` 就是精确到一把。
     Lock { did: Option<String>, kid: Option<String> },
     Status,
+    /// 读一份**本机发布过的** DID 文档。只读,不签任何东西。
+    ///
+    /// `did` 是那台机器上 `publish` 过的某个 DID —— 这台机器没有发布过的
+    /// DID 一律答 `KeyNotFound`(它不能联网去取,见 `docs/ADAPTER.md` §3.2)。
+    GetDocument { did: String },
 }
 
 /// 一条应答。
@@ -250,6 +276,13 @@ pub enum Response {
     /// `u16 sig_len ‖ sig`。Ed25519 的签名是 64 字节。
     Signature(Vec<u8>),
     Status(Vec<UnlockedKey>),
+    /// 一份 DID 文档的**原始字节** —— 就是 `publish` 写下去的那一份。
+    ///
+    /// 不是解析出来再序列化回去:那份文档是一件**签好名的成品**,它的字节
+    /// 排布本身就是被签的那一份(proof 走 JCS,规范化之后的字节就是它)。
+    /// 交到调用方手里必须是原文,否则"内联一份和已发布的一模一样的文档"
+    /// 这句话就不成立了(`docs/ADAPTER.md` §3.2)。
+    Document(Vec<u8>),
     Error { code: ErrorCode, message: String },
 }
 
@@ -388,6 +421,12 @@ fn decode_request(payload: &[u8]) -> Result<Request> {
             expect_empty(body, "STATUS")?;
             Ok(Request::Status)
         }
+        GET_DOCUMENT => {
+            let mut c = Cursor::new(body);
+            let did = c.string16()?;
+            c.expect_end("GET_DOCUMENT")?;
+            Ok(Request::GetDocument { did })
+        }
         other => Err(KeydError::Protocol(format!(
             "0x{other:02x} is not a request type this daemon accepts"
         ))),
@@ -425,9 +464,21 @@ fn decode_sign(body: &[u8]) -> Result<SignRequest> {
             for _ in 0..covered_count {
                 covered.push(c.string16()?);
             }
+
+            // 空串 = "没给"。见 [`SignRequest::Structured::nonce`]。
+            let nonce = c.opt_string16()?;
             c.expect_end("SIGN(Structured)")?;
 
-            Ok(SignRequest::Structured { did, kid, method, target_uri, headers, body, covered })
+            Ok(SignRequest::Structured {
+                did,
+                kid,
+                method,
+                target_uri,
+                headers,
+                body,
+                covered,
+                nonce,
+            })
         }
         0x02 => {
             let did = c.string16()?;
@@ -498,6 +549,12 @@ fn decode_response(payload: &[u8]) -> Result<Response> {
             c.expect_end("STATUS")?;
             Ok(Response::Status(keys))
         }
+        GET_DOCUMENT => {
+            let mut c = Cursor::new(body);
+            let document = c.bytes32()?;
+            c.expect_end("GET_DOCUMENT")?;
+            Ok(Response::Document(document))
+        }
         other => Err(KeydError::Protocol(format!(
             "0x{other:02x} is not a response type this client knows"
         ))),
@@ -519,6 +576,7 @@ fn encode_request(request: &Request) -> Result<Vec<u8>> {
                     headers,
                     body: request_body,
                     covered,
+                    nonce,
                 } => {
                     body.push(0x01);
                     body.string16(did)?;
@@ -537,6 +595,7 @@ fn encode_request(request: &Request) -> Result<Vec<u8>> {
                     for component in covered {
                         body.string16(component)?;
                     }
+                    body.string16(nonce.as_deref().unwrap_or(""))?;
                 }
                 SignRequest::Raw { did, kid, payload } => {
                     body.push(0x02);
@@ -557,6 +616,10 @@ fn encode_request(request: &Request) -> Result<Vec<u8>> {
             body.string16(did.as_deref().unwrap_or(""))?;
             body.string16(kid.as_deref().unwrap_or(""))?;
             LOCK
+        }
+        Request::GetDocument { did } => {
+            body.string16(did)?;
+            GET_DOCUMENT
         }
     };
 
@@ -606,6 +669,10 @@ fn encode_response(response: &Response) -> Result<Vec<u8>> {
                 body.u64(key.unlocked_secs);
             }
             STATUS
+        }
+        Response::Document(document) => {
+            body.bytes32(document)?;
+            GET_DOCUMENT
         }
     };
 
@@ -862,6 +929,7 @@ mod tests {
             headers,
             body: Some(b"{\"hello\":1}".to_vec()),
             covered: vec!["content-type".into()],
+            nonce: None,
         }
     }
 
@@ -874,15 +942,21 @@ mod tests {
     ///
     /// 所以这个测试同时干两件事:
     ///
-    /// 1. 把 256 个字节**逐个**喂进解码器,只允许 [`REQUEST_TYPES`] 里那 5 个
-    ///    不报"没有这个类型"。将来谁顺手加了一个 0x06,这里立刻红。
+    /// 1. 把 256 个字节**逐个**喂进解码器,只允许 [`REQUEST_TYPES`] 里那几个
+    ///    不报"没有这个类型"。将来谁顺手加了一个新的,这里立刻红。
     /// 2. 把表本身也数一遍 —— 加成员是一次**看得见的决定**,不是顺手写的
     ///    一个分支。
+    ///
+    /// **`GET_DOCUMENT` 是那张表上唯一一次"加过"。** 它把 0x06 用掉了,而
+    /// 0x06 本来正是下面那段点名的"下一个编号"。改这一条的时候要带着
+    /// [`REQUEST_TYPES`] 的注释一起读:那次加的是一个**不签名**的类型,所以
+    /// "加类型 = 改授权模型"那句话没被推翻。**下一个加的人要面对的是同一句
+    /// 话,不是同一条先例。**
     #[test]
-    fn the_only_message_types_are_the_five_that_do_not_export_anything() {
+    fn the_message_types_are_the_ones_that_do_not_export_anything() {
         assert_eq!(
             REQUEST_TYPES.len(),
-            5,
+            6,
             "the request table changed. Read the comment on REQUEST_TYPES before \
              accepting a new one — a type that can hand out key material is a different \
              product, not a new feature"
@@ -901,14 +975,70 @@ mod tests {
         }
 
         // 顺手把几个"最像导出"的编号钉死,好在有人真去加的时候一眼看见自己
-        // 加的是什么。0x06 是这张表顺下来的下一个。
-        for byte in [0x00, 0x06, 0x07, 0x40, 0x7F, 0x90] {
+        // 加的是什么。0x07 是这张表顺下来的下一个。
+        for byte in [0x00, 0x07, 0x40, 0x7F, 0x90] {
             assert!(
                 decode_request(&[byte]).is_err(),
                 "0x{byte:02x} must stay unused: an unused code point is what a future \
                  `EXPORT_SEED` message would need, and there is deliberately no room for it"
             );
         }
+    }
+
+    /// **`GET_DOCUMENT` 读得到文档,但读不出这台机器没有发布过的东西。**
+    ///
+    /// 线上那一层能保证的只是"这个 DID 名被原样送到了守护进程";答不答得出
+    /// 东西由磁盘决定(见 `daemon::state::DaemonState::get_document`)。这条
+    /// 测试钉的是**字节原样**:文档是 sigil 里带引号、括号、换行的 JSON,
+    /// 中间任何一个字符被规范化过,内联出去的那一份就和发布的那一份对不上。
+    #[test]
+    fn a_document_survives_the_wire_byte_for_byte() {
+        let document = b"{\n  \"id\": \"did:wba:example.com:user:alice:e1_abc\",\n  \"@context\": []\n}\n".to_vec();
+
+        assert_eq!(
+            round_trip_request(&Request::GetDocument {
+                did: "did:wba:example.com:user:alice:e1_abc".into()
+            }),
+            Request::GetDocument { did: "did:wba:example.com:user:alice:e1_abc".into() }
+        );
+        assert_eq!(
+            round_trip_response(&Response::Document(document.clone())),
+            Response::Document(document)
+        );
+    }
+
+    /// nonce 是**不透明**的,但"能不能原样穿过"是真要验的:它会被拼进
+    /// `@signature-params` 那一行,路上少一个字符就是另一条签名。
+    #[test]
+    fn a_caller_supplied_nonce_survives_the_wire_unchanged() {
+        let with_nonce = |nonce: Option<&str>| {
+            SignRequest::Structured {
+                did: "did:wba:x".into(),
+                kid: None,
+                method: "POST".into(),
+                target_uri: "https://e.com/".into(),
+                headers: BTreeMap::new(),
+                body: None,
+                covered: Vec::new(),
+                nonce: nonce.map(str::to_string),
+            }
+        };
+
+        for nonce in [Some("abc-123_XYZ"), Some("QUJDREVGRw"), None] {
+            let request = with_nonce(nonce);
+            assert_eq!(
+                round_trip_request(&Request::Sign(request.clone())),
+                Request::Sign(request),
+                "{nonce:?}"
+            );
+        }
+
+        // 空串在线上和"没给"是同一个值 —— 这是这个协议一贯的约定(见
+        // `Cursor::opt_string16`),不是这里新开的口子。
+        assert_eq!(
+            round_trip_request(&Request::Sign(with_nonce(Some("")))),
+            Request::Sign(with_nonce(None))
+        );
     }
 
     #[test]
@@ -929,6 +1059,7 @@ mod tests {
             },
             Request::Lock { did: Some("did:wba:x".into()), kid: None },
             Request::Lock { did: None, kid: None },
+            Request::GetDocument { did: "did:wba:x".into() },
         ];
 
         for request in requests {
@@ -952,6 +1083,7 @@ mod tests {
                 unlocked_secs: 42,
             }]),
             Response::Error { code: ErrorCode::BadCredential, message: "bad".into() },
+            Response::Document(b"{\"id\":\"did:wba:x\"}\n".to_vec()),
         ];
 
         for response in responses {
@@ -971,6 +1103,7 @@ mod tests {
             headers: BTreeMap::new(),
             body: None,
             covered: Vec::new(),
+            nonce: None,
         };
         let empty = match absent.clone() {
             SignRequest::Structured { did, kid, method, target_uri, headers, covered, .. } => {
@@ -982,6 +1115,7 @@ mod tests {
                     headers,
                     body: Some(Vec::new()),
                     covered,
+                    nonce: None,
                 }
             }
             _ => unreachable!(),

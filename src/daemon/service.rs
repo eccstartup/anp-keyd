@@ -99,6 +99,12 @@ fn socket_identity(path: &Path) -> Option<(u64, u64)> {
     Some((meta.dev(), meta.ino()))
 }
 
+/// pid 文件里记的是哪个 pid。文件还没落盘、正写到一半、或者里面不是数字,
+/// 都算"还不知道" —— 这一层只用来等它,不用来判断对错。
+fn recorded_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
 /// 把守护进程放到后台,然后**把这个终端还回去**。
 ///
 /// 做法是**重新执行自己**,不是 fork:后台那个进程就是
@@ -111,8 +117,9 @@ fn socket_identity(path: &Path) -> Option<(u64, u64)> {
 /// 进程就没了",看起来像随机故障。
 ///
 /// 返回 `Ok` 表示"已经在后台跑起来了",不是"它一定健康" —— 后者没法保证,
-/// 这里只保证"没有立刻死掉,而且**我们起的那个** socket 在那儿"。
-pub fn detach(log_path: &Path, sock_path: &Path) -> Result<()> {
+/// 这里只保证"没有立刻死掉,而且**我们起的那个** socket 在那儿,pid 文件也
+/// 已经写好"。
+pub fn detach(log_path: &Path, sock_path: &Path, pid_path: &Path) -> Result<()> {
     // **起子进程之前先记住这个 socket 现在长什么样。**
     //
     // 少了这一步,"那儿有一个 socket 文件"这个条件在有别的守护进程占着同一个
@@ -163,13 +170,17 @@ pub fn detach(log_path: &Path, sock_path: &Path) -> Result<()> {
             return Err(exited(status));
         }
 
-        // 就绪 = **那个 socket 文件不是原来那个了,而且孩子还活着。**
+        // 就绪 = **那个 socket 文件不是原来那个了、孩子还活着,而且 pid 文件
+        // 已经写下他。**
         //
         // 比 `(dev, ino)`:子进程要么在一个死文件上重建一个(inode 变了),
         // 要么从无到有建一个(`before` 是 `None`),两种都算数。而"文件是新的
-        // + 孩子没死"就够了吗?够 —— `bind()` 之后孩子那边每一步失败
-        // (写 pid 文件、起 runtime)都以**退出**收场,而那正是上面这一句在
-        // 看的;绑上了就是已经在 `listen` 了。
+        // + 孩子没死"就够了吗?不够 —— `bind()` 之后孩子那边**还有一步**:
+        // 写 pid 文件。漏掉它,`serve` 就会在 socket 出现、pid 文件还没落盘的
+        // 那一小段里把终端还回去,而这一段**不是**零:紧接着 `serve` 敲一句
+        // `stop` 的脚本,或者一条读完就去看 `run/keyd.pid` 的测试,都会读到
+        // 一个不存在的文件 —— 症状是"守护进程明明起来了,`stop` 却说没在跑"。
+        // 这是实测撞到的:`serve` 之后立刻读 pid 文件,负载一上来就开始红。
         //
         // **这里不连 socket。** 起先连过,后来发现它有个不那么显然的代价:
         // 开了第三层(`--allow-binary`)之后,那条探测连接会被拒 —— 对端是
@@ -177,7 +188,7 @@ pub fn detach(log_path: &Path, sock_path: &Path) -> Result<()> {
         // 启动都给自己记一条 `DENIED` 审计事件,外加一条 WARN。审计是防篡改
         // 的证据,不该混进工具自己的噪声。
         let now = socket_identity(sock_path);
-        if now.is_some() && now != before {
+        if now.is_some() && now != before && recorded_pid(pid_path) == Some(pid) {
             // 再看一眼:孩子可能正好在"重建了 socket 文件、bind 又失败"的
             // 那条路上,而那条路也以退出收场。
             if let Some(status) = child.try_wait()? {

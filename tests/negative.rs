@@ -128,6 +128,7 @@ fn request() -> SignRequest {
         headers: BTreeMap::new(),
         body: Some(b"{\"hello\":1}".to_vec()),
         covered: Vec::new(),
+        nonce: None,
     }
 }
 

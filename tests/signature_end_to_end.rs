@@ -207,6 +207,7 @@ async fn a_signature_made_over_the_socket_verifies_with_the_upstream_verifier() 
                     headers: BTreeMap::from([("accept".to_string(), "application/json".into())]),
                     body: None,
                     covered: vec![],
+                    nonce: None,
                 })
                 .unwrap();
 
@@ -222,6 +223,7 @@ async fn a_signature_made_over_the_socket_verifies_with_the_upstream_verifier() 
                     )]),
                     body: Some(br#"{"hello":"world"}"#.to_vec()),
                     covered: vec![],
+                    nonce: None,
                 })
                 .unwrap();
 
@@ -292,6 +294,7 @@ async fn the_signature_is_bound_to_the_request_it_was_made_for() {
                     headers: BTreeMap::new(),
                     body: Some(b"amount=10".to_vec()),
                     covered: vec![],
+                    nonce: None,
                 })
                 .unwrap()
         })
@@ -373,6 +376,7 @@ async fn signing_is_refused_while_locked() {
                     headers: BTreeMap::new(),
                     body: None,
                     covered: vec![],
+                    nonce: None,
                 })
                 .unwrap_err()
         })
@@ -414,6 +418,7 @@ async fn two_concurrent_signers_do_not_interleave() {
                     headers: BTreeMap::new(),
                     body: None,
                     covered: vec![],
+                    nonce: None,
                 })
                 .unwrap();
             (index, signed)

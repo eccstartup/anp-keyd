@@ -243,16 +243,16 @@ fn payload(result: &Value) -> Value {
 }
 
 // ————————————————————————————————————————————————————————————
-// 1. 四个工具,握手就列得出来
+// 1. 五个工具,握手就列得出来
 // ————————————————————————————————————————————————————————————
 
-/// **工具表就是四个,和 `mcp` 模块里那条单元测试说的是同一件事。**
+/// **工具表就是这五个,和 `mcp` 模块里那条单元测试说的是同一件事。**
 ///
 /// 两条测试不重复:那条守的是"我们的代码里注册了几个",这条守的是"一个真的
 /// MCP 客户端**看得见**几个"。中间隔着 rmcp 的 schema 生成和协议编解码,
 /// 而一个工具在客户端看不见,等于不存在。
 #[test]
-fn a_client_sees_exactly_the_four_documented_tools() {
+fn a_client_sees_exactly_the_five_documented_tools() {
     let daemon = Daemon::start();
     let mut mcp = Mcp::start(&daemon.sock);
 
@@ -265,7 +265,10 @@ fn a_client_sees_exactly_the_four_documented_tools() {
         .collect();
     names.sort();
 
-    assert_eq!(names, ["list_my_keys", "sign_request", "status", "unlock"]);
+    assert_eq!(
+        names,
+        ["get_did_document", "list_my_keys", "sign_request", "status", "unlock"]
+    );
     assert!(
         !names.iter().any(|name| name.contains("raw")),
         "raw signing must not be reachable over MCP: {names:?}"
@@ -309,6 +312,40 @@ fn status_is_empty_before_anything_is_unlocked() {
         payload(&result)["unlocked"].as_array().map(Vec::len),
         Some(0),
         "nothing has been unlocked yet"
+    );
+}
+
+/// **`get_did_document` 给的是磁盘上那一份的原文,而且不用解锁。**
+///
+/// 这是走 MCP 的 agent 登录那一半:它要证明自己是谁,手上就得有这份文档。
+/// 这里不走 `unlock` —— 文档是可公开的成品,拿"没解锁"去挡它挡掉的只是
+/// 调用方本来就够得着的东西。
+///
+/// 断言的是**逐字节**相等:那份文档是签好名的,内联进别的东西里靠的就是
+/// 这一点。中间任何一层"顺手重排一下键"都会让签名对不上。
+#[test]
+fn get_did_document_returns_the_published_bytes_without_unlocking() {
+    let daemon = Daemon::start();
+    let mut mcp = Mcp::start(&daemon.sock);
+
+    let result = mcp.call_tool(5, "get_did_document", json!({"did": daemon.did}));
+    let answer = payload(&result);
+
+    assert_eq!(answer["did"], daemon.did);
+    let served: Value =
+        serde_json::from_str(answer["document"].as_str().expect("the document is text")).unwrap();
+    assert_eq!(served, daemon.document, "the document came back changed");
+    // 而且它确实是**那一份**文档,不是随便一段 JSON:路径绑定还挂得上。
+    document::verify_path_binding(&daemon.did, &served).unwrap();
+
+    // 别人的 DID 答不出来 —— 守护进程不联网,resolve 是客户端的事。
+    let refused = mcp.request(6, "tools/call", json!({
+        "name": "get_did_document",
+        "arguments": {"did": "did:wba:example.com:user:bob:e1_zzz"},
+    }));
+    assert!(
+        refused.get("error").is_some(),
+        "a DID this machine never published must not be served: {refused}"
     );
 }
 
@@ -378,6 +415,59 @@ fn unlock_then_sign_request_produces_headers_upstream_accepts() {
         .is_err(),
         "the signature must be bound to the request it was made for"
     );
+}
+
+/// **`nonce` 走 MCP 这条路也要到得了签名里。**
+///
+/// 这一条单独立着,因为它挡的是一种**不会报错**的漏接:nonce 是共用层
+/// (`wire`)的类型,而门面各接一处。漏掉 MCP 那一处,命令行上怎么试都好,
+/// 只有走 agent 的那条路静默地拿不到它 —— 而那个调用方多半正指望着它。
+///
+/// 验的还是上游的实现:请求体里带着同一个 nonce,签名必须照样验得过。
+#[test]
+fn a_caller_supplied_nonce_reaches_the_signature_over_mcp() {
+    let daemon = Daemon::start();
+    let mut mcp = Mcp::start(&daemon.sock);
+
+    mcp.call_tool(1, "unlock", json!({
+        "did": daemon.did,
+        "passphrase": String::from_utf8_lossy(PASSPHRASE),
+    }));
+
+    let url = "https://example.com/api/nonce";
+    let nonce = "caller-chosen-42";
+    let body = format!(r#"{{"nonce":"{nonce}"}}"#);
+    let signed = payload(&mcp.call_tool(2, "sign_request", json!({
+        "did": daemon.did,
+        "method": "POST",
+        "url": url,
+        "headers": {"content-type": "application/json"},
+        "body": body,
+        // 同一个 nonce 也在请求体里 —— 它同时出现在两处,所以只能由调用方
+        // 给,而守护进程只负责把它原样放进 `@signature-params`。
+        "nonce": nonce,
+    })));
+
+    let headers: BTreeMap<String, String> = serde_json::from_value(signed["headers"].clone())
+        .unwrap_or_else(|error| panic!("the signed headers must be a map: {error}; {signed}"));
+    assert!(
+        headers["Signature-Input"].contains(&format!("nonce=\"{nonce}\"")),
+        "the caller's nonce must land in @signature-params: {:?}",
+        headers["Signature-Input"]
+    );
+
+    let mut request_headers: BTreeMap<String, String> =
+        [("content-type".to_string(), "application/json".to_string())].into_iter().collect();
+    request_headers.extend(headers);
+
+    anp::authentication::verify_http_message_signature(
+        &daemon.document,
+        "POST",
+        url,
+        &request_headers,
+        Some(body.as_bytes()),
+    )
+    .expect("a signature carrying a caller-chosen nonce must verify upstream");
 }
 
 // ————————————————————————————————————————————————————————————

@@ -44,7 +44,26 @@ pub struct SignRequest {
     /// 下限,谁说话都不好使。所以这里不是一个"调用方决定覆盖面"的口子,
     /// 只是"调用方可以请求得更严"。
     pub covered: Vec<String>,
+    /// 调用方指定的 nonce。`None` = 由上游随机生成一个。
+    ///
+    /// **它和 `covered` 是反着来的**:`covered` 只能让签名保护得更多,
+    /// 而这个只能让这次签名**是调用方要的那一次**。
+    ///
+    /// 为什么它得由调用方给、不能由守护进程自己挑,见 `docs/ADAPTER.md` §3.1:
+    /// 它同时出现在请求体和签名基里,而**两处必须是同一个值**,所以挑的人
+    /// 只能是那个能看到请求体的人。它在 401 之后还会换一次,换的值来自服务端
+    /// —— 那是网络状态机的一部分,守护进程看不到。
+    ///
+    /// **守护进程管长度和"能不能写进去",不管含义。** 见 [`validate_nonce`]。
+    pub nonce: Option<String>,
 }
+
+/// 调用方指定的 nonce 的上限,按字节算。
+///
+/// nonce 进签名基,**它的长度就是签名基的长度** —— 所以有一条上限。256 比
+/// 任何会真实出现的挑战都宽得多(base64url 编 32 字节才 43 个字符),又不至于
+/// 让一条签名请求变成一次任意长度的写入。
+pub const MAX_NONCE_LEN: usize = 256;
 
 /// 签完之后的产物。
 #[derive(Debug, Clone)]
@@ -81,6 +100,9 @@ impl SignRequest {
     pub fn validate(&self) -> Result<()> {
         validate_method(&self.method)?;
         validate_url(&self.url)?;
+        if let Some(nonce) = &self.nonce {
+            validate_nonce(nonce)?;
+        }
         for (name, value) in &self.headers {
             validate_header_name(name)?;
             validate_header_value(name, value)?;
@@ -165,7 +187,11 @@ pub fn sign_request(
         req.body.as_deref(),
         anp::authentication::HttpSignatureOptions {
             keyid: Some(key.id().kid.clone()),
-            nonce: None,
+            // 调用方给的 nonce 原样交上去;没给就是 `None`,上游自己随机一个
+            // (今天的行为不变)。它不是"签什么内容"的一部分,是"这是哪一次
+            // 签名"的一部分 —— 所以它是**被签的**,调用方改它最多让自己那条
+            // 签名对不上服务端的挑战。见 `docs/ADAPTER.md` §3.1。
+            nonce: req.nonce.clone(),
             created: None,
             expires: None,
             // 这里就是"守护进程决定"落到实处的地方 —— 这个值不是调用方给的,
@@ -410,6 +436,43 @@ fn validate_header_value(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// 调用方给的 nonce 必须能**原样**活到签名基里。
+///
+/// 上游把它拼成 `nonce="<值>"` 塞进 `@signature-params` 那一行,而且
+/// **一个字符都不转义**(`anp` 的 `serialize_signature_params` 就是一句
+/// `format!("nonce=\"{}\"", value)`)。所以这个值里出现一个 `"`,就能提前
+/// 合上引号、往那条结构化字段列表里再塞一段 —— 例如重写 `keyid`;出现一个
+/// 换行,就能凭空补出一整行签名基。和 [`validate_header_value`] 挡的是同一类
+/// 事,只是入口换了一个。
+///
+/// **这里管的是"能不能写进签名基",不是"含义对不对"。** 这个 nonce 是不是
+/// 服务端发的、有没有过期、是不是重放,守护进程一概不问 —— 那是服务端的事,
+/// 一个替人保管私钥的进程去"理解"挑战正是 `docs/ADAPTER.md` §一 要防的越界。
+/// 所以下面只排除**结构上有破坏性**的字节,不缩小它作为一串不透明字节的取值
+/// 空间:可见 ASCII(空格也算),去掉引号和反斜杠,就是全部规则。
+fn validate_nonce(nonce: &str) -> Result<()> {
+    if nonce.len() > MAX_NONCE_LEN {
+        return Err(KeydError::Protocol(format!(
+            "the nonce is {} bytes, over the {MAX_NONCE_LEN}-byte limit; it goes into the \
+             signature base, so its length becomes the signature base's length",
+            nonce.len()
+        )));
+    }
+
+    if let Some(bad) = nonce
+        .bytes()
+        .find(|byte| !(0x20..=0x7e).contains(byte) || *byte == b'"' || *byte == b'\\')
+    {
+        return Err(KeydError::Protocol(format!(
+            "the nonce contains {bad:#04x}, which cannot be written into the \
+             @signature-params line as it stands — a quote or a backslash escapes it, and a \
+             control character forges a whole line of the signature base"
+        )));
+    }
+
+    Ok(())
+}
+
 /// 调用方额外要求覆盖的分量,只能是这个形状。
 ///
 /// 收得这么紧是因为这个字符串会**原样进入 `@signature-params` 那一行的括号里**。
@@ -494,6 +557,7 @@ mod tests {
             headers,
             body: body.map(|b| b.to_vec()),
             covered: Vec::new(),
+            nonce: None,
         }
     }
 
@@ -627,6 +691,111 @@ mod tests {
         let b = sign_request(&doc, &key, &request(None)).unwrap();
         assert_ne!(a.headers["Signature"], b.headers["Signature"]);
         assert_ne!(a.signature_base_digest, b.signature_base_digest);
+    }
+
+    // ---- 调用方指定的 nonce ----
+
+    /// **调用方给的 nonce 必须原样出现在签名基里,而且签出来的东西要验得过。**
+    ///
+    /// 这条是适配层的落脚点:connectx 要把同一个 nonce 写进请求体(于是它进
+    /// `content-digest`)**和**签名基,而"同一个值"这件事只有调用方能保证。
+    #[test]
+    fn a_caller_supplied_nonce_reaches_the_signature_base_and_verifies() {
+        let (key, doc) = fixture(31);
+        let nonce = "QUJDREVGRw";
+        let mut req = request(Some(b"{\"nonce\":\"QUJDREVGRw\"}"));
+        req.nonce = Some(nonce.to_string());
+
+        let signed = sign_request(&doc, &key, &req).unwrap();
+
+        // 它在签名基里 —— 也就是 `Signature-Input` 那一行里,原样。
+        let input = &signed.headers["Signature-Input"];
+        assert!(input.contains(&format!("nonce=\"{nonce}\"")), "{input}");
+
+        // 而且上游的验签方(它会从那一行里把 nonce 读回去重拼基)认这条签名。
+        let mut headers = req.headers.clone();
+        for (name, value) in &signed.headers {
+            headers.insert(name.clone(), value.clone());
+        }
+        let metadata = anp::authentication::verify_http_message_signature(
+            &doc,
+            &req.method,
+            &req.url,
+            &headers,
+            req.body.as_deref(),
+        )
+        .expect("a signature over a caller-chosen nonce must verify");
+        assert_eq!(metadata.keyid, key.id().kid);
+    }
+
+    /// 不给 nonce 时行为不变:上游自己随机一个,两条同样的请求签出来不一样。
+    #[test]
+    fn without_a_caller_nonce_the_upstream_still_picks_one() {
+        let (key, doc) = fixture(32);
+        let signed = sign_request(&doc, &key, &request(None)).unwrap();
+        assert!(signed.headers["Signature-Input"].contains("nonce=\""), "{:?}", signed.headers);
+    }
+
+    /// **nonce 会被原样拼进 `@signature-params` 那一行的引号里,上游不转义。**
+    /// 所以能在这里改写结构的字节,一个都不能进 —— 和头值里的换行是同一类
+    /// 攻击,只是入口换了一个。
+    #[test]
+    fn a_nonce_that_could_rewrite_the_signature_base_is_refused() {
+        let (key, doc) = fixture(33);
+
+        for bad in [
+            // 提前合上引号,再塞一段参数 —— 例如把 keyid 重写掉。
+            "x\";keyid=\"did:wba:evil#key-1",
+            // 凭空补一整行签名基。
+            "x\n\"@authority\": evil.com",
+            "x\r\n\"@method\": GET",
+            "x\\\"",
+            // 上界之外:它不是"含义不对",是签不出去。
+            "aé",
+            "\u{7f}",
+        ] {
+            let mut req = request(None);
+            req.nonce = Some(bad.to_string());
+            assert!(
+                matches!(req.validate(), Err(KeydError::Protocol(_))),
+                "{bad:?} must not reach the signature base"
+            );
+            assert!(sign_request(&doc, &key, &req).is_err(), "{bad:?}");
+        }
+
+        // 长度上限也一样:超了就拒,而不是截断 —— 截断会悄悄换掉那个值。
+        let mut req = request(None);
+        req.nonce = Some("a".repeat(MAX_NONCE_LEN));
+        assert!(sign_request(&doc, &key, &req).is_ok(), "正好到上限应当放行");
+
+        let mut req = request(None);
+        req.nonce = Some("a".repeat(MAX_NONCE_LEN + 1));
+        let err = sign_request(&doc, &key, &req).unwrap_err();
+        assert!(matches!(err, KeydError::Protocol(_)), "{err}");
+        assert!(err.to_string().contains("256"), "{err}");
+    }
+
+    /// 但**不能**因为防御就顺手去"理解"这个值:base64url、hex、UUID、带空格的
+    /// 都被放行 —— 守护进程管的是能不能写进去,不是它是不是一个"合法"的挑战。
+    #[test]
+    fn the_nonce_is_opaque_and_only_its_shape_is_checked() {
+        let (key, doc) = fixture(34);
+
+        for good in [
+            "QUJDREVGRw",
+            "9f8b2c1d4e5a6b7c",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "a b c",
+            "with.dots_and-dashes~",
+        ] {
+            let mut req = request(None);
+            req.nonce = Some(good.to_string());
+            let signed = sign_request(&doc, &key, &req).unwrap();
+            assert!(
+                signed.headers["Signature-Input"].contains(&format!("nonce=\"{good}\"")),
+                "{good:?}"
+            );
+        }
     }
 
     // ---- 签名基注入 ----

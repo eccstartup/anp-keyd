@@ -1,4 +1,4 @@
-//! MCP 前端:stdin/stdout 上暴露四个工具。
+//! MCP 前端:stdin/stdout 上暴露五个工具。
 //!
 //! # 为什么是"socket 客户端",而不是把守护进程搬进来
 //!
@@ -7,7 +7,7 @@
 //!
 //! 三条理由,一条比一条要紧:
 //!
-//! 1. `client` 里已经有正好这四个操作了,一行不多一行不少。
+//! 1. `client` 里已经有正好这几个操作了,一行不多一行不少。
 //! 2. 自动上锁、审计、覆盖面下限这些判断**只有一处**。MCP 是第二个门面,
 //!    不是第二套实现 —— 门面各自实现一遍,迟早会有一边的墙少砌一块。
 //! 3. 这个进程是**agent 拉起来的**,它跑在 agent 的 uid 下。走 socket 意味着
@@ -15,9 +15,9 @@
 //!    如果把密钥库读进来在本地解封,这一整层就被绕过去了,而且绕过它的是
 //!    "我们自己的 MCP 服务器"这种听起来很正当的东西。
 //!
-//! # 只有四个工具,而且没有一个是 raw
+//! # 五个工具,而且没有一个是 raw
 //!
-//! `list_my_keys` / `sign_request` / `unlock` / `status`。
+//! `list_my_keys` / `sign_request` / `unlock` / `status` / `get_did_document`。
 //!
 //! **没有 raw 签名,没有 keygen,没有导出,没有生命周期操作。** 这不是还没做,
 //! 是不做:
@@ -29,9 +29,16 @@
 //!   (见 `cli.rs` 开头那一节)。MCP 是给**运行期签名**用的门面,不是给身份
 //!   管理用的。
 //!
+//! `get_did_document` 是第五个,它和上面那条界限不冲突:**它只读,不改任何
+//! 东西,也不需要解锁。** 文档本来就是 0644 的可公开成品。加它的理由是登录
+//! 这件事本身:agent 要证明自己是谁,手上就得有那份文档,而文档躺在
+//! `0700` 的目录里、还可能被 `publish --out` 挪到别处 —— 让它去猜路径、去
+//! 读内部布局,不如给一个说得清的口子。移掉它,症状不会是报错,而是**走 MCP
+//! 的 agent 登不了录,同一个 agent 在命令行上怎么试都是好的**。
+//!
 //! # `unlock` 这个工具要多说一句
 //!
-//! 它是四个工具里唯一一个**会把口令带过 MCP 通道**的 —— 也就是说,接了它的
+//! 它是这几个工具里唯一一个**会把口令带过 MCP 通道**的 —— 也就是说,接了它的
 //! agent 手里会有口令。这一点必须写明白,不能装作没发生。三条限制让它不至于
 //! 变成灾难,但它是**一个权衡,不是一个免费的东西**:
 //!
@@ -72,7 +79,7 @@ use crate::keystore::layout::KeydLayout;
 // "type alias takes 1 generic argument"。所以这里只导 `KeydError`,自家那个
 // alias 一律写全 `crate::error::Result`。
 
-/// 四个工具的实现体。
+/// 五个工具的实现体。
 ///
 /// 它只持有一个东西:**守护进程的 socket 在哪**。不持有口令、不持有密钥、
 /// 不持有连接 —— 一次调用一条连接,和 `client` 的约定一致(签名不是幂等的,
@@ -136,6 +143,23 @@ pub struct SignArgs {
     /// **额外**要求覆盖的分量。只能加,不能减:覆盖面有下限,由守护进程定。
     #[serde(default)]
     pub covered: Vec<String>,
+    /// 写进 `@signature-params` 的 `nonce`。
+    ///
+    /// 要和**请求体里那个**是同一个值 —— 它同时出现在两个地方(请求体,
+    /// 经由 `content-digest`;以及签名参数),所以只能由调用方给。不给就是
+    /// 守护进程随机生成一个,那对一次性请求够用,对"回给一个已经见过 nonce
+    /// 的服务端"没用。
+    #[serde(default)]
+    pub nonce: Option<String>,
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct DocumentArgs {
+    /// 要取文档的 DID。
+    pub did: String,
+    /// 不给就是当前用户默认的那个密钥库。
     #[serde(default)]
     pub root: Option<String>,
 }
@@ -225,6 +249,7 @@ impl Keyd {
                 .collect(),
             body: args.body.map(String::into_bytes),
             covered: args.covered,
+            nonce: args.nonce,
         };
 
         let signed = self
@@ -235,6 +260,34 @@ impl Keyd {
         // 就验不过 —— 所以这里解析、再序列化成 JSON 对象,让调用方能直接用。
         let headers = parse_signed_headers(&signed).map_err(refusal)?;
         text(serde_json::json!({"headers": headers}))
+    }
+
+    #[tool(description = "取一份本机发布过的 DID 文档。只读,不需要解锁")]
+    async fn get_did_document(
+        &self,
+        Parameters(args): Parameters<DocumentArgs>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        let did = args.did;
+        let caller = did.clone();
+        let bytes = self
+            .with_daemon(&args.root, "get_did_document", move |client| client.document(&did))
+            .await?;
+
+        // **交回原文。** 这是一件签好名的成品,它的字节就是被签的那些字节 ——
+        // 收成字符串而不是解析成对象,是为了让"逐字节一样"这件事在 MCP 这一跳
+        // 上还能成立(解析再序列化会把键重排)。
+        //
+        // 必须是 UTF-8:守护进程那边已经把它解析成过 JSON,所以走到这里不会
+        // 失败。这不是"可能出错的地方",是**跨进程边界的一次确认** —— 边界
+        // 之外的东西不该按边界之内的保证来对待。
+        let document = String::from_utf8(bytes).map_err(|error| {
+            ErrorData::internal_error(
+                format!("the daemon returned a document that is not UTF-8: {error}"),
+                None,
+            )
+        })?;
+
+        text(serde_json::json!({"did": caller, "document": document}))
     }
 }
 
@@ -350,18 +403,25 @@ pub fn serve(socket: Option<PathBuf>) -> crate::error::Result<()> {
 mod tests {
     use super::*;
 
-    /// **工具表就是四个,而且没有一个能把任意字节签出去。**
+    /// **工具表就是这五个,而且没有一个能把任意字节签出去。**
     ///
     /// 这条测试挡的是"顺手加一个工具":MCP 是 agent 直接够得着的面,多一个
     /// 工具就是多一条 agent 能走的路。所以工具集合被钉死在这儿,改动它必须
     /// 先改这条测试 —— 而那次改动会被 review 看见。
+    ///
+    /// 第五个 `get_did_document` 是**只读**的,加它的理由写在模块头里:登录
+    /// 需要它,而它不开放任何新的授权。往这张表里再加东西,请先回答模块头
+    /// 那一节的问题。
     #[test]
-    fn exactly_four_tools_and_none_of_them_signs_raw_bytes() {
+    fn exactly_five_tools_and_none_of_them_signs_raw_bytes() {
         let router = Keyd::tool_router();
         let mut names: Vec<String> = router.list_all().into_iter().map(|tool| tool.name.to_string()).collect();
         names.sort();
 
-        assert_eq!(names, ["list_my_keys", "sign_request", "status", "unlock"]);
+        assert_eq!(
+            names,
+            ["get_did_document", "list_my_keys", "sign_request", "status", "unlock"]
+        );
         assert!(
             !names.iter().any(|name| name.contains("raw")),
             "raw signing must never be reachable from the MCP front end: {names:?}"

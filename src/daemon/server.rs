@@ -578,6 +578,7 @@ mod tests {
                     headers: Default::default(),
                     body: Some(b"{}".to_vec()),
                     covered: Vec::new(),
+                    nonce: None,
                 });
 
                 // 解锁。口令就是从这个 socket 上传过去的 —— 这是 v1 的
@@ -592,6 +593,7 @@ mod tests {
                     headers: Default::default(),
                     body: Some(b"{}".to_vec()),
                     covered: Vec::new(),
+                    nonce: None,
                 });
 
                 (listed, locked, unlocked, signed)

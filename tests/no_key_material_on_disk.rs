@@ -252,6 +252,7 @@ impl Machine {
                     headers: BTreeMap::from([("content-type".into(), "application/json".into())]),
                     body: Some(br#"{"hello":"disk"}"#.to_vec()),
                     covered: vec![],
+                    nonce: None,
 
                 })
                 .unwrap()

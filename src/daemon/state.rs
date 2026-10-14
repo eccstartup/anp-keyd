@@ -328,6 +328,25 @@ impl DaemonState {
         })
     }
 
+    /// 读一份**本机发布过的** DID 文档,原样交回字节。
+    ///
+    /// 只读,而且**不需要解锁** —— 文档是可公开的,它躺在 `dids/` 里就是
+    /// 0644。所以这里不进 vault、不碰私钥、不产生签名,也不进覆盖面:它开放
+    /// 的是一次读,不是一次授权(`docs/ADAPTER.md` §3.2)。
+    ///
+    /// 答不出来的只有一种情形:这台机器上没有发布过这个 DID。守护进程不联网,
+    /// 所以它**替不了**调用方去 resolve 别人的 DID —— 那件事只能在客户端做。
+    pub fn get_document(&self, uid: u32, did: &str) -> Result<(Vec<u8>, String)> {
+        let layout = self.layout_for(uid)?;
+        let bytes = store::read_did_document_bytes(&layout, did)?;
+        // 交出去的字节和记进审计的摘要是**同一次读**的两面,所以在这里
+        // 一次算完 —— 分成两次读,两次之间文档可能已经被替换,审计里那条
+        // 就会指着一份调用方从没见过的版本。
+        let document: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let digest = crate::did::lifecycle::document_digest(&document)?;
+        Ok((bytes, digest))
+    }
+
     pub fn unlock(
         &self,
         uid: u32,
@@ -567,6 +586,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 body: Some(b"{}".to_vec()),
                 covered: Vec::new(),
+                nonce: None,
             }
         }
     }

@@ -118,6 +118,17 @@ impl Client {
         }
     }
 
+    /// 取一份**本机发布过的** DID 文档,原样字节。
+    ///
+    /// 只读,而且**不需要先 unlock**:文档是可公开的成品。别人的 DID 这里
+    /// 答不出来 —— 守护进程不联网,resolve 只能在客户端做。
+    pub fn document(&mut self, did: &str) -> Result<Vec<u8>> {
+        match self.call(Request::GetDocument { did: did.to_string() })? {
+            Response::Document(bytes) => Ok(bytes),
+            other => Err(unexpected("document", &other)),
+        }
+    }
+
     fn call(&mut self, request: Request) -> Result<Response> {
         wire::write_request(&mut self.stream, &request)?;
 
@@ -180,6 +191,7 @@ fn describe(response: &Response) -> &'static str {
         Response::ListKeys(_) => "LIST_KEYS",
         Response::Signature(_) => "SIGN",
         Response::Status(_) => "STATUS",
+        Response::Document(_) => "GET_DOCUMENT",
         Response::Error { .. } => "ERR",
     }
 }

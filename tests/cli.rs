@@ -836,6 +836,86 @@ fn the_five_steps_in_the_readme_work_end_to_end() {
     drop(daemon);
 }
 
+/// **调用方指定的 nonce 走完 CLI → socket → 守护进程 → 签名头这一整条路。**
+///
+/// 它必须由调用方给:同一个 nonce 同时出现在请求体里(经由 `content-digest`)
+/// 和 `@signature-params` 里,而调用方是唯一同时知道这两处的那一方。守护进程
+/// 管它的长度,不管它的含义。
+#[test]
+fn a_caller_supplied_nonce_reaches_the_signature() {
+    let dir = TempDir::new("nonce");
+    let did = keygen(&dir, "bot");
+    run_in_terminal(dir.path(), &["publish", "--did", &did], &default_rules()).expect_ok();
+
+    let _daemon = Daemon::start(&dir);
+    unlock(&dir, &did).expect_ok();
+
+    let signed = run(
+        dir.path(),
+        &[
+            "sign",
+            "--did",
+            &did,
+            "--method",
+            "POST",
+            "--url",
+            "https://api.example.net/orders",
+            "--nonce",
+            "caller-chosen-42",
+        ],
+    );
+    let text = signed.expect_ok();
+
+    assert!(text.contains(r#"nonce="caller-chosen-42""#), "{text}");
+
+    // 不给就是不给了:守护进程自己随机一个,而不是把上一次那个留下来。
+    let plain = sign(&dir, &did);
+    let generated = plain.expect_ok();
+    assert!(
+        !generated.contains("caller-chosen-42"),
+        "an absent --nonce must not inherit the previous one: {generated}"
+    );
+}
+
+/// **`document` 答得出本机发布过的那一份,逐字节一样,而且不用解锁。**
+///
+/// 走 socket 而不是让调用方自己去读文件:文件在 `0700` 的目录里、
+/// `publish --out` 还能把它挪走,路径是**内部布局**。逐字节是重点 —— 这是
+/// 一件签好名的成品,内联进别的东西里靠的就是这一点。
+#[test]
+fn document_prints_the_published_bytes_without_unlocking() {
+    let dir = TempDir::new("document");
+    let did = keygen(&dir, "bot");
+    let published = run_in_terminal(dir.path(), &["publish", "--did", &did], &default_rules());
+    let published = published.expect_ok();
+
+    // 发布时它自己说了写到哪儿 —— 拿这句话当"磁盘上那一份"的出处,而不是
+    // 在测试里重算一遍内部布局(那正是 `document` 存在的理由:布局是内部
+    // 的事)。
+    let path = published
+        .lines()
+        .find_map(|line| line.strip_prefix("wrote "))
+        .expect("publish says where it wrote the document")
+        .trim()
+        .to_string();
+    let on_disk = std::fs::read(&path).expect("the published document is on disk");
+
+    let _daemon = Daemon::start(&dir);
+
+    // 没解锁也答得出来 —— 文档是可公开的。
+    let answered = run(dir.path(), &["document", "--did", &did]);
+    let served = answered.expect_ok();
+    assert_eq!(
+        served.as_bytes(),
+        on_disk.as_slice(),
+        "the daemon must hand back the published bytes, not a re-serialised copy"
+    );
+
+    // 别人的 DID:答不出来。守护进程不联网,resolve 是客户端的事。
+    let refused = run(dir.path(), &["document", "--did", "did:wba:example.com:user:bob:e1_zzz"]);
+    refused.expect_failure();
+}
+
 /// 口令敲错就是打不开,而且报的错和"少了 device.secret"**一模一样**。
 ///
 /// 两者可区分等于告诉拿到磁盘的人"你缺的是哪个因子"。

@@ -67,8 +67,9 @@ pub struct Cli {
 /// 改**,`every_subcommand_is_listed_in_the_help_template` 那条测试就是盯这个的。
 ///
 /// 分节的依据是模块头那条分界线:`serve` 是守护进程本体;`sign` / `list` /
-/// `status` / `lock` 走 socket 且不要口令,agent 够得着;`unlock` 也走 socket
-/// 但口令只从终端读,单独一节;其余的在人的进程里开信封,agent 够不着。
+/// `status` / `lock` / `document` 走 socket 且不要口令,agent 够得着;
+/// `unlock` 也走 socket 但口令只从终端读,单独一节;其余的在人的进程里开
+/// 信封,agent 够不着。
 ///
 /// 特性门控的两条只在对应构建里存在,所以按 `#[cfg]` 追加,不能写死进来 ——
 /// 默认构建的 help 里出现一条敲了也没用的命令,比不列更糟。
@@ -87,6 +88,7 @@ fn help_template() -> String {
          \x20 list                List the keys on this machine.\n\
          \x20 status              List the unlocked keys and how long they have been unlocked.\n\
          \x20 lock                Lock.\n\
+         \x20 document            Print a DID document this machine published, byte for byte.\n\
          \n\
          Sets the passphrase — do this yourself, in your own terminal:\n\
          \x20 unlock              Unlock a key.\n\
@@ -152,6 +154,12 @@ pub enum Command {
     Status,
     /// Lock.
     Lock(LockArgs),
+    /// Print a DID document this machine published, byte for byte.
+    ///
+    /// Read-only, and it needs no unlock: the document is public. It answers
+    /// only for DIDs **published on this machine** — the daemon has no network,
+    /// so resolving someone else's DID is the caller's job.
+    Document(DocumentArgs),
 
     // 也走 socket,但和上面四条不同:口令只从终端读,所以这一步是人做的,
     // agent 做不了也不该做。
@@ -207,11 +215,11 @@ pub enum Command {
     #[cfg(feature = "seed-export")]
     ExportSeed(ExportSeedArgs),
     // 这是给 **MCP 客户端的配置位**用的:配置里那一行 `command` 就指向这个
-    // 子命令。它自己不开密钥库,只把四个工具转发给守护进程(见 `mcp` 模块)。
+    // 子命令。它自己不开密钥库,只把几个工具转发给守护进程(见 `mcp` 模块)。
     /// Speak MCP on stdin/stdout — **only in a build with the `mcp` feature**.
     ///
     /// This is what an MCP client's config points at. It opens no keystore of
-    /// its own; it forwards four tools to the daemon.
+    /// its own; it forwards a handful of tools to the daemon.
     #[cfg(feature = "mcp")]
     Mcp(McpArgs),
 }
@@ -437,6 +445,17 @@ pub struct LockArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct DocumentArgs {
+    /// The DID whose document to print.
+    #[arg(long, value_name = "DID")]
+    pub did: String,
+
+    /// Socket path (derived from the directory layout by default).
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
 pub struct SignArgs {
     /// The DID to sign as.
     #[arg(long, value_name = "DID")]
@@ -475,6 +494,19 @@ pub struct SignArgs {
     #[arg(long = "cover", value_name = "NAME")]
     pub cover: Vec<String>,
 
+    /// The `nonce` to put in `@signature-params` — supply the **same value**
+    /// that is in the request body.
+    ///
+    /// It has to come from here because it appears in two places at once: the
+    /// body (through `content-digest`) and the signature params. The daemon
+    /// only carries it; whether it means anything is the server's business.
+    ///
+    /// Left out, the daemon generates a random one — which is fine for
+    /// single-use requests and useless for a reply the caller had to bind to a
+    /// nonce it already saw.
+    #[arg(long, value_name = "NONCE")]
+    pub nonce: Option<String>,
+
     // 它和结构化那一套参数**互相排除**。不是洁癖:如果 `--raw` 能和
     // `--body`/`--cover` 一起给,调用方就会以为那些东西也进了覆盖面,而实际上
     // 原始签名的输入只有那个文件 —— 这正是"悄悄降级"的形状。要么给一套,
@@ -490,7 +522,7 @@ pub struct SignArgs {
     #[arg(
         long,
         value_name = "PATH",
-        conflicts_with_all = ["url", "headers", "body", "cover"]
+        conflicts_with_all = ["url", "headers", "body", "cover", "nonce"]
     )]
     pub raw: Option<PathBuf>,
 
@@ -684,6 +716,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Unlock(args) => unlock(root, args),
         Command::Lock(args) => lock(root, args),
         Command::Sign(args) => sign(root, args),
+        Command::Document(args) => document(root, args),
         Command::AddRecoveryKey(args) => crate::ops::keys::add_recovery_key(
             root,
             crate::ops::keys::AddRecoveryKey {
@@ -815,7 +848,7 @@ fn serve(root: Option<&Path>, args: ServeArgs) -> Result<()> {
     }
 
     layout.ensure()?;
-    crate::daemon::service::detach(&layout.log_path(), &sock_path)
+    crate::daemon::service::detach(&layout.log_path(), &sock_path, &layout.pid_path())
 }
 
 /// 单用户 → `--root` 指哪儿是哪儿;系统服务 → `/var/lib/anp-keyd/users/<uid>`。
@@ -923,7 +956,7 @@ fn serve_here(layout: &KeydLayout, args: ServeArgs, sock_path: PathBuf) -> Resul
 
 /// 把 `serve` 放到后台去的那个守护进程停下来。
 ///
-/// **不是一种 socket 消息。** 线上只有五种消息类型,是 README 明写的契约;
+/// **不是一种 socket 消息。** 线上那几种消息类型是 README 明写的契约;
 /// 为了让一条"给人用的"命令跑通去动那个契约,是拿 agent 那侧的稳定性换
 /// 一点便利。
 ///
@@ -1342,11 +1375,25 @@ fn sign(root: Option<&Path>, args: SignArgs) -> Result<()> {
         headers: parse_headers(&args.headers)?,
         body,
         covered: args.cover.clone(),
+        nonce: args.nonce.clone(),
     })?;
 
     // **原样搬运。** 这份字节要挂到真实请求上去,改动其中任何一个字符
     // 签名就验不过 —— 所以这里不解析、不重排、不补引号。
     std::io::stdout().write_all(&signed)?;
+    Ok(())
+}
+
+/// 打印一份本机发布过的 DID 文档。
+///
+/// **原样搬运,不解析、不重排、不补缩进。** 这是一件签好名的成品,它的字节
+/// 就是被签的那些字节 —— 内联进别的东西里、或者和服务端手里那份比,靠的都是
+/// "逐字节一样"。所以走 socket 拿的是文件原文,而不是守护进程重新序列化一遍
+/// 的结果(`crate::keystore::store::read_did_document_bytes`)。
+fn document(root: Option<&Path>, args: DocumentArgs) -> Result<()> {
+    let mut client = connect(root, args.socket.as_deref())?;
+    let bytes = client.document(&args.did)?;
+    std::io::stdout().write_all(&bytes)?;
     Ok(())
 }
 

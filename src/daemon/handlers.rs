@@ -1,4 +1,4 @@
-//! 五类请求的处理。
+//! 六类请求的处理。
 //!
 //! 这一层是"对端说的话"和"守护进程做的事"之间唯一的翻译。它有两个纪律：
 //!
@@ -58,6 +58,15 @@ fn dispatch(state: &DaemonState, peer: &PeerIdentity, request: Request) -> Resul
         }
 
         Request::Sign(request) => sign_request(state, peer, request),
+
+        Request::GetDocument { did } => {
+            let (document, digest) = state.get_document(peer.uid, &did)?;
+            state.record(
+                peer.uid,
+                &Event::DocumentRead { uid: peer.uid, did, document_digest: digest },
+            )?;
+            Ok(Response::Document(document))
+        }
     }
 }
 
@@ -75,6 +84,7 @@ fn sign_request(
             headers,
             body,
             covered,
+            nonce,
         } => {
             let signing = rfc9421::SignRequest {
                 method,
@@ -83,6 +93,7 @@ fn sign_request(
                 headers,
                 body,
                 covered,
+                nonce,
             };
 
             let signed = state.sign_structured(peer.uid, &did, kid.as_deref(), &signing)?;
@@ -260,6 +271,7 @@ mod tests {
                 headers,
                 body: Some(b"{}".to_vec()),
                 covered: Vec::new(),
+                nonce: None,
             })
         }
 
@@ -499,12 +511,93 @@ mod tests {
             headers,
             body,
             covered: vec!["x-not-sent".into()],
+            nonce: None,
         });
 
         let Response::Error { code, .. } = handle(&f.state, &f.peer(), request) else {
             panic!("expected a refusal");
         };
         assert_eq!(code, crate::daemon::wire::ErrorCode::CoveredSetRejected);
+    }
+
+    /// **读文档不需要解锁。** 它是一份可公开的成品,躺在 0644 的文件里;
+    /// 拿"没解锁"去挡它,挡掉的只是调用方本来就够得着的东西。
+    #[test]
+    fn the_document_is_served_byte_for_byte_without_unlocking() {
+        let f = Fixture::new(false);
+
+        let Response::Document(bytes) =
+            handle(&f.state, &f.peer(), Request::GetDocument { did: f.did.clone() })
+        else {
+            panic!("expected a document");
+        };
+
+        // 给的必须是**发布出去的那一份**的原文,不是重新序列化出来的。
+        let on_disk = std::fs::read(
+            f.state.layout_for(501).unwrap().did_path(&f.did),
+        )
+        .unwrap();
+        assert_eq!(bytes, on_disk);
+
+        // 而它确实是一份能解析的文档。
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["id"], f.did);
+
+        // 留痕留的是"谁取走了哪一版",不是"谁被授权了"。
+        let text = f.audit_text();
+        assert!(text.contains("DOCUMENT_READ"), "{text}");
+        assert!(text.contains("document_digest"), "{text}");
+    }
+
+    /// 别人的 DID:**答不出来**。守护进程不联网,它替不了调用方去 resolve。
+    #[test]
+    fn a_did_this_machine_never_published_is_key_not_found() {
+        let f = Fixture::new(false);
+
+        let Response::Error { code, .. } = handle(
+            &f.state,
+            &f.peer(),
+            Request::GetDocument { did: "did:wba:example.com:user:bob:e1_zzz".into() },
+        ) else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(code, crate::daemon::wire::ErrorCode::KeyNotFound);
+    }
+
+    /// 调用方指定的 nonce 必须落到签名里 —— 它是"同一条请求"和"另一条
+    /// 请求"的分界,也是 `@signature-params` 里那个 nonce。
+    #[test]
+    fn a_caller_supplied_nonce_reaches_the_signature() {
+        let f = Fixture::new(false);
+        f.unlock();
+
+        let Request::Sign(SignRequest::Structured {
+            did,
+            method,
+            target_uri,
+            headers,
+            body,
+            ..
+        }) = f.structured()
+        else {
+            unreachable!()
+        };
+        let request = Request::Sign(SignRequest::Structured {
+            did,
+            kid: None,
+            method,
+            target_uri,
+            headers,
+            body,
+            covered: Vec::new(),
+            nonce: Some("caller-chosen-42".into()),
+        });
+
+        let Response::Signature(bytes) = handle(&f.state, &f.peer(), request) else {
+            panic!("expected a signature");
+        };
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("nonce=\"caller-chosen-42\""), "{text}");
     }
 
     /// 审计里的 keyid 是从我们自己刚生成的 `Signature-Input` 里读的。
