@@ -1,0 +1,14 @@
+{
+  "_source": "NOT an RFC transcript — this one comes from a sibling implementation. awiki's anp-sdk, src/core/crypto/fingerprint.test.ts: `ED_PUB = ed25519.getPublicKey(new Uint8Array(32).fill(1))` and `ED_FP = 'e1_UDDReOZl1ipXAfp9wYsm13sDBMK5og--QWdBjzuf6o4'` (lines 11-12; the same string is written out as a literal JWK on line 41). The key is a seed of 32 bytes of 0x01 — chosen by that test, not by any standard.",
+  "_note": "What is transcribed: the seed and `did_binding_segment` (that string is the sibling's own assertion). What was recomputed for this file, from the seed, by a second implementation (Python `cryptography` + `hashlib` + `json`) when it was written: `public_hex`, `required_members.x`, `canonical` and `sha256_hex`. Those four pin the intermediate steps rather than the endpoint — a compensating pair of errors on either side would otherwise still land on the right 43 characters.",
+  "seed_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+  "public_hex": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+  "required_members": {
+    "crv": "Ed25519",
+    "kty": "OKP",
+    "x": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w"
+  },
+  "canonical": "{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w\"}",
+  "sha256_hex": "5030d178e665d62a5701fa7dc18b26d77b0304c2b9a20fbe4167418f3b9fea8e",
+  "did_binding_segment": "e1_UDDReOZl1ipXAfp9wYsm13sDBMK5og--QWdBjzuf6o4"
+}

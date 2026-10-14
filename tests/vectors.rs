@@ -1,4 +1,4 @@
-//! 外部标准的测试向量 —— 计划 §十。
+//! 外部标准的测试向量,外加一条兄弟实现的 —— 计划 §十。
 //!
 //! # 为什么单开一个文件
 //!
@@ -10,10 +10,15 @@
 //!
 //! # 这些向量是从哪儿来的
 //!
-//! `tests/vectors/*.json` 里每一个字节都是从 RFC 正文里**机械抽出来**的
-//! (出处写在各自的 `_source` 字段);不是我照着记忆打的。这一点决定了失败时
-//! 该怀疑谁:向量是权威文本的抄本,所以**它红了,先怀疑实现**。改向量让测试
-//! 变绿,正好把这个文件存在的理由抹掉。
+//! `tests/vectors/*.json` 里每一个字节都是有出处的(写在各自的 `_source`
+//! 字段);不是我照着记忆打的。出处有两类,而**失败时该怀疑谁,取决于它是哪
+//! 一类**:
+//!
+//! - **RFC 正文的抄本**(`rfc*.json`)。向量是权威文本,所以**它红了,先怀疑
+//!   实现**。改向量让测试变绿,正好把这个文件存在的理由抹掉。
+//! - **一个兄弟实现自己算出来的值**(`anp_sdk_*.json`)。它红了是**两个实现
+//!   分家了**,得先问是谁动了 —— 期望值那一串在别人家的测试里也是断言,它有
+//!   可能才是对的一方。去两边的仓库里各读一遍,而不是挑一边改。
 //!
 //! 同一件事也解释了为什么这里缺了几样东西。RFC 9421 附录 B 只有一条同时
 //! 满足"Ed25519"(确定性,签名可复现)和"覆盖集非空"(本实现按 §M3 拒绝空
@@ -318,6 +323,69 @@ fn the_ed25519_thumbprint_is_the_one_rfc8037_published() {
         e1_segment(&verifying).expect("the e1 segment"),
         string(case, "did_binding_segment"),
         "our e1_ segment has to be RFC 8037's own published thumbprint"
+    );
+}
+
+// ————————————————————————————————————————————————————————————
+// 别人的实现 —— 同一把钥匙,两边算出来的 `e1_` 段是不是同一串
+// ————————————————————————————————————————————————————————————
+
+/// **一个兄弟实现自己算出来的 `e1_` 段,我们必须得出同一串。**
+///
+/// 上面几条把我们的指纹钉在 RFC 上;这一条钉的是**互操作**,而且是往下游一
+/// 格。awiki 那套东西(connectx 走的正是它)拿 `anp-sdk` 的 `ed25519Fingerprint`
+/// 算 DID,keyd 走的是上游 `anp` 的 `compute_multikey_fingerprint` —— 两边必须
+/// 是同一串字节,否则同一个身份在客户端和在服务端会是两个 DID,而**它们各自
+/// 看自己都是对的**:自洽、可复现、测试全绿,只是对不上。
+///
+/// 它和上面几条的失败含义不一样,见文件头:这一条红了是"两个实现分家了",
+/// 期望值那串在 `anp-sdk` 里也是断言,它有可能才是对的一方。所以修法是去两个
+/// 仓库里各读一遍,不是挑一边改。
+///
+/// 中间几步也逐项比。只比最后那 46 个字符的话,两边各错一处、恰好抵消,看上去
+/// 照样是绿的 —— 而那正是这类分家最常见的形态。
+#[test]
+fn the_e1_segment_is_the_one_the_sibling_implementation_derives() {
+    let file = vectors("anp_sdk_ed25519_fingerprint.json");
+
+    let seed: [u8; 32] = unhex(&string(&file, "seed_hex"))
+        .as_slice()
+        .try_into()
+        .expect("an Ed25519 seed is 32 bytes");
+    let verifying = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+    assert_eq!(
+        verifying.to_bytes().to_vec(),
+        unhex(&string(&file, "public_hex")),
+        "the seed has to be the one the sibling derives this public key from"
+    );
+
+    // 指纹的输入(RFC 7638 的 JWK)和它的规范化 —— 一步都不许歪。
+    let members = file.get("required_members").expect("required_members");
+    let jwk = serde_json::json!({
+        "crv": string(members, "crv"),
+        "kty": string(members, "kty"),
+        "x": string(members, "x"),
+    });
+    assert_eq!(
+        b64url(&verifying.to_bytes()),
+        string(members, "x"),
+        "the JWK's x member is the public key in unpadded base64url"
+    );
+    assert_eq!(canonical(&jwk), string(&file, "canonical"), "the canonical JWK");
+
+    let digest = Sha256::digest(string(&file, "canonical").as_bytes());
+    assert_eq!(
+        digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        string(&file, "sha256_hex"),
+        "the SHA-256 of that canonical JSON"
+    );
+
+    // 最后才是我们自己那一层。前面几项是它的输入,它们先对了,这一条才说明
+    // 问题 —— 否则它红的时候看不出是拼装错了还是上游算错了。
+    assert_eq!(
+        e1_segment(&verifying).expect("the e1 segment"),
+        string(&file, "did_binding_segment"),
+        "our e1_ segment has to be the one anp-sdk asserts"
     );
 }
 
