@@ -3,13 +3,13 @@
 **这不是当前待办。** 现役的在仓库根目录的 [../TODO.md](../TODO.md)。
 
 这份收的是**已经不在 TODO.md 里的东西**:已经做完的那几件的记录(**为什么**当时
-那么做、以及实测出来的坑),"和计划写得不一样的地方"那张对照表,和两版 TODO 的原样
-快照。没做完的那几件在仓库根的 [../TODO.md](../TODO.md),不在这个文件里。
+那么做、以及实测出来的坑),"和计划写得不一样的地方"那张对照表,和**三版** TODO 的
+原样快照。没做完的那几件在仓库根的 [../TODO.md](../TODO.md),不在这个文件里。
 
 **这一版正文(下面「原文」那一段)不再改。** 此后做完的几件追加在它后面(到写这行
-为止有「追加一」到「追加五」),所以这份文件的末尾会一直长出新的记录来,而那段正文
-始终是当时的样子。**2026-10-14 收工时又加了「整份归档二」** —— 那一版 TODO 的原样
-快照,连同"旧号怎么对上新号"那张表。
+为止有「追加一」到「追加六」),所以这份文件的末尾会一直长出新的记录来,而那段正文
+始终是当时的样子。**2026-10-14 收了两次工,加过两次整份快照**:「整份归档二」和
+「整份归档三」—— 各自是那一版 TODO 的原样,连同"旧号怎么对上新号"那张表。
 
 下面是原文。
 
@@ -801,3 +801,353 @@ biscuit 能力令牌),边界见 [DESIGN.md](DESIGN.md) §一 和 §六。
 | `src/error.rs` | `ChallengeDisabled` 的消息带上该开哪个开关 |
 | `docs/ADAPTER.md` §3.3 / §3.1 / §三 / §八 / §九 / §十 / §十一 / §十二 | 岔口落定:四样边界、为什么不是另外两条、以及"密码学上同一个东西"那段实话 |
 | `TODO.md` §一 / §五 | §一 拍定、§五 这一件做完,都在原地留下指向本条的一行 |
+
+---
+
+# 追加六:客户端侧和验收 —— ✅ 已做完(2026-10-14)
+
+**下面「整份归档三」那一版(以及它前面那一版)的 §二。** 那一节的验收有两半,而两半
+问的是**不同的问题**:连接器那一半问"客户端和守护进程对得上吗",服务端那一半问
+"**另一个实现**认这个身份吗"。第二半是这一条补上的,也是整个适配层里唯一一次
+**跨语言、跨进程的对端**。
+
+做完的样子就是那两条验收:
+
+| | 脚本 | 是什么 |
+|---|---|---|
+| 守护进程那一半 | `anp-sdk/scripts/keyd-acceptance.mjs` | 五条反证对真守护进程,九条里八过一 SKIP |
+| 服务端那一半 | `anp-sdk/scripts/keyd-server-acceptance.mjs` | 注册 + 登录对真的 `awiki-open-server`,十条全过 |
+
+两个脚本一个约定:自己的临时 root、自己的守护进程、`keyd-tty.py` 供 TTY、逐条
+PASS/SKIP/FAIL、跑完把自己的根删掉,不碰 `~/.anp-keyd`。第二个脚本要一台**已经在跑**
+的服务端(`--target`),所以它不进 CI,是手动跑的验收 —— 这一点写在它自己的头一段里。
+
+## 落地的形状
+
+跨两个仓库,而且**两边各有一处只有那边才该做的改动**:
+
+| | 在哪儿 | 是什么 |
+|---|---|---|
+| 连接器 | `anp-sdk/src/core/connectors/keyd.ts` | `AnpConnector` 的一支:只转发、只翻译错误 |
+| 线 | `anp-sdk/src/core/connectors/keydWire.ts` | 帧 + 结构化变体 + `signChallenge`(SIGN 0x03) |
+| 请求体 | `anp-sdk/src/core/protocol/anp.ts` | `buildAnpLoginBody` 提成一个函数,连接器和钱包那条路共用 |
+| 挑战签名 | 同上 + `types.ts` | `AnpConnector` 上的**可选**方法 `signChallenge?` |
+| `proofValue` | `anp-keyd/src/did/proof_value.rs` | 出站换 multibase,交回上游验签前换回去 |
+
+**"适配器里只做转发和错误翻译,出现协议词就是边界划错了地方"这条守住了。** 请求体
+不是连接器拼的,是 SDK 自己的 `buildAnpLoginBody`;连接器里出现的唯一协议词就是那个
+函数名。`Locked` 走的是 `KeydLockedError` 而不是 `ConnectxError` —— 调用方**不可能**
+把它报成"签名失败",因为类型上就不是那一个。
+
+## 实测出来的五样
+
+**一、`proofValue` 的字母表:上游 `anp` 1.0.6 是那个离群的。** 它 `complete_w3c_proof`
+交出来的是**裸 base64url**;ANP-03 §2.5.5(W3C Data Integrity)要的是 multibase
+base58btc,也就是一个 `z` 前缀,而 awiki-open-server 只认这一种
+(`service_identity._decode_proof_value` 见到别的前缀直接报
+`did_document_proof_value_invalid`),anp-sdk 也只发这一种。**量过**:拿上游那份
+base64url 去注册,服务端原样拒;同一个签名换成 `z`+base58btc,注册当场成功。
+
+**换字母表不动签名。** 签名输入是 `jcs(proof options) ‖ jcs(document minus proof)`,
+而 `proofValue` 本来就被剔在输入外面 —— 重编的是同一批字节,不是重签一次,所以既
+不需要私钥,也不可能因为换而签坏。反方向的那个函数是给**上游的验签**用的:它只认得
+base64url,把文档交给它之前先换回去,它算出来的输入和我们签的那一份逐字节相同,于是
+它验的就是我们真正签过的东西。
+
+**和上面那条"1.0.6 不动签名基"不矛盾** —— 那说的是 `proof/mod.rs` 改的是**验证**那一支
+的输入拼法,而这里分歧的是**编码**,不在签名输入里。
+
+**二、带签名的登录是 did-auth RPC 本身,不是 `GET /me` —— 上一版 TODO 在这一点上写错了。**
+错处已划在快照里,这里记结论:`GET /user-service/v1/me` **走不到**签名那一支,它的
+`legacy_me_profile` 先叫 `current_did(request, required=True)`,而 `/me` 不在
+`did_auth_signature_path` 里,于是在看签名之前就抛 `missing_authentication`。这一版的
+`did_verify_login` 也照旧:收 `did` + 一个配置里的 dev code,**根本不验签**。真正带签名的
+登录是往 `/user-service/v1/did-auth/rpc` 发一个不带 bearer、带 `signature-input` +
+`signature` 的 JSON-RPC 调用,服务端验完签名回**资料 + 一套新 token**。在这台服务端上,
+"登录"和"一次带签名的调用"是同一件事,没有第二个口。
+
+**三、连接器的 `signRequest` 接不了这条路,和注册是同一类错位。** 它签名盖住的体永远是
+`buildAnpLoginBody` 产出的 `{nonce, did, didDocument}`,而这个口要的是**纯 JSON-RPC
+信封**(`JsonRpcRequest` 是 `extra="forbid"` 的),形状对不上,在验签之前就被拒;
+`RequestEnvelope` 又跑在签名**之后**,改不了已经算进摘要的字节。注册那边是同一个故事:
+服务端要的字段和 ANP-02 的登录体不是一回事(`ADR-0003`)。
+
+所以验收**不为此新开 SDK API** —— 开的那个口子("签调用方自己拼的体")正是 §十 挡着的
+东西。走的是 CLI 那条**公开接缝**:`anp-keyd sign --url --header --body <FILE>`,
+调用方自己拼体,守护进程签**那串字节**。这条路本来就存在(结构化 `sign` 收的是文件),
+验收只是第一个这么用它的调用方。
+
+**四、有 proof 的文档里那条 `ANPMessageService` 是要考的,而且只对有 proof 的文档生效。**
+`_ensure_anp_message_service`(`user_compat/core.py:310`)分两支:没有 proof 的文档,
+服务端把模板直接塞进去;有 proof 的走验证那一支 —— 要求**恰好一条**
+`ANPMessageService`,且 `serviceEndpoint` 和 `serviceDid` **等于服务端自己的配置**,
+否则是 `signed_did_document_service_endpoint_mismatch` / `..._service_did_mismatch`。
+其余字段(profiles / securityProfiles / authSchemes)服务端**改写**成自己的值,只保留
+调用方给的 `id`。这不是挑剔:它不肯在一份自己签发的身份文档里,把一个对端指向**别人的**
+消息口。keyd 的文档带 proof,走的就是这一支 —— 验收脚本因此去读服务端自己发布的那份
+文档,把那条 entry 原样拿过来,而不是自己拼一个 URL。
+
+**五、keyd 拒签非 HTTPS 的 URL,而服务端按自己的配置重算签名基 —— 两边要的是同一个串。**
+`sign/rfc9421.rs::validate_url` 拒签 `http://`(理由是 did:wba 是绑在域名上的身份),
+所以对一台没有 TLS 的开发服务器,签名里的来源和字节实际发到的地址是**两个值**
+(脚本的 `--signed-origin`)。这能成立,是因为服务端重算签名基用的是它自己配置的
+`AWIKI_PUBLIC_BASE_URL` + 路径,**不看这次连接上走的是什么协议**。同一处还有
+`--did-domain`:服务端 `_validate_local_user_did` 要求 DID 的域等于它自己的
+`AWIKI_DID_DOMAIN`,而它自己发布的那条 DID 会把端口写进 authority,所以默认值是从
+那里推、再把端口剥掉。
+
+## 剩下的一条尾巴
+
+**awiki-cli-rs2 那半没动,而且不是"没写"** —— 它在这台机器上开不了工:`Cargo.toml:43-44`
+两条 path 钉的是 `../anp/anp/rust`(`=1.0.3`)和
+`../anp/anp-identity/crates/anp-identity`(`=0.2.3`),两个目录本机都不存在,registry 上
+只有 `1.0.5`/`1.0.6` 和 `0.2.5`,`=` 钉死了换不上去。**要么把上游那两个版本弄回来,要么
+松那两条钉 —— 两件都是要人拍的**,所以搬进了新的 [TODO.md](../TODO.md) 第一节。
+
+## 落地清单
+
+| 文件 | 改了什么 |
+|---|---|
+| `anp-sdk/src/core/connectors/keyd.ts` | 新增:连接器本体(转发 + 错误翻译表 + `KeydLockedError`) |
+| `anp-sdk/src/core/connectors/keydWire.ts` | 新增:线协议客户端,含 `signChallenge` 与 `MAX_CHALLENGE_LEN` |
+| `anp-sdk/src/core/protocol/anp.ts` | `buildAnpLoginBody` 从 `cryptoWalletProver` 里提出来,两处共用 |
+| `anp-sdk/src/core/types.ts` | `'keyd'` 钱包类型;`ChallengeSignRequest` / `ChallengeSignature`;`AnpConnector.signChallenge?` |
+| `anp-sdk/src/core/{index.ts,connectors/index.ts}` | 导出 `keydConnector` / `KeydLockedError` 和两个挑战类型 |
+| `anp-sdk/src/core/index.test.ts` | 公开导出清单里加上那两个新名字 |
+| `anp-sdk/scripts/keyd-acceptance.mjs` | 新增:对真守护进程的五条反证(九条检查) |
+| `anp-sdk/scripts/keyd-server-acceptance.mjs` | 新增:对真 awiki-open-server 的注册 + 登录(十条检查) |
+| `anp-keyd/src/did/proof_value.rs` | 新增:两种字母表互转 + 五个测试 |
+| `anp-keyd/src/did/document.rs` | 签名后换成 multibase;交给上游验签前换回去;一条新测试 |
+| `anp-keyd/tests/signature_end_to_end.rs` | 上游验签那一处也先换字母表 |
+
+---
+
+# 整份归档三:2026-10-14 收工时的 TODO
+
+**下面是那一版 TODO.md 的原样快照。** 它是"一件就是一件事"的那一版(上一版的归档是
+「整份归档二」)。它在自己这一段里的那几件,记录就是上面「追加五」和「追加六」;
+**没收的那一件搬进了新的 [TODO.md](../TODO.md)**。
+
+**这一版重新编号了,快照里是旧号。** 上一版的 §一 拍定、§二 做完、§五 做完,剩下的
+按顺序变成了新 TODO 的一到三。旧号留在这份快照里,是因为提交信息、上面各「追加」、以及
+ADAPTER 里都用"§二 那条"、"§五 那个开关"这样的说法 —— 快照在,那些话就查得到。
+
+**正文一字未改,只把链接前缀去掉了** —— 它从仓库根目录挪进了 `docs/` 里,`docs/` 那一段
+不去的会指向 `docs/docs/`,`anp-sdk/…` 那些原本就是仓库外的相对路径,照旧。
+
+**一处错话原样留着**:§二 里那段划掉的 `login` 说明当时是**写错的**(`GET /me` 走不到
+签名那一支),更正就在它下面,没有抹掉。留着的理由和别处一样 —— 快照的意义是当时
+什么样,不是后来改成了什么样。
+
+---
+
+# TODO
+
+还没做完的事。**为什么**这么做在 [DESIGN.md](DESIGN.md)(威胁模型、取舍)
+和 [ADAPTER.md](ADAPTER.md)(适配层的方案)里 —— 这里只列**要动手的东西**。
+
+**一件就是一件事。** 一件做到什么算完,写在条目里;怎么做到,在对应的文档里。
+
+**这一份重新编号了,所以旧的说法要去归档里对。** 上一版整份快照是归档里的
+[TODO-archive.md](TODO-archive.md) 「整份归档二」—— 它做完的那几件
+(§一 / §四 / §六)分别记在归档的「追加一」到「追加四」里,没收的四件搬过来时按顺序
+成了下面的一到四:
+
+| 上一版 | 现在 | 是什么 |
+|---|---|---|
+| §二 | 一 | 注册那个挑战签名(要人拍的岔口) |
+| §三 | 二 | 客户端侧和验收 |
+| §五 | 三 | 硬件根剩下三件 |
+| §七 | 四 | 明确不做 |
+
+**这一版内部的规矩和上一版一样:做完的就在原地划掉,不搬走、不重编号** —— 等到这一版
+也收工,再整份快照进归档。所以这个文件里,**没被划掉的才是还没做的**。
+
+眼下的主线是**适配层** —— 在不让守护进程认识任何一个具体协议的前提下,让它满足
+connectx / awiki-cli-rs2 这类工具的签名需求([ADAPTER.md](ADAPTER.md))。
+硬件根是上一阶段的收尾,剩下的三件不是代码问题,理由在条目里。
+
+---
+
+## ~~一、适配层:注册那个挑战签名 —— 先写下来,不必现在拍~~ ✅ 已拍(2026-10-14)
+
+~~awiki-open-server 的注册,除了 DID 文档自签,还要一次一次性挑战的证明:对服务端
+下发的随机串做一次 Ed25519 签名(`challenge_signature`)。**那不是 RFC 9421**,而
+[ADAPTER.md](ADAPTER.md) §十 那条线("不为适配打开 `Raw`")正挡在它前面。
+三条路(不签 / 开一条比 `Raw` 窄的路 / 承认注册不在范围内)写在
+[ADAPTER §3.3](ADAPTER.md) —— 那是这份方案里**唯一一处要人拍的岔口**。~~
+
+~~**但两个客户端都不发它** —— connectx 走文档自签 + 401 重签,awiki-cli-rs2 的注册 RPC
+里没这个字段(**两个都核过了**)。所以"不签"这条路**今天零成本**:它挡不住任何人,
+只是一条**将来**对端把"可选"翻成"必需"时才会咬人的线。先记在这儿,不急着拍;真要拍,
+要么进第四节「明确不做」,要么变成共用层上的一件东西 —— 那会是一条**新**的条目,不是
+把上一版那条(nonce + `GET_DOCUMENT`)捡回来,那条已经做完并归档了。~~
+
+~~**算完的样子:** 三条路里选定的那一条写进 ADAPTER 正文,§十二 里那条"未决"落定。~~
+
+**拍的是第二条:开一条比 `Raw` 窄的路**,四条边界写进 [ADAPTER §3.3](ADAPTER.md)
+正文(256 字节上限、不做字符集过滤、不解释字节、单独审计 + 单独开关),§十二 里那条
+"未决"落定。**有一条要连着读**:这条路在密码学上和 `Raw` 是同一个东西,分开它们的只有
+那条上限和程序上的三样东西 —— 理由写在 §3.3 最后两段,别只看这一行。
+
+## ~~五、适配层:把那条窄路做到 socket 上~~ ✅ 已做完(2026-10-14)
+
+~~上一节拍下来的那条路,落点是共用层:**`SIGN` 的第三个变体**(`SignRequest::Challenge`,
+和 `Structured` / `Raw` 并列),不是新消息类型。加一处类型、一处 handler、一条审计
+(`CHALLENGE_SIGNED`,和 `RAW_SIGNED` 分开)、一个开关(`--allow-challenge-signing`,
+默认关;`--allow-raw-signing` 打开时它自动也开,因为 `Raw` 严格更宽),`cli` 接一处。
+**`mcp` 不接** —— 给 agent 一个"签这串字节"的工具,正是 §9.3 那条要挡的东西。~~
+
+~~**这一件不是"顺手开的口子",所以边界跟着代码一起落:** 上限在协议层就拦掉(超了报
+`Protocol`,不是签完再说),字节原样签名、不做字符集过滤(和 `nonce` 正相反,理由在 §3.3),
+审计记 `did` / 长度 / 摘要。~~
+
+~~**算完的样子:** `SIGN` 的第三个变体在 `wire` 上跑得通;256 字节签得出、257 字节在协议层
+被拒;守护进程没开那个开关时拒绝的码和消息都对得上;开了之后签名能用上游实现验过。~~
+
+**四样边界都落了,四条都当场量过**(256 签得出 / 257 在解码层被拒 / 关着时拒的话里
+有那个开关的名字 / 开了之后交付的是 `ed25519_dalek` 拿**已发布文档**里的公钥验过的
+签名),`mcp` 一处没接。**唯一要连着读的一句**:这条路在密码学上和 `Raw` 是同一个
+东西,钉住它的只有那道 256 字节的墙 —— 记录在 [TODO-archive.md](TODO-archive.md)
+末尾「追加五」,别把"窄"读成"有形状"。
+
+## 二、适配层:客户端侧,和验收
+
+- ~~**connectx:接的是 connector,不是 provider。** `AnpConnector.signRequest` 收
+  method / url / nonce / handle,形状正好对上 keyd 的结构化路径;EIP-1193 那层只到
+  `signMessage`,用它就得开 `Raw`。实现纪律照抄 `providers/README.md`:适配器里
+  只做转发和错误翻译,出现 "ANP" 这个词就是边界划错了地方(§八)。`Locked` 原样
+  交回给人,**不重试、不翻译成"签名失败"**(§六)。~~ ✅ 已做完(2026-10-14):
+  连接器在 `anp-sdk/src/core/connectors/keyd.ts`,线在 `keydWire.ts`,都是公开导出。
+  转发那半做到了"没有 ANP 知识" —— 请求体是 SDK 自己的 `buildAnpLoginBody` 拼的,
+  连接器里出现的唯一协议词就是它;错误那半是一张只变粗的翻译表,`Locked` 走的是
+  `KeydLockedError`(不是 `ConnectxError`,所以调用方不可能把它报成签名失败)。
+- **awiki-cli-rs2:接缝已经在了,而且形状就是 keyd 的。** 它那层 `IdentitySigner` 的
+  `http_signature_headers(kid, url, method, headers, body, options)` 正是结构化
+  `SIGN`,而且 `options` **本来就带 `nonce`**;`did_document()` 正是 `GET_DOCUMENT`。
+  `AnpIdentitySigner` 已经把同一批方法转手给 `anp-identity` 这个"custody 在别处"的
+  实现 —— keyd 照它再写一份即可(§八)。**一处错位**:`sign_document_proof` 收的是
+  调用方构造的文档,和 keyd 的不变量 3 对不上,注册那一段的改法要单独想。
+  **在这台机器上开不了工,而且不是环境没配好:** `Cargo.toml:43-44` 那两条 path 钉的是
+  `../anp/anp/rust`(`=1.0.3`)和 `../anp/anp-identity/crates/anp-identity`(`=0.2.3`),
+  两个目录本机都不存在,registry 上只有 `1.0.5`/`1.0.6` 和 `0.2.5`,`=` 钉死了换不上去。
+  要么把上游那两个版本弄回来,要么松那两条钉 —— **两件都是要人拍的**,所以这半没动。
+- ~~**验收是 §十一 那五条反证。** 核心是第一条:**停掉守护进程,connectx 必须失败**
+  —— 不然只是多了一条可选路径,不叫抽出来了。~~ ✅ 五条都对真守护进程跑过
+  (2026-10-14):`anp-sdk/scripts/keyd-acceptance.mjs`,自己一个临时 root 和 socket,
+  跑完删掉,不碰 `~/.anp-keyd`。第 1 条连错误码、消息里点名 `anp-keyd serve`、
+  以及"守护进程回来就恢复"一起验;第 2 条验的不只是"交出个 `Locked`",而是**同一个
+  请求**在人工解锁之后签得出来(不验这半,"可重试"就只是个词);第 3 条不是数行数,
+  是在 JS 里把整条哈希链重算了一遍;第 4 条把 connectx 的 DID 和 `document` 子命令的
+  字节逐字节比了;第 5 条交给 Python(`anp` 1.0.3)。第 5 条要另一个语言,没给
+  `ANP_PYTHON` 就报 **SKIP 并说明为什么**,不假装过。后来又加了一条挑战签名
+  (守护进程默认关 → 开了之后签得出 → 用文档里那把公钥验得过 → 审计里记的是摘要
+  不是原文),**九条里八过一跳**。
+- **验收那条已经跑通了(2026-10-14):对真的 `awiki-open-server` 走完 `register` +
+  `login`。** 上一条证的是守护进程那一侧 —— 客户端和守护进程对得上;这一条把同一把
+  keyd 持有的身份送到**另一个实现**面前:服务端拿 Python `anp` 重算签名基、拿 pip 的
+  `cryptography` 验 Ed25519,中间隔着进程边界、一条 socket、两种语言。脚本在
+  `anp-sdk/scripts/keyd-server-acceptance.mjs`,沿用上一条 `keyd-acceptance.mjs` 的
+  约定(自己的临时 root、自己的守护进程、`keyd-tty.py` 供 TTY、逐条 PASS/FAIL):
+
+  ```bash
+  npm run build
+  ANP_KEYD_BIN=/path/to/anp-keyd node scripts/keyd-server-acceptance.mjs \
+    --target http://127.0.0.1:8792
+  ```
+
+  **十条,全过。** 前四条是注册:`challenge` → 挑战裸签 → `register` → 服务端存下来的
+  文档里 `proofValue` **仍是 `z` 打头的 multibase**(这条才把 `did::proof_value` 那个
+  改动钉在真对端上)→ 同一个 challenge 再花一次被拒。后六条是登录:不带签名被拒
+  (`missing_authentication`)→ 带签名回来一整套 token → 重放同一份签名被拒
+  (`signature_replayed`)→ 为**另一个 URL** 签的那份头拿来打这个口被拒
+  (`invalid_http_signature`)。
+
+  **服务端这一侧的规矩(对着源码核出来的):**
+  - 注册走的是 JSON-RPC(`/user-service/v1/did-auth/rpc`,方法 `register`),没有
+    ANP-02 那个 `/api/login/anp/verify` 口子。它要 `did` + `did_document`(带 proof,
+    也就是 `publish` 出来的那一份,`GET_DOCUMENT` 取得回来),另外**可以**带一对
+    `challenge` / `challenge_signature` —— `challenge` 有专门的 RPC 发(300 秒、一次
+    性),签名是**对这串 challenge 本身的 Ed25519 裸签**,拿文档里的验证方法验。
+    这正是 §一 拍的那条、§五 落到 socket 上的 `SIGN` 第三个变体。
+  - ~~**可连接器还没接那条路。** `keydWire.ts` 里只有结构化那一支(`SIGN_STRUCTURED`),
+    挑战那一支没发过,`challenge_disabled` 只是当错误码翻了个名。所以要把注册跑通,
+    先得把挑战签名这条路从 `keyd.ts` 露出来 —— **这是 §二 里剩下最实的一件**。~~
+    ✅ 已接上(2026-10-14):`keydWire.ts` 多了 `signChallenge`(SIGN 0x03,带
+    `bytes32` 那一列)和 `MAX_CHALLENGE_LEN = 256`;`keyd.ts` 把它接成
+    `AnpConnector` 上的**可选**方法 `signChallenge?`(别的连接器不实现就该不实现,
+    调用方按 `events` 那种方式探),返回 base64url 的签名 + 用的是哪份文档。
+    出口只有这一条窄路:上限 256 字节,超了在**连接器这一层**就拒(报
+    `invalid_argument`)—— 不能留给守护进程拒,它按 `Protocol` 拒,而那张翻译表
+    把 `Protocol` 读成"版本对不上",对"这不是个挑战"是句错话。开不开由守护进程的
+    `--allow-challenge-signing` 定(默认关),所以 SDK 自己不另加开关:
+    `challenge_disabled` 就是那个开关的读法。
+  - 还有一条硬约束:服务端 `_validate_local_user_did` 要求 DID 的域等于它自己的
+    `did_domain`(默认 `localhost`),所以 keyd 那把钥匙得用同一个域 `keygen` 出来,
+    不是随便造一把就行。
+  - **文档里那条 `ANPMessageService` 也有约束,而且只对有 proof 的文档生效。**
+    `_ensure_anp_message_service`(`user_compat/core.py:310`)分两支:没有 proof 的
+    文档,服务端直接把模板塞进去;有 proof 的走验证那一支 —— 它要求**恰好一条**
+    `ANPMessageService`,并且 `serviceEndpoint` 和 `serviceDid` 必须**等于服务端
+    自己的配置**,否则就是 `signed_did_document_service_endpoint_mismatch` /
+    `..._service_did_mismatch`。其余字段(profiles / securityProfiles /
+    authSchemes)服务端**改写**成自己的值,只保留调用方给的 `id`。这不是挑剔:
+    它不肯在一份自己签发的身份文档里把一个对端指向**别人的**消息口。keyd 的文档
+    带 proof,所以走的是这一支 —— 验收脚本因此去读服务端自己发布的那份文档,把那条
+    entry 原样拿过来,而不是自己拼一个 URL。
+  - ~~**`login` 另外说:** 这一版的 `did_verify_login` 收的是 `did` + 一个配置里的
+    `did_verify_dev_code`(默认 `666666`),**根本不验签**。带签名的那条路是
+    `GET /user-service/v1/me`:不带 bearer、带 `signature-input` 时它回一套 token ——
+    那个形状正是 connectx 的 `signRequest` 产出的。所以"登录"这一步要对的是 `/me`,
+    不是 `login`。~~ ❌ **上一版这一段写错了,2026-10-14 对着源码核过并已跑通:**
+    `GET /user-service/v1/me` **走不到**签名那一支 —— `legacy_me_profile` 先叫
+    `current_did(request, required=True)`,而 `/me` 不在 `did_auth_signature_path`
+    里,于是**在看签名之前**就抛 `missing_authentication`
+    (`user_compat/core.py:1273`)。`did_verify_login` 那边照旧:收 `did` + 配置里的
+    `did_verify_dev_code`(默认 `666666`),**根本不验签**,登录也不是它。
+    **真正带签名的登录就是 did-auth RPC 本身:** 不带 bearer、带 `signature-input` +
+    `signature`,方法挑一个要身份的(`get_me`),服务端验完签名回**资料 + 一套新
+    token**。在这台服务端上,"登录"和"一次带签名的调用"是同一件事,没有第二个口。
+  - **连接器的 `signRequest` 接不了这条路,和注册是同一类错位。** 它签名盖住的体
+    永远是 `buildAnpLoginBody` 产出的 `{nonce, did, didDocument}`;这个口子要的是
+    **纯 JSON-RPC 信封**,而 `JsonRpcRequest` 是 `extra="forbid"` 的 —— 形状对不上,
+    在验签之前就被拒;`RequestEnvelope` 又跑在签名**之后**,改不了已经算进摘要的
+    字节。所以验收脚本不为此新开 SDK API,而是走 CLI 那条**公开接缝**:
+    `anp-keyd sign --url --header --body <FILE>` —— 调用方自己拼体,守护进程签
+    **那串字节**。开发服务器没有 TLS 时再补一个 `--signed-origin`:keyd 拒签非
+    HTTPS 的 URL(`sign/rfc9421.rs::validate_url`),而服务端重算签名基用的是它自己
+    的 `AWIKI_PUBLIC_BASE_URL`,两边要的是同一个串。脚本的 `--did-domain` 同理,
+    默认从服务端自己发布的那条 DID 推(把端口剥掉,因为 `AWIKI_DID_DOMAIN` 是裸域)。
+- **`@authority` 那条也在这儿收了:** 规范化当初是对着源码核出来的(归档「追加二」),
+  后来签名侧是真守护进程算的、验签侧是 Python `anp` 1.0.3 —— 也就是服务端自己用的
+  那一份 —— 重算后对上了。~~**但对面还没有一个真的服务端**。~~ **现在有了:**
+  上面那条带签名的 `get_me` 就是真对端 —— 客户端签的 URL 里 `@authority` 来自
+  `--url`,服务端从它自己的 `AWIKI_PUBLIC_BASE_URL` 重算,两边拼出同一个串才验得过;
+  反证是同一份体、为另一个 URL 签的头打过来被拒(`invalid_http_signature`)。
+  跨实现这一环到此为止是**双向都量过**的,不再只是"源码上对得上"。
+
+## 三、硬件根(M5):剩下三件,两件堵在签名身份上
+
+代码都写完、能验的也验过了(结论在归档里),剩下的**都不是代码问题**:
+
+- **SE 的持久化没验过。** "SE key 留在钥匙串里、进程重启之后还开得了"需要签名身份,
+  而本机 `security find-identity -v -p codesigning` 是 0 个。有身份之后的三步验收
+  在归档里。
+- **macOS 的 SE 版本必须签名分发。** 写钥匙串要 Apple 签发的
+  `application-identifier`,这是发行决策。**不要去试"ad-hoc 签名 + 手写
+  entitlement"** —— 已经量过,进程会被内核 SIGKILL。
+- **硬件绑定的端到端验收仍然跑在软件替身上。** `tests/hardware.rs` 验的是那条路的
+  **形状**;"HS 真的出不了这台机器"只有真后端能验。TPM 那半在 Linux 上真跑过了,
+  SE 那半等身份。
+
+## 四、明确不做
+
+适配这条路上不碰的(理由都在 [ADAPTER.md](ADAPTER.md) §十):打开 `Raw`、
+让守护进程认识 ANP-02 的语义、让守护进程联网、`export` 上 socket、多用户细粒度
+授权。加上原始计划 §十一 划掉的 v1 范围线(凭据中介、远程多租户解锁仪式、委托链 /
+biscuit 能力令牌),边界见 [DESIGN.md](DESIGN.md) §一 和 §六。
+
+**第一节那个岔口已经拍定、也做完了**(2026-10-14,记录在归档「追加五」):拍的是
+"开一条比 `Raw` 窄的路",所以它**没有**落进这一节。这一节里留给它的只有两条照着
+那条路划出来的线:那条窄路**不进 `mcp`**(agent 手里不该有"签这串字节"的工具,
+§9.3),以及"窄"不等于"有形状"—— 它只有一个 256 字节的上界。

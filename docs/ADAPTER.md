@@ -660,11 +660,39 @@ connectx 有两个接缝,要挑对的那一个:
 上的 `nonce`),两个前端各接一处 —— 见 §9.1。
 
 **这条剧本有一个前提,现在写出来:** connectx 和 awiki-cli-rs2 的 `register` **都不发**
-`challenge_signature`(§八),所以剧本能跑到绿。**话也要说全** —— 它证明的是"这条注册
-路径能走通",**不是**"注册这件事整个被抽出来了":对端一旦把挑战签名翻成必需,
-剧本里那一步才需要补。**那一步现在有地方可补了**(§3.3 的 `Challenge`,默认关,要用得先在
-守护进程上开 `--allow-challenge-signing`),**但"有地方补"不等于"补过了"** —— 今天没有
-客户端发它,所以剧本里仍然没有这一步。**别让一个绿的剧本冒充比它更宽的结论。**
+`challenge_signature`(§八)。
+
+**剧本跑过了(2026-10-14)。** 两个脚本,一个对真守护进程、一个对真的
+`awiki-open-server`,都在 `anp-sdk/scripts/`,都用自己的临时 root 和守护进程、跑完
+删掉:
+
+| 脚本 | 对谁 | 覆盖 |
+|---|---|---|
+| `keyd-acceptance.mjs` | 真守护进程 | 第 1 / 2 / 3 / 4 条,外加一条挑战签名 |
+| `keyd-server-acceptance.mjs` | 真的 `awiki-open-server` | **第 5 条**,以及 `register` + `login` 本身 |
+
+第二个是**唯一跨语言的那一条**:服务端拿 Python `anp` 重算签名基、拿 pip 的
+`cryptography` 验 Ed25519,中间隔着进程边界、一条 socket、两种语言。十条全过 ——
+包括"同一份签名重放被拒"和"为另一个 URL 签的头被拒"两条负例。记录在
+[TODO-archive.md](TODO-archive.md) 的「追加六」。
+
+**但别把这份绿读宽了。** 两处要说清:
+
+- **注册那半**是连接器走的(取 keyd 自己发布的那份文档 + `keydConnector.signChallenge`),
+  但**挑战那一步是脚本显式调的**(§3.3 那个变体,守护进程上开着
+  `--allow-challenge-signing`)—— connectx 的 `register` 流程自己**仍然不发**那个字段
+  (SDK 里除了连接器自己的测试,没有第二处调 `signChallenge`)。
+- **登录那半没走 connectx 的 API。** 那个口要的是**纯 JSON-RPC 信封**,而
+  `AnpConnector.signRequest` 签的体永远是 `buildAnpLoginBody` 产出的
+  `{nonce, did, didDocument}` —— `extra="forbid"` 的 `JsonRpcRequest` 收不下它,
+  形状对不上,在验签之前就被拒;`RequestEnvelope` 又跑在签名**之后**,改不了已经
+  算进摘要的字节。所以验收走的是 CLI 那条公开接缝(`anp-keyd sign --url --header
+  --body <FILE>`),**不为它新开 SDK API**。这和注册那边是同一类错位(ADR-0003)。
+
+所以今天绿的是"**这条路走得通、而且对端认**",**不是**"connectx 那套调用已经能登
+录了"。对端一旦把挑战签名翻成必需,要改的是 connectx / awiki-cli-rs2 那两处
+`register`,**不是守护进程** —— 那边有地方可补,而且补过了。
+**别让一个绿的剧本冒充比它更宽的结论。**
 
 ---
 
@@ -718,7 +746,11 @@ connectx 有两个接缝,要挑对的那一个:
    **头**都设成了 `url.host` —— 线上跑的就是不带端口的那一份。所以 keyd 现在在把 URL
    交给上游之前先规范化(小写 host、去掉默认端口),`@authority` 和 `@target-uri` 一起
    正。记录在 [TODO-archive.md](TODO-archive.md) 的「追加二」。
-   **拿真对端跑一次仍然是 §十一 那条验收里的事** —— 上面这些是对着源码核出来的。
+   **已经拿真对端跑过了(2026-10-14)** —— 上面这些是对着源码核出来的,而
+   `keyd-server-acceptance.mjs` 又对着真的 `awiki-open-server` 量了一遍:客户端签的
+   URL 里 `@authority` 来自它要签的那个地址,服务端从自己的 `AWIKI_PUBLIC_BASE_URL`
+   重算,两边拼出同一个串才验得过;反证是同一份体、为另一个 URL 签的头被拒
+   (`invalid_http_signature`)。记录在 [TODO-archive.md](TODO-archive.md) 的「追加六」。
 5. **§3.3 那个岔口 —— 已定(2026-10-14):开第二条,边界钉在 256 字节的上限上。**
    核过两个客户端(connectx、awiki-cli-rs2),**没有一个发那个挑战签名**,所以这条路
    **今天没有调用方**,而且默认关着 —— 它今天零成本这一点没有变。定下来不是为了眼下的
