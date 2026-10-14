@@ -250,6 +250,11 @@ cargo install --path . --features hardware-tpm   # Linux:钥匙可以绑到 TPM 
   `stop` 发的是 SIGTERM)。对不上时它不杀、也不删那个文件。
 - **`sign --raw` 默认关着。** 那是守护进程里唯一一条能给调用方任意签名的路,
   要用得先 `serve --allow-raw-signing`。
+- **`sign --url` 里的 URL 会按 URL 解析器的写法规范化。** host 归一成小写,默认
+  端口去掉(`https://example.com:443/x` 按 `https://example.com/x` 签)。验签方
+  是**自己解析 URL 再算一遍** `@authority` 的,两边必须是同一串 —— 照字面签
+  `:443` 会得到一个"签名无效",把人指向钥匙而不是指向 URL。path、query、
+  fragment 一个字节不动,非默认端口照旧。
 - **`migrate --allow-different-subject` 默认关。** 默认放行等于让一次打错字
   的 `--to` 变成一次无人察觉的冒名。
 - **`serve --system` 不给 `--allow-binary` 就拒绝启动。** 一个守护进程服务

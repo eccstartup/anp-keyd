@@ -179,9 +179,14 @@ pub fn sign_request(
     let mut headers = req.headers.clone();
     headers.retain(|name, _| !name.eq_ignore_ascii_case("content-digest"));
 
+    // 送进上游的是**规范化之后**的 URL。签名基里 `@authority` 和 `@target-uri`
+    // 都出自这一个字符串,所以在这里换一次,两个分量一起正 —— 见
+    // [`normalized_target_uri`]。
+    let target_uri = normalized_target_uri(&req.url);
+
     let prepared = anp::authentication::prepare_http_signature_headers(
         document,
-        &req.url,
+        &target_uri,
         &req.method,
         Some(&headers),
         req.body.as_deref(),
@@ -389,11 +394,7 @@ fn validate_url(url: &str) -> Result<()> {
             "refusing to sign a non-HTTPS request URL: {url:?}"
         )));
     }
-    let rest = &url["https://".len()..];
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
+    let authority = split_authority(url).map_or("", |(authority, _)| authority);
     if authority.is_empty() {
         return Err(KeydError::Protocol(format!(
             "the request URL has no authority: {url:?}"
@@ -406,6 +407,52 @@ fn validate_url(url: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// 把 URL 切成「authority」和「其余」两段。`https://` 之外没 authority。
+fn split_authority(url: &str) -> Option<(&str, &str)> {
+    let rest = url.strip_prefix("https://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    Some((&rest[..end], &rest[end..]))
+}
+
+/// 把 URL 规范成**一个 URL 解析器会写出来的那个样子**,其余字节原样。
+///
+/// 只有两处改动,而且都在 authority 里:**host 归一成小写**,**默认端口去掉**
+/// (`:443`,空端口也算)。这两处之外一个字节都不碰 —— path、query、fragment
+/// 原样。
+///
+/// **为什么非改不可。** 被签的是 `@authority` 和 `@target-uri`,而验签方那边是
+/// **自己解析 URL 重新算一遍**的:awiki 的服务端拿它配的 `public_base_url` 拼出
+/// URL 再切 netloc;connectx / anp-sdk 那侧是 `new URL(url).host` 和 `url.href`。
+/// 两边算出来的都是小写 host、不带默认端口的那一份。所以调用方写
+/// `https://Example.com:443/x` 时,照字面签出来的签名**一定验不过** —— 而报错
+/// 会是"签名无效",把人指向钥匙,而不是指向 URL。
+///
+/// 上游 `anp` 自己就分岔在这个点上:`network` 那支走 `url` crate(就是下面这个
+/// 规则),无网络那支按文本切、把 `:443` 留着。守护进程走的是后者,这一层补的
+/// 就是那个差。它是 RFC 3986 §6.2.2.1 / §6.2.3 的规范化,不是改意思。
+pub fn normalized_target_uri(url: &str) -> String {
+    let Some((authority, rest)) = split_authority(url) else {
+        return url.to_string();
+    };
+    format!("https://{}{rest}", normalize_authority(authority))
+}
+
+/// authority 的规范形式,见 [`normalized_target_uri`]。
+fn normalize_authority(authority: &str) -> String {
+    let lower = authority.to_ascii_lowercase();
+    // `[::1]` 里也有冒号,所以只有"冒号后面全是数字"的那一截才算端口。
+    let Some((host, port)) = lower.rsplit_once(':') else {
+        return lower;
+    };
+    if !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return lower;
+    }
+    if port.is_empty() || port == "443" {
+        return host.to_string();
+    }
+    lower
 }
 
 fn validate_header_name(name: &str) -> Result<()> {
@@ -612,6 +659,69 @@ mod tests {
         .expect("our own signature must verify under the upstream verifier");
 
         assert_eq!(metadata.keyid, key.id().kid);
+        assert_eq!(metadata.components, signed.covered);
+    }
+
+    // ---- `@authority` / `@target-uri` 的写法 ----
+
+    /// **一个 URL 解析器怎么写,签名基里就该怎么写。**
+    ///
+    /// 表里每一行是"调用方写的"对"解析器写的"。后面几行要证明的是**没有顺手
+    /// 多改**:非默认端口、path、query、fragment、host 之外的大小写,都得原样
+    /// 过去 —— 一个"顺手把整个 URL 小写"的实现会把 path 弄坏,而它看起来
+    /// 只是"清理了一下"。
+    #[test]
+    fn the_target_uri_is_normalised_the_way_a_url_parser_writes_it() {
+        for (written, canonical) in [
+            ("https://example.com/x", "https://example.com/x"),
+            ("https://Example.COM/x", "https://example.com/x"),
+            ("https://example.com:443/x", "https://example.com/x"),
+            ("https://example.com:/x", "https://example.com/x"),
+            ("https://example.com:8443/x", "https://example.com:8443/x"),
+            ("https://example.com:443", "https://example.com"),
+            ("https://example.com:443/x?a=1#f", "https://example.com/x?a=1#f"),
+            // IPv6 字面量里的冒号不是端口分隔符。
+            ("https://[::1]/x", "https://[::1]/x"),
+            ("https://[::1]:443/x", "https://[::1]/x"),
+            ("https://[::1]:8443/x", "https://[::1]:8443/x"),
+            // 大小写只归一 host。
+            ("https://example.com/Case?Q=U&x=1", "https://example.com/Case?Q=U&x=1"),
+            // 不是 https 就原样返回,交给 `validate_url` 去拒。
+            ("not a url", "not a url"),
+        ] {
+            assert_eq!(normalized_target_uri(written), canonical, "{written}");
+        }
+    }
+
+    /// **同一个请求,两种写法,验签方只认解析器写出来的那一种。**
+    ///
+    /// 这条不是"我们改了一个字符串",是**不这么改签名就没人认**:拿调用方原样
+    /// 的 URL 去验会失败,拿规范化过的去验才过。用的是上游那个验签器 —— 它按
+    /// 文本切 authority,和每个真对端一样是**自己重算一遍**的。
+    #[test]
+    fn a_url_written_with_the_default_port_only_verifies_after_normalisation() {
+        let (key, doc) = fixture(25);
+        let mut req = request(None);
+        req.method = "GET".into();
+        req.url = "https://Example.com:443/api/agents/alice".into();
+
+        let signed = sign_request(&doc, &key, &req).unwrap();
+        let mut headers = req.headers.clone();
+        headers.extend(signed.headers.clone());
+
+        anp::authentication::verify_http_message_signature(
+            &doc, &req.method, &req.url, &headers, None,
+        )
+        .expect_err("the literal URL must not verify: its authority is not the one in the base");
+
+        let metadata = anp::authentication::verify_http_message_signature(
+            &doc,
+            &req.method,
+            &normalized_target_uri(&req.url),
+            &headers,
+            None,
+        )
+        .expect("the normalised URL is the one every verifier derives");
         assert_eq!(metadata.components, signed.covered);
     }
 

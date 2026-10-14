@@ -670,13 +670,18 @@ connectx 有两个接缝,要挑对的那一个:
    keyd 的签名键是 `0xed 0x01` 的 `Multikey`,agreement 那一档用的是
    `X25519KeyAgreementKey2019` 而不是 `Multikey`,而且这个 build **根本不做 X25519
    密钥**(`src/did/document.rs:58`)。
-4. **签名基 —— 已核到序列化这一层;还差拿真对端跑一次。** 覆盖面、参数顺序
+4. **签名基 —— 已核到序列化这一层;`:443` 那处分岔也收了。** 覆盖面、参数顺序
    (`created;expires;nonce;keyid`,两边都不带 `alg`)、`@signature-params` 那一行的拼法、
    行分隔 `\n`,以及 300 秒的 `expires`,四种拼法(Rust `anp` crate / Python 服务端 /
    connectx 的 JS)逐字节相同,而且第 3 条已排掉"两边 `anp` 版本不同"这个变量。
-   **已知一处分岔**:`@authority` 对显式默认端口 `:443` 的处理不一致(connectx 用
-   WHATWG `URL.host`,吃掉它;keyd 从 URL 文本切,保留它)。**仍然必须拿真对端跑一次,
-   不能靠"都按 RFC 9421 写的"来推。**
+   **原先记的那处分岔已经收了**(2026-10-14):`@authority` 对显式默认端口 `:443` 的
+   处理不一致 —— connectx 用 WHATWG `URL.host`(吃掉它),keyd 从 URL 文本切(保留它)。
+   核到源码那一层之后发现**留下的是 keyd 一个**:上游 `anp` 开 `network` 时走 `url`
+   crate,也是吃掉的那一种;`anp-sdk/src/core/crypto/resolveDid.ts:591` 更把 `Host`
+   **头**都设成了 `url.host` —— 线上跑的就是不带端口的那一份。所以 keyd 现在在把 URL
+   交给上游之前先规范化(小写 host、去掉默认端口),`@authority` 和 `@target-uri` 一起
+   正。记录在 [TODO-archive.md](TODO-archive.md) 的「追加二」。
+   **拿真对端跑一次仍然是 §十一 那条验收里的事** —— 上面这些是对着源码核出来的。
 5. **§3.3 那个岔口 —— 是一条前瞻性的线,不是眼下的拦路石。** 核过两个客户端
    (connectx、awiki-cli-rs2),**没有一个发那个挑战签名**,所以三条路里"不签"这条
    今天零成本。要拍的不是"现在怎么办",是"**将来对端把它翻成必需时怎么办**" ——

@@ -256,3 +256,82 @@ publish、export、联网 —— 共同点是**它们要么签任意字节,要�
 到此都在 socket 上了。**下一件是原文 §二那个岔口**(注册的挑战签名),它仍然是个
 要人拍的决定。
 
+---
+
+# 追加二:§四 那两条尾巴 —— ✅ 已做完(2026-10-14)
+
+原文在那一版 [TODO.md](../TODO.md) §四:"动手前要核实的"四条都核完之后,还剩两条
+尾巴 —— 一条是把已核过的 DID 推导钉成向量测试,一条是 `@authority` 那个 `:443`
+的写法分歧。两条都收了。
+
+## 尾巴一:把跨实现的指纹钉住
+
+新文件 `tests/vectors/anp_sdk_ed25519_fingerprint.json`,种子是那一份测试用的
+**32 个 `0x01`**,期望值是它自己断言的
+`e1_UDDReOZl1ipXAfp9wYsm13sDBMK5og--QWdBjzuf6o4`。整条链逐项比:公钥 → JWK 的
+`x` → 规范化 JSON → SHA-256 → `e1_` 段。只比最后那 46 个字符是不够的 —— 两边各错
+一处、恰好抵消,看上去照样是绿的。
+
+**它带出一个文件头要改的地方。** `tests/vectors.rs` 原来写着"每一个字节都是从 RFC
+正文里机械抽出来的",这一条不是:它的出处是一个**兄弟实现**
+(`anp-sdk/src/core/crypto/fingerprint.test.ts:11-12`,connectx 走的就是它)。出处不
+同,失败时该怀疑谁也不同:
+
+- RFC 抄本红了 → **先怀疑实现**,别改向量;
+- 兄弟实现的值红了 → **两个实现分家了**,得先问是谁动了。期望值那一串在别人家也是
+  断言,它有可能才是对的一方。
+
+这条规则现在写在文件头,而不是新开一个文件、让两份测试各自守着一半的理由。`_note`
+里另外写明:公钥、JWK 的 `x`、规范化 JSON、摘要这四个中间值是用**第二个实现**
+(Python)从种子重算的,不是从谁的文档里抄的 —— 免得读者以为它们也是"权威文本"。
+
+## 尾巴二:`@authority` 里的 `:443`
+
+先说结论:**送进上游之前把 URL 规范化**,改成"一个小写 host、不带默认端口"的那一份
+—— 也就是**每一个验签方自己算出来的那一份**。
+
+原先记的是"connectx 用 WHATWG `URL.host`,会把 `:443` 吃掉;守护进程会保留"。核到
+源码这一层,这件事比原来记的**更糟,也更好办**:
+
+| 谁 | 怎么算 `@authority` | `https://example.com:443/x` |
+|---|---|---|
+| 上游 `anp`(开 `network`,走 `url` crate) | `host_str()` + `port()` | `example.com` |
+| 上游 `anp`(**无** `network` —— keyd 用的这支) | 从文本里切 | `example.com:443` |
+| anp-sdk 的签名侧(`signer.ts:67`) | `new URL(url).host` | `example.com` |
+| anp-sdk 的验签侧(`verify.ts:352`) | `new URL(targetUri).host` 对上 `authority` | 要求 `example.com` |
+| awiki-open-server(`shared/runtime.py`) | 拿自己配的 `public_base_url` **重拼** URL,再切 netloc | `example.com` |
+| Python wheel 的 `_component_value` | `urlparse(url).netloc` | 跟着传进去的那串 |
+
+两件事因此清楚了:
+
+1. **分歧不只在两个仓库之间,还在上游 `anp` 自己内部** —— 开不开 `network` 是两种
+   切法。keyd 走的是无网络那支,所以它和**自己的依赖**在另一种构建下不一致。
+2. **被留下的是 keyd 一个。** 更硬的一条证据在 `resolveDid.ts:591`:`Host` **头**本身
+   就被设成了 `url.host` —— 也就是说线上跑的那一串就是不带端口的那一份,不只是签名
+   里那一份。
+
+所以照字面签 `:443` 得到的签名**一定验不过**,而报错是"签名无效":它把人指向钥匙,
+而不是指向 URL。这就是为什么这条要收,不能只写一句"平时没人那么写"。
+
+落点是 `src/sign/rfc9421.rs` 的 `normalized_target_uri()`:host 归一成小写,空端口和
+`:443` 去掉,其余一个字节不动(path、query、fragment 原样,非默认端口照旧,IPv6 字面
+量里的冒号不被当成端口分隔符)。它**只在一个地方生效** —— `sign_request` 把 URL 交给
+上游之前那一次 —— 因为 `@authority` 和 `@target-uri` 都出自那个字符串,换一次两个分
+量一起正。`validate_url` 仍然看调用方**原样**给的 URL。
+
+守它的是两条测试:`the_target_uri_is_normalised_the_way_a_url_parser_writes_it`
+(那张对照表,含"没有被顺手多改"的那几行)和
+`a_url_written_with_the_default_port_only_verifies_after_normalisation` —— 后者拿
+**上游的验签器**当对端跑了一遍:照字面给的 URL 验不过,规范化过的验得过。
+
+**和 JS 侧故意不一样的一处。** anp-sdk 那边只规范化 authority(`authority = url.host`),
+`@target-uri` 用的还是**原样**的 `input.url`。我们没有那么做:awiki 的服务端是拿
+`public_base_url` 重拼 URL 的,那个拼出来的 `@target-uri` 也是不带端口的,所以只管
+authority 的写法在它那儿照样过不去。两个分量一起正,才能同时过两边。
+
+## 现在的 TODO 是什么样
+
+§四 的标题从"剩下两条尾巴"改成"两条尾巴也收了",两条尾巴各自划掉并在原地留下"收法"
+一行;没收到的只剩 §二(注册的挑战签名)那个**要人拍的岔口**。README 的"几个不显然
+的默认值"里加了一条 —— 改了被签的字节,就得写在明处。
+

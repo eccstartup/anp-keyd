@@ -68,23 +68,29 @@ awiki-open-server 的注册,除了 DID 文档自签,还要一次一次性挑战�
 - **验收是 §十一 那五条反证。** 核心是第一条:**停掉守护进程,connectx 必须失败**
   —— 不然只是多了一条可选路径,不叫抽出来了。
 
-## 四、适配层:动手前要核实的(四条都核完了,剩下两条尾巴)
+## 四、适配层:动手前要核实的(四条都核完了,两条尾巴也收了)
 
 1. ~~**DID 推导 —— 已核对,两边一致。** connectx 的 `ed25519Fingerprint`(RFC 7638
    JWK 指纹 → SHA-256 → base64url 无填充 → `e1_`)和守护进程走的 `anp` 上游
    `compute_multikey_fingerprint`(同一个 JWK,过 RFC 8785 JCS,`URL_SAFE_NO_PAD`)
    是同一串字节。**实测过**:拿 connectx 自己的测试向量独立算了一遍,得到
    `e1_UDDReOZl1ipXAfp9wYsm13sDBMK5og--QWdBjzuf6o4`,和它断言的一致。~~
-   **还没做:** 在仓库里加一条向量测试把它钉住(就拿上面那串),免得哪一边以后悄悄
-   改了编码。
+   ~~**还没做:** 在仓库里加一条向量测试把它钉住(就拿上面那串
+   `e1_UDDReOZl1ipXAfp9wYsm13sDBMK5og--QWdBjzuf6o4`),免得哪一边以后悄悄改了
+   编码。~~ **做了** —— `tests/vectors/anp_sdk_ed25519_fingerprint.json`,种子是那
+   一份测试用的 32 个 `0x01`,整条链(公钥 → JWK → 规范化 → SHA-256 → `e1_` 段)
+   逐项比。
 2. ~~**签名基的跨语言一致性 —— 已核到序列化这一层。** 覆盖面
    (`@method @target-uri @authority content-digest`)、参数顺序
    (`created;expires;nonce;keyid`,两边都不带 `alg`)、`@signature-params` 那一行的
    拼法、行分隔用 `\n` 而不是 `\r\n`,`expires` 两边都固定 300 秒 —— **逐字节相同**。~~
-   **还没做:** `@authority`。connectx 用 WHATWG `URL.host`,显式写出默认
+   ~~**还没做:** `@authority`。connectx 用 WHATWG `URL.host`,显式写出默认
    端口时会把 `:443` 吃掉;守护进程无网络构建下是从 URL 文本里切出来的,会**保留**
    `:443`。平时没人那么写,但"差一个字符就是另一条签名"正是这类地方的代价 —— 它
-   只能拿真对端跑一次来收,所以在第三节那条验收里。
+   只能拿真对端跑一次来收,所以在第三节那条验收里。~~
+   **收法:** 送进上游之前把 URL 规范化 —— 一个小写 host、不带默认端口的那一份,
+   也就是**每一个验签方自己算出来的那一份**。理由、三方实现的对照、以及新发现的
+   一条(JS 侧连 `@target-uri` 都留着原样,和我们最后选的不一样)在归档「追加二」。
 3. ~~**上游版本错位 —— 已核掉,签名基逐字节一致。** 整条 awiki 都在 `anp 1.0.3`
    (Rust CLI 的 path 依赖 `=1.0.3` + Python 服务端的 wheel `anp-1.0.3`),只有 anp-keyd
    钉 `=1.0.6`。拿 1.0.3 那个 pin 的 commit(`096ca3e`)和 crates.io 上的 1.0.6 对拉了
