@@ -51,6 +51,10 @@ pub enum KeydError {
     // —— 签名 ——
     #[error("raw signing is disabled (start the daemon with --allow-raw-signing)")]
     RawDisabled,
+    #[error(
+        "challenge signing is disabled (start the daemon with --allow-challenge-signing)"
+    )]
+    ChallengeDisabled,
     #[error("caller asked for a covered component the daemon will not sign: {0}")]
     CoveredSetRejected(String),
 

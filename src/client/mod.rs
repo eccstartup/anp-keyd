@@ -118,6 +118,25 @@ impl Client {
         }
     }
 
+    /// 签一段调用方给的挑战字节(注册流程里"证明此刻握着这把钥匙"那一步)。
+    /// 守护进程没开 `--allow-challenge-signing` 时会被拒;超过
+    /// [`crate::daemon::wire::MAX_CHALLENGE_LEN`] 字节的输入在协议层就被挡下。
+    pub fn sign_challenge(
+        &mut self,
+        did: &str,
+        kid: Option<&str>,
+        challenge: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        match self.call(Request::Sign(SignRequest::Challenge {
+            did: did.to_string(),
+            kid: kid.map(str::to_string),
+            challenge,
+        }))? {
+            Response::Signature(bytes) => Ok(bytes),
+            other => Err(unexpected("sign_challenge", &other)),
+        }
+    }
+
     /// 取一份**本机发布过的** DID 文档,原样字节。
     ///
     /// 只读,而且**不需要先 unlock**:文档是可公开的成品。别人的 DID 这里

@@ -100,6 +100,19 @@ pub enum Event {
         payload_len: usize,
         payload_digest: String,
     },
+    /// 挑战签名。这条路径默认关着，开了之后每次都要留痕。
+    ///
+    /// **和 [`Event::RawSigned`] 分开记，不是它的一个字段。** 两条路都签调用方
+    /// 给的字节，但事后要问的问题不一样：“我们签了一次**挑战**”和“我们签了
+    /// **别的什么东西**”必须是分得开的两件事。压成一条带 `kind` 字段的记录，
+    /// 读日志的人就得先知道那个字段的取值表才读得懂 —— 而这条日志要回答的
+    /// 恰恰是“那天到底发生了什么”。
+    ChallengeSigned {
+        uid: u32,
+        did: String,
+        challenge_len: usize,
+        challenge_digest: String,
+    },
     /// 有人取走了一份 DID 文档。
     ///
     /// 这条**不是**"授权"的记录，是"取件"的记录：文档本来就躺在一个 0644
@@ -940,6 +953,12 @@ mod tests {
                 signature_base_digest: "ab".into(),
             },
             Event::RawSigned { uid: 1, did: "d".into(), payload_len: 3, payload_digest: "cd".into() },
+            Event::ChallengeSigned {
+                uid: 1,
+                did: "d".into(),
+                challenge_len: 3,
+                challenge_digest: "cd".into(),
+            },
             Event::DocumentRead { uid: 1, did: "d".into(), document_digest: "ef".into() },
             Event::Swept { dropped: 1 },
         ];
@@ -952,7 +971,16 @@ mod tests {
             .collect();
         assert_eq!(
             tags,
-            ["DENIED", "UNLOCKED", "LOCKED", "SIGNED", "RAW_SIGNED", "DOCUMENT_READ", "SWEPT"]
+            [
+                "DENIED",
+                "UNLOCKED",
+                "LOCKED",
+                "SIGNED",
+                "RAW_SIGNED",
+                "CHALLENGE_SIGNED",
+                "DOCUMENT_READ",
+                "SWEPT"
+            ]
         );
     }
 

@@ -679,9 +679,16 @@ impl Daemon {
     /// 会话里跑,而那个进程不是这个孩子的孩子 —— `Drop` 里的 `kill` 够不着
     /// 它,于是每跑一次测试就在机器上留一个守护进程。
     fn start(dir: &TempDir) -> Self {
+        Self::start_with(dir, &[])
+    }
+
+    /// 同上,但给 `serve` 多带几个参数 —— 开关是命令行上的东西,要测它就得
+    /// 从这儿进来。
+    fn start_with(dir: &TempDir, extra: &[&str]) -> Self {
         let mut child = Command::new(BIN)
             .arg("serve")
             .arg("--foreground")
+            .args(extra)
             .arg("--root")
             .arg(dir.path())
             .stdout(Stdio::null())
@@ -1038,6 +1045,105 @@ fn the_audit_log_records_the_signature_and_holds_no_secrets() {
             );
         }
     }
+}
+
+/// **`--challenge` 是自己一条路,不是 `--raw` 的别名。**
+///
+/// 三件事一起量,因为它们各自都可能是假的:签得出、而且签的**就是那串字节**
+/// (拿文档里的公钥在外面验一次);`--raw` 在这个开关下面**仍然**被拒(这只
+/// 开了它自己那扇门);日志里那条叫 `CHALLENGE_SIGNED`,记的是长度和摘要,
+/// **不是挑战本身**。
+#[test]
+fn the_challenge_flag_is_its_own_door() {
+    // —— 开关关着:拒,而且拒的话得说出是哪个开关 ——
+    //
+    // 另起一个根,不在下面那个上做第二遍:同一个根上 `Daemon::start` 会看到
+    // **上一个守护进程留下的那个 socket 文件**而立刻返回,于是下一条命令撞在
+    // 一个还没绑好的 socket 上。
+    {
+        let dir = TempDir::new("challenge-off");
+        let did = keygen(&dir, "bot");
+        run_in_terminal(dir.path(), &["publish", "--did", &did], &default_rules()).expect_ok();
+
+        let path = dir.path().join("challenge.txt");
+        std::fs::write(&path, b"a server-issued nonce").expect("write the challenge");
+
+        let _daemon = Daemon::start(&dir);
+        // 解了锁还拒,拒的理由才只可能是那个开关 —— 这是这一条的全部意思。
+        unlock(&dir, &did).expect_ok();
+        let refused = run(
+            dir.path(),
+            &["sign", "--did", &did, "--challenge", &path.display().to_string()],
+        );
+        let text = refused.expect_failure();
+        assert!(
+            text.contains("--allow-challenge-signing"),
+            "a refusal has to name the switch that would allow it:\n{text}"
+        );
+    }
+
+    // —— 开着:签得出,而且外面验得过 ——
+    let dir = TempDir::new("challenge-on");
+    let did = keygen(&dir, "bot");
+    run_in_terminal(dir.path(), &["publish", "--did", &did], &default_rules()).expect_ok();
+
+    let challenge = b"a server-issued nonce, signed as-is";
+    let path = dir.path().join("challenge.txt");
+    std::fs::write(&path, challenge).expect("write the challenge");
+    let path = path.display().to_string();
+
+    let _daemon = Daemon::start_with(&dir, &["--allow-challenge-signing"]);
+    unlock(&dir, &did).expect_ok();
+    let printed = run(dir.path(), &["sign", "--did", &did, "--challenge", &path]);
+    let printed = printed.expect_ok();
+
+    let document = read_local_document(&dir, &did);
+    let multibase = document["verificationMethod"][0]["publicKeyMultibase"]
+        .as_str()
+        .expect("the published document carries the public key");
+    let key = anp_keyd::crypto::thumbprint::ed25519_from_multibase(multibase)
+        .expect("the document's key must decode");
+
+    let signature = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(printed.trim())
+            .expect("the CLI prints base64")
+    };
+    let signature = ed25519_dalek::Signature::from_slice(&signature).expect("64 bytes");
+    {
+        use ed25519_dalek::Verifier;
+        key.verify(challenge, &signature)
+            .expect("the signature must be over the challenge bytes themselves");
+    }
+
+    // —— 这个开关**只**开自己那扇门 ——
+    let raw_path = dir.path().join("raw.bin");
+    std::fs::write(&raw_path, b"anything at all").expect("write the raw payload");
+    let raw = run(
+        dir.path(),
+        &["sign", "--did", &did, "--raw", &raw_path.display().to_string()],
+    );
+    let text = raw.expect_failure();
+    assert!(
+        text.contains("--allow-raw-signing"),
+        "opening the narrow door must not open the wide one:\n{text}"
+    );
+
+    // —— 日志:一条自己的记录,存的是摘要不是内容 ——
+    let text = audit_text(&dir);
+    assert!(
+        text.contains("\"event\":\"CHALLENGE_SIGNED\""),
+        "the challenge signature needs its own line, not a `RAW_SIGNED`:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("\"challenge_len\":{}", challenge.len())),
+        "and it must say how long the challenge was:\n{text}"
+    );
+    assert!(
+        !text.contains("a server-issued nonce"),
+        "the log records a digest of the challenge, never the challenge itself:\n{text}"
+    );
 }
 
 /// **一份文档的一生:写下去的那条、和取件那条,摘要是同一个算出来的。**

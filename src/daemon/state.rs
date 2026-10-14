@@ -219,13 +219,47 @@ impl Vault {
     }
 }
 
+/// 哪几条签名路开着。
+///
+/// 一个具名的结构体,而不是构造函数上两个挨着的位置参数 —— 两个 `bool` 摆
+/// 在一起,调换顺序编译得过去、行为却完全相反,而且没有任何地方看得出来。
+///
+/// `challenge` 由 [`SigningGates::new`] 按 `raw || challenge` **算出来**,不是
+/// 照着传进来的值原样存:`raw` 严格比 `challenge` 宽(凡是挑战签得了的,原始
+/// 签名都签得了,反过来不成立),所以一个打开了宽门的操作者不该被再要求去把
+/// 窄门也打开一次。
+///
+/// 字段私有,只留 [`SigningGates::new`] 一个入口 —— 否则那句"算出来"就只是一
+/// 句注释:字面量构造 `SigningGates { raw: true, challenge: false }` 编译得过
+/// 去,而且没有任何地方看得出来它错了。
+pub struct SigningGates {
+    raw: bool,
+    challenge: bool,
+}
+
+impl SigningGates {
+    pub fn new(raw: bool, challenge: bool) -> Self {
+        Self { raw, challenge: raw || challenge }
+    }
+
+    /// 原始签名那条路开着没有。
+    pub fn raw(&self) -> bool {
+        self.raw
+    }
+
+    /// 挑战签名那条路开着没有。
+    pub fn challenge(&self) -> bool {
+        self.challenge
+    }
+}
+
 /// 守护进程的全部可变状态。
 pub struct DaemonState {
     roots: Roots,
     policy: PeerPolicy,
     autolock: Autolock,
-    /// `--allow-raw-signing`。默认 false,打开之后每次原始签名都留痕。
-    raw_signing: bool,
+    /// 哪几条签名路开着 —— `--allow-raw-signing` / `--allow-challenge-signing`。
+    gates: SigningGates,
     vaults: Mutex<BTreeMap<u32, Vault>>,
     /// **一个目录一个 [`AuditLog`]**,按路径索引。
     ///
@@ -236,12 +270,12 @@ pub struct DaemonState {
 }
 
 impl DaemonState {
-    pub fn new(roots: Roots, policy: PeerPolicy, autolock: Autolock, raw_signing: bool) -> Self {
+    pub fn new(roots: Roots, policy: PeerPolicy, autolock: Autolock, gates: SigningGates) -> Self {
         Self {
             roots,
             policy,
             autolock,
-            raw_signing,
+            gates,
             vaults: Mutex::new(BTreeMap::new()),
             audits: Mutex::new(BTreeMap::new()),
         }
@@ -290,7 +324,7 @@ impl DaemonState {
     }
 
     pub fn raw_signing(&self) -> bool {
-        self.raw_signing
+        self.gates.raw
     }
 
     /// 对端 uid 的磁盘根。不需要碰锁 —— 它只取决于 uid。
@@ -458,8 +492,33 @@ impl DaemonState {
         kid: Option<&str>,
         f: impl FnOnce(&LockedSigningKey) -> Result<R>,
     ) -> Result<R> {
-        if !self.raw_signing {
+        if !self.gates.raw {
             return Err(KeydError::RawDisabled);
+        }
+        let layout = self.layout_for(uid)?;
+        let resident = store::resolve(&layout, did, kid)?.id.kid;
+        let autolock = self.autolock;
+        let now = Instant::now();
+        self.with_vault(uid, |vault| vault.with_key(&resident, autolock, now, f))
+    }
+
+    /// 借出钥匙做一次挑战签名(`--allow-challenge-signing` 那条路)。
+    ///
+    /// 形状和 [`DaemonState::sign_raw`] 逐字相同 —— 同样的
+    /// `layout_for` / `store::resolve` / `with_vault` / `with_key` —— 只换了
+    /// 查哪一扇开关、以及拒绝时报哪个码。
+    ///
+    /// 开关的检查**在这里**,不在 handlers:让"能不能走这条路"和"这条路怎么走"
+    /// 待在同一个地方,免得哪天有人绕开 handler 直接调。
+    pub fn sign_challenge<R>(
+        &self,
+        uid: u32,
+        did: &str,
+        kid: Option<&str>,
+        f: impl FnOnce(&LockedSigningKey) -> Result<R>,
+    ) -> Result<R> {
+        if !self.gates.challenge {
+            return Err(KeydError::ChallengeDisabled);
         }
         let layout = self.layout_for(uid)?;
         let resident = store::resolve(&layout, did, kid)?.id.kid;
@@ -525,7 +584,7 @@ mod tests {
     }
 
     impl Fixture {
-        fn new(raw_signing: bool) -> Self {
+        fn new(gates: SigningGates) -> Self {
             let dir = TempDir::new();
             let layout = KeydLayout::at(dir.path().to_path_buf());
             layout.ensure().unwrap();
@@ -565,7 +624,7 @@ mod tests {
                     Roots::Single(layout),
                     PeerPolicy::default(),
                     Autolock::idle(Duration::from_secs(900)),
-                    raw_signing,
+                    gates,
                 ),
                 did: created.did,
                 resident,
@@ -593,7 +652,7 @@ mod tests {
 
     #[test]
     fn listing_keys_does_not_require_the_vault_to_be_unlocked() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
         let keys = f.state.list_keys(501).unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].did, f.did);
@@ -603,14 +662,14 @@ mod tests {
 
     #[test]
     fn signing_a_locked_key_is_refused_rather_than_prompted() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
         let err = f.state.sign_structured(501, &f.did, None, &f.request()).unwrap_err();
         assert!(matches!(err, KeydError::Locked), "{err}");
     }
 
     #[test]
     fn the_right_passphrase_unlocks_and_then_the_key_signs() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
         f.unlock();
 
         assert_eq!(f.state.status(501).unwrap().len(), 1);
@@ -625,7 +684,7 @@ mod tests {
 
     #[test]
     fn the_wrong_passphrase_leaves_nothing_unlocked() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
         let err = f
             .state
             .unlock(501, &f.did, None, Zeroizing::new("wrong".to_string()))
@@ -637,7 +696,7 @@ mod tests {
     /// 锁上之后,钥匙不只是"被拦住"—— 它从进程里消失了。
     #[test]
     fn locking_removes_the_key_from_memory() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
         f.unlock();
         assert_eq!(f.state.lock(501, Some(&f.did), None).unwrap(), 1);
 
@@ -665,7 +724,7 @@ mod tests {
     #[test]
     fn one_uid_cannot_reach_another_uids_key_even_by_naming_it_exactly() {
         // B 有一把装满的 vault。
-        let b = Fixture::new(false);
+        let b = Fixture::new(SigningGates::new(false, false));
         assert_eq!(b.state.list_keys(502).unwrap().len(), 1);
 
         // A 的 vault 是空的。
@@ -678,7 +737,7 @@ mod tests {
             Roots::Single(a_layout),
             PeerPolicy::default(),
             Autolock::idle(Duration::from_secs(900)),
-            false,
+            SigningGates::new(false, false),
         );
 
         // A 报出 B 的 did:列不到、解不开、更签不出来。
@@ -704,7 +763,7 @@ mod tests {
 
     #[test]
     fn an_idle_key_is_dropped_before_it_can_be_used() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
         f.unlock();
         assert_eq!(f.state.status(501).unwrap().len(), 1);
 
@@ -722,7 +781,7 @@ mod tests {
     /// 用一次就续一次。空闲超时收走的是"没人用"的钥匙,不是"开了一会儿"的。
     #[test]
     fn using_a_key_restarts_its_idle_clock() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
         f.unlock();
 
         // 解锁在 T0。现在假装时钟走到 T0+800s 并"用"一次。
@@ -740,7 +799,7 @@ mod tests {
     /// 一个失败的调用不该把钥匙的寿命续上。
     #[test]
     fn a_failed_sign_does_not_extend_the_lifetime() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
         f.unlock();
 
         let now = Instant::now() + Duration::from_secs(800);
@@ -757,7 +816,7 @@ mod tests {
 
     #[test]
     fn raw_signing_is_off_unless_it_was_turned_on() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
         f.unlock();
 
         let err = f.state.sign_raw(501, &f.did, None, |_| Ok(())).unwrap_err();
@@ -767,7 +826,7 @@ mod tests {
     /// 开关先于一切:关着的时候,连"没解锁"都轮不到报。
     #[test]
     fn the_raw_switch_is_checked_before_the_lock_state() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
         assert!(matches!(
             f.state.sign_raw(501, &f.did, None, |_| Ok(())).unwrap_err(),
             KeydError::RawDisabled
@@ -776,7 +835,7 @@ mod tests {
 
     #[test]
     fn an_unlocked_key_is_usable_for_raw_signing_when_the_switch_is_on() {
-        let f = Fixture::new(true);
+        let f = Fixture::new(SigningGates::new(true, false));
         f.unlock();
 
         let signature = f
@@ -784,6 +843,70 @@ mod tests {
             .sign_raw(501, &f.did, None, |key| Ok(key.sign(b"hello").unwrap()))
             .unwrap();
         assert_eq!(signature.len(), 64);
+    }
+
+    #[test]
+    fn challenge_signing_is_off_unless_its_switch_is_on() {
+        let f = Fixture::new(SigningGates::new(false, false));
+        f.unlock();
+
+        let err = f
+            .state
+            .sign_challenge(501, &f.did, None, |_| Ok(()))
+            .unwrap_err();
+        assert!(matches!(err, KeydError::ChallengeDisabled), "{err}");
+    }
+
+    /// **开关先于一切:** 关着的时候连"没解锁"都轮不到报 —— 和
+    /// [`the_raw_switch_is_checked_before_the_lock_state`] 同一个形状,因为
+    /// 这两条路共用一套外壳。
+    #[test]
+    fn the_challenge_switch_is_checked_before_the_lock_state() {
+        let f = Fixture::new(SigningGates::new(false, false));
+        assert!(matches!(
+            f.state.sign_challenge(501, &f.did, None, |_| Ok(())).unwrap_err(),
+            KeydError::ChallengeDisabled
+        ));
+    }
+
+    #[test]
+    fn an_unlocked_key_is_usable_for_challenge_signing_when_the_switch_is_on() {
+        let f = Fixture::new(SigningGates::new(false, true));
+        f.unlock();
+
+        let signature = f
+            .state
+            .sign_challenge(501, &f.did, None, |key| Ok(key.sign(b"challenge").unwrap()))
+            .unwrap();
+        assert_eq!(signature.len(), 64);
+    }
+
+    /// **开宽门就等于开窄门。** `raw` 比 `challenge` 宽,所以一个启动时只给了
+    /// `--allow-raw-signing` 的操作者不该再被要求去给 `--allow-challenge-signing`
+    /// —— 那条路能签的东西 `raw` 全都答得了。这条测试钉的是
+    /// [`SigningGates::new`] 里那个 `raw || challenge`。
+    #[test]
+    fn opening_the_wider_raw_door_also_opens_the_narrow_challenge_one() {
+        let f = Fixture::new(SigningGates::new(true, false));
+        f.unlock();
+
+        assert!(f
+            .state
+            .sign_challenge(501, &f.did, None, |key| Ok(key.sign(b"challenge").unwrap()))
+            .is_ok());
+    }
+
+    /// 反过来不成立:窄门开着,宽门还是关的。`raw` 能签的是一份文档,
+    /// `challenge` 那条路没答应过。
+    #[test]
+    fn opening_the_challenge_door_does_not_open_raw() {
+        let f = Fixture::new(SigningGates::new(false, true));
+        f.unlock();
+
+        assert!(matches!(
+            f.state.sign_raw(501, &f.did, None, |_| Ok(())).unwrap_err(),
+            KeydError::RawDisabled
+        ));
     }
 
     #[test]

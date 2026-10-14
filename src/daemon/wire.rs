@@ -30,6 +30,19 @@ pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 /// 请求体上限。比整帧小,好让头字段一定有地方放。
 pub const MAX_BODY: usize = 4 * 1024 * 1024;
 
+/// 挑战字节的上限。**这条上限就是边界本身。**
+///
+/// 挑战签名这条路([`SignRequest::Challenge`])开得下去,全靠这个数:256
+/// 字节**比任何一份 DID 文档、也比任何一条签名基都小**,所以它结构上长不成
+/// "把我这份文档签了" —— 而那正是 `docs/ADAPTER.md` §3.2 担心的滥用。调大它,
+/// 打开的就不是一条更宽的挑战通道,而是 §十 关掉的那条 [`SignRequest::Raw`]。
+///
+/// 值和 `sign::rfc9421::MAX_NONCE_LEN` 对齐不是巧合:两个都是"调用方给的、
+/// 要进签名的一条不透明字节"的长度上限(base64url 编 32 字节的随机值才 43 个
+/// 字符,任何会真实出现的挑战都在这之内)。差别在它们各自的去处:nonce 进的是
+/// 我们重建出来的签名基,而这些字节**本身就是被签的内容**。
+pub const MAX_CHALLENGE_LEN: usize = 256;
+
 // —— 消息类型 ——
 
 pub const LIST_KEYS: u8 = 0x01;
@@ -96,6 +109,16 @@ pub enum ErrorCode {
     /// 报 "0x… is not an error code this client knows",而它同时拿得到
     /// `message` —— 那是安全的降级,不是静默的错误答案。
     HardwareUnavailable = 0x000B,
+    /// `SIGN(Challenge)` 这条路开着没有。
+    ///
+    /// 为什么不复用 `RawDisabled`:两者是**不同的门**。`raw` 严格比 `challenge`
+    /// 宽(打开 raw 也就打开了 challenge,反过来不成立),所以"raw 关着、challenge
+    /// 开着"是一个合法状态;共用一个码,一个只开了窄门却被要求签文档的调用方会
+    /// 收到"raw signing disabled",而那句话对它此刻的处境是错的。
+    ///
+    /// 加一个码是**加**,不是改:老客户端收到认不出来的码会报 "0x… is not an
+    /// error code this client knows",同时拿得到 `message` —— 那是安全的降级。
+    ChallengeDisabled = 0x000C,
     /// 守护进程自己出了问题。**消息文本要对调用方无信息量。**
     Internal = 0x00FF,
 }
@@ -119,6 +142,7 @@ impl std::fmt::Display for ErrorCode {
             ErrorCode::Protocol => "protocol",
             ErrorCode::Did => "did",
             ErrorCode::HardwareUnavailable => "hardware root unavailable",
+            ErrorCode::ChallengeDisabled => "challenge signing disabled",
             ErrorCode::Internal => "internal",
         })
     }
@@ -143,6 +167,7 @@ impl ErrorCode {
             0x0009 => Protocol,
             0x000A => Did,
             0x000B => HardwareUnavailable,
+            0x000C => ChallengeDisabled,
             0x00FF => Internal,
             _ => return None,
         })
@@ -161,6 +186,7 @@ impl KeydError {
             Locked => ErrorCode::Locked,
             PeerCredentialUnavailable(_) | Permission(_) => ErrorCode::Permission,
             RawDisabled => ErrorCode::RawDisabled,
+            ChallengeDisabled => ErrorCode::ChallengeDisabled,
             CoveredSetRejected(_) => ErrorCode::CoveredSetRejected,
             Protocol(_) => ErrorCode::Protocol,
             Did(_) => ErrorCode::Did,
@@ -240,6 +266,21 @@ pub enum SignRequest {
     },
     /// 受限路径:原始字节。默认关,`--allow-raw-signing` 才开,且必留审计。
     Raw { did: String, kid: Option<String>, payload: Vec<u8> },
+    /// 受限路径:调用方给的、有长度上限的挑战字节。默认关,
+    /// `--allow-challenge-signing` 才开,且必留审计。
+    ///
+    /// 和 [`SignRequest::Raw`] 的差别不在"签不签调用方给的字节" —— 两条都签
+    /// —— 也不在"这串字节有没有形状"(它没有,和 `Raw` 一样)。差别在**这条路
+    /// 签得了的东西有上界**:[`MAX_CHALLENGE_LEN`] 卡在任何一份 DID 文档之下,
+    /// 所以它答得了"证明你此刻握着这把钥匙",答不了"把我这份文档签了"。这是
+    /// `docs/ADAPTER.md` §3.3 那个岔口挑定的那条窄路 —— 也是它和 `Raw` 之间
+    /// 全部的、以及仅有的距离。
+    ///
+    /// **这里没有字符集过滤,是有意的。** `nonce` 会被拼进文本签名基,所以
+    /// `validate_nonce` 要剥掉 `"` 和 `\`(它在那里能改结构);而这些字节
+    /// **就是要被签的内容本身,中间没有任何拼接**,没有可以注入的地方 ——
+    /// 加一条字符集限制只会让人以为边界画在字符集上,而它其实画在长度上。
+    Challenge { did: String, kid: Option<String>, challenge: Vec<u8> },
 }
 
 /// 一把钥匙在磁盘上的样子 —— `LIST_KEYS` 的应答项。
@@ -487,6 +528,22 @@ fn decode_sign(body: &[u8]) -> Result<SignRequest> {
             c.expect_end("SIGN(Raw)")?;
             Ok(SignRequest::Raw { did, kid, payload })
         }
+        0x03 => {
+            let did = c.string16()?;
+            let kid = c.opt_string16()?;
+            let challenge = c.bytes32()?;
+            // 上限在这里,不在 handler:`bytes32` 只保证不吃掉进程的内存
+            // (MAX_BODY),而"这条路能签的东西有形状"靠的是这个小得多的界。
+            // 破了它,收下的就是一份"任意字节"—— 也就是 `Raw` 那条路。
+            if challenge.len() > MAX_CHALLENGE_LEN {
+                return Err(KeydError::Protocol(format!(
+                    "a {}-byte challenge exceeds the {MAX_CHALLENGE_LEN}-byte limit",
+                    challenge.len()
+                )));
+            }
+            c.expect_end("SIGN(Challenge)")?;
+            Ok(SignRequest::Challenge { did, kid, challenge })
+        }
         other => Err(KeydError::Protocol(format!(
             "0x{other:02x} is not a SIGN variant"
         ))),
@@ -602,6 +659,12 @@ fn encode_request(request: &Request) -> Result<Vec<u8>> {
                     body.string16(did)?;
                     body.string16(kid.as_deref().unwrap_or(""))?;
                     body.bytes32(payload)?;
+                }
+                SignRequest::Challenge { did, kid, challenge } => {
+                    body.push(0x03);
+                    body.string16(did)?;
+                    body.string16(kid.as_deref().unwrap_or(""))?;
+                    body.bytes32(challenge)?;
                 }
             }
             SIGN
@@ -1052,6 +1115,11 @@ mod tests {
                 kid: None,
                 payload: vec![0, 1, 2],
             }),
+            Request::Sign(SignRequest::Challenge {
+                did: "did:wba:x".into(),
+                kid: None,
+                challenge: vec![0, 1, 2],
+            }),
             Request::Unlock {
                 did: "did:wba:x".into(),
                 kid: None,
@@ -1065,6 +1133,38 @@ mod tests {
         for request in requests {
             assert_eq!(round_trip_request(&request), request, "{request:?}");
         }
+    }
+
+    /// **256 就是边界,整数位。** 末尾那一个字节之差,是这条路和 `Raw` 之间
+    /// 全部的距离 —— 所以它值得一条自己的测试,而不是靠"超长字段会被拒"那条
+    /// 泛泛的边界测试顺带盖住(base64url 编 32 字节的挑战才 43 个字符,会真实
+    /// 出现的都在这之内)。
+    #[test]
+    fn a_challenge_at_the_cap_is_accepted_and_one_byte_over_is_refused() {
+        let with_len = |len: usize| SignRequest::Challenge {
+            did: "did:wba:x".into(),
+            kid: None,
+            challenge: vec![0u8; len],
+        };
+
+        // 正好卡在上限:原样穿过。
+        let at_cap = with_len(MAX_CHALLENGE_LEN);
+        assert_eq!(
+            round_trip_request(&Request::Sign(at_cap.clone())),
+            Request::Sign(at_cap)
+        );
+
+        // 多一个字节:守护进程**在读的时候**就拒掉,并说清破的是哪条界、给了多少。
+        let mut wire = Vec::new();
+        write_request(&mut wire, &Request::Sign(with_len(MAX_CHALLENGE_LEN + 1))).unwrap();
+        let mut reader = std::io::Cursor::new(wire);
+        let err = read_request(&mut reader).unwrap_err();
+        assert!(matches!(err, KeydError::Protocol(_)), "{err}");
+        assert!(err.to_string().contains("challenge"), "{err}");
+        assert!(
+            err.to_string().contains(&(MAX_CHALLENGE_LEN + 1).to_string()),
+            "the refusal must name the actual length: {err}"
+        );
     }
 
     #[test]
@@ -1282,6 +1382,7 @@ mod tests {
             ErrorCode::CoveredSetRejected,
             ErrorCode::Protocol,
             ErrorCode::Did,
+            ErrorCode::ChallengeDisabled,
             ErrorCode::Internal,
         ] {
             assert_eq!(ErrorCode::from_u16(code.as_u16()), Some(code));

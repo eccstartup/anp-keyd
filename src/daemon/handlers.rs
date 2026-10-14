@@ -131,6 +131,22 @@ fn sign_request(
 
             Ok(Response::Signature(signature.to_vec()))
         }
+
+        SignRequest::Challenge { did, kid, challenge } => {
+            let signature = state.sign_challenge(peer.uid, &did, kid.as_deref(), |key| {
+                key.sign(&challenge)
+            })?;
+
+            let event = Event::ChallengeSigned {
+                uid: peer.uid,
+                did,
+                challenge_len: challenge.len(),
+                challenge_digest: crate::audit::log::digest_hex(&challenge),
+            };
+            state.record(peer.uid, &event)?;
+
+            Ok(Response::Signature(signature.to_vec()))
+        }
     }
 }
 
@@ -179,7 +195,7 @@ mod tests {
     use super::*;
     use crate::crypto::kdf::Argon2Config;
     use crate::daemon::autolock::Autolock;
-    use crate::daemon::state::Roots;
+    use crate::daemon::state::{Roots, SigningGates};
     use crate::did::DidDocumentSpec;
     use crate::keystore::layout::KeydLayout;
     use crate::keystore::hardware::HardwareChoice;
@@ -200,7 +216,7 @@ mod tests {
     }
 
     impl Fixture {
-        fn new(raw_signing: bool) -> Self {
+        fn new(gates: SigningGates) -> Self {
             let dir = TempDir::new();
             let layout = KeydLayout::at(dir.path().to_path_buf());
             layout.ensure().unwrap();
@@ -237,7 +253,7 @@ mod tests {
                     Roots::Single(layout),
                     Default::default(),
                     Autolock::idle(Duration::from_secs(900)),
-                    raw_signing,
+                    gates,
                 ),
                 did: created.did,
                 _dir: dir,
@@ -290,7 +306,7 @@ mod tests {
 
     #[test]
     fn listing_and_status_work_without_unlocking() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
         let Response::ListKeys(keys) = handle(&f.state, &f.peer(), Request::ListKeys) else {
             panic!("expected a key list");
         };
@@ -305,7 +321,7 @@ mod tests {
 
     #[test]
     fn unlocking_then_signing_returns_the_signature_headers() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
         assert_eq!(f.unlock(), Response::Ok);
 
         let Response::Signature(bytes) = handle(&f.state, &f.peer(), f.structured()) else {
@@ -321,7 +337,7 @@ mod tests {
     /// 签名头必须是**逐字节**可用的原文：中间多一个空格，签名就验不过。
     #[test]
     fn the_headers_come_back_exactly_as_the_upstream_built_them() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
         f.unlock();
 
         let Response::Signature(bytes) = handle(&f.state, &f.peer(), f.structured()) else {
@@ -340,7 +356,7 @@ mod tests {
 
     #[test]
     fn signing_a_locked_key_answers_locked_and_says_nothing_else() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
         assert_eq!(
             handle(&f.state, &f.peer(), f.structured()),
             Response::Error {
@@ -353,7 +369,7 @@ mod tests {
     /// **拒绝也要留痕。** 一次被挡掉的签名在审计里必须看得见。
     #[test]
     fn a_refused_signature_is_still_written_to_the_audit_log() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
         assert!(f.audit_text().is_empty(), "nothing should be logged yet");
 
         let _ = handle(&f.state, &f.peer(), f.structured());
@@ -367,7 +383,7 @@ mod tests {
 
     #[test]
     fn a_successful_signature_is_logged_with_the_base_digest() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
         f.unlock();
         let _ = handle(&f.state, &f.peer(), f.structured());
 
@@ -383,7 +399,7 @@ mod tests {
 
     #[test]
     fn locking_is_logged_and_drops_the_key() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
         f.unlock();
         assert_eq!(
             handle(&f.state, &f.peer(), Request::Lock { did: Some(f.did.clone()), kid: None }),
@@ -405,7 +421,7 @@ mod tests {
 
     #[test]
     fn raw_signing_is_refused_while_the_switch_is_off_and_says_why() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
         f.unlock();
 
         let Response::Error { code, message } = handle(
@@ -428,7 +444,7 @@ mod tests {
 
     #[test]
     fn raw_signing_works_when_the_operator_turned_it_on() {
-        let f = Fixture::new(true);
+        let f = Fixture::new(SigningGates::new(true, false));
         f.unlock();
 
         let Response::Signature(signature) = handle(
@@ -450,9 +466,63 @@ mod tests {
         assert!(!text.contains("anything"), "the payload leaked into the log: {text}");
     }
 
+    /// 挑战签名这条路默认也关着，而且拒的时候**说得清是哪个开关** ——
+    /// 和 raw 那条一样，含糊在这里只会让人查不动。
+    #[test]
+    fn challenge_signing_is_refused_while_the_switch_is_off_and_says_why() {
+        let f = Fixture::new(SigningGates::new(false, false));
+        f.unlock();
+
+        let Response::Error { code, message } = handle(
+            &f.state,
+            &f.peer(),
+            Request::Sign(SignRequest::Challenge {
+                kid: None,
+                did: f.did.clone(),
+                challenge: b"server-issued".to_vec(),
+            }),
+        ) else {
+            panic!("expected a refusal");
+        };
+
+        assert_eq!(code, crate::daemon::wire::ErrorCode::ChallengeDisabled);
+        assert!(message.contains("--allow-challenge-signing"), "{message}");
+    }
+
+    /// 打开之后它回的是一次真签名，并且只把**摘要**记进审计 —— 挑战原文
+    /// 不该落进那个会被备份走的文件里，和 [`Event::RawSigned`] 同一个道理。
+    #[test]
+    fn challenge_signing_signs_the_challenge_bytes_when_on() {
+        let f = Fixture::new(SigningGates::new(false, true));
+        f.unlock();
+
+        let challenge = b"register-now-please".to_vec();
+        let Response::Signature(signature) = handle(
+            &f.state,
+            &f.peer(),
+            Request::Sign(SignRequest::Challenge {
+                kid: None,
+                did: f.did.clone(),
+                challenge: challenge.clone(),
+            }),
+        ) else {
+            panic!("expected a signature");
+        };
+
+        assert_eq!(signature.len(), 64);
+        // 留痕带的是挑战的**摘要**，不是挑战本身。
+        let text = f.audit_text();
+        assert!(text.contains("CHALLENGE_SIGNED"), "{text}");
+        assert!(text.contains("challenge_digest"), "{text}");
+        assert!(
+            !text.contains("register-now-please"),
+            "the challenge leaked into the log: {text}"
+        );
+    }
+
     #[test]
     fn the_wrong_passphrase_answers_the_same_thing_a_missing_device_secret_would() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
         let Response::Error { code, message } = handle(
             &f.state,
             &f.peer(),
@@ -471,7 +541,7 @@ mod tests {
 
     #[test]
     fn asking_for_an_unknown_key_answers_key_not_found() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
         let Response::Error { code, .. } = handle(
             &f.state,
             &f.peer(),
@@ -489,7 +559,7 @@ mod tests {
     /// 请求里要求覆盖一个请求中并不存在的头 —— 这是调用方的错，得说清楚。
     #[test]
     fn a_caller_asking_to_cover_a_header_it_did_not_send_is_refused() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
         f.unlock();
 
         let Request::Sign(SignRequest::Structured {
@@ -524,7 +594,7 @@ mod tests {
     /// 拿"没解锁"去挡它,挡掉的只是调用方本来就够得着的东西。
     #[test]
     fn the_document_is_served_byte_for_byte_without_unlocking() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
 
         let Response::Document(bytes) =
             handle(&f.state, &f.peer(), Request::GetDocument { did: f.did.clone() })
@@ -552,7 +622,7 @@ mod tests {
     /// 别人的 DID:**答不出来**。守护进程不联网,它替不了调用方去 resolve。
     #[test]
     fn a_did_this_machine_never_published_is_key_not_found() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
 
         let Response::Error { code, .. } = handle(
             &f.state,
@@ -568,7 +638,7 @@ mod tests {
     /// 请求"的分界,也是 `@signature-params` 里那个 nonce。
     #[test]
     fn a_caller_supplied_nonce_reaches_the_signature() {
-        let f = Fixture::new(false);
+        let f = Fixture::new(SigningGates::new(false, false));
         f.unlock();
 
         let Request::Sign(SignRequest::Structured {

@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use anp_keyd::crypto::kdf::Argon2Config;
 use anp_keyd::daemon::peer::PeerPolicy;
-use anp_keyd::daemon::state::{autolock_from_secs, DaemonState, Roots};
+use anp_keyd::daemon::state::{autolock_from_secs, DaemonState, Roots, SigningGates};
 use anp_keyd::daemon::{server, ServerConfig};
 use anp_keyd::did::document::{self, DidDocumentSpec};
 use anp_keyd::keystore::hardware::HardwareChoice;
@@ -104,7 +104,7 @@ impl Daemon {
             Roots::Single(KeydLayout::at(root)),
             PeerPolicy { allowed_uids: vec![], allowed_binaries: vec![] },
             autolock_from_secs(900),
-            false,
+            SigningGates::new(false, false),
         ));
 
         let runtime = tokio::runtime::Builder::new_multi_thread()

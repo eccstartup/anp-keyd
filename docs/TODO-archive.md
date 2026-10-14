@@ -7,7 +7,7 @@
 快照。没做完的那几件在仓库根的 [../TODO.md](../TODO.md),不在这个文件里。
 
 **这一版正文(下面「原文」那一段)不再改。** 此后做完的几件追加在它后面(到写这行
-为止有「追加一」到「追加四」),所以这份文件的末尾会一直长出新的记录来,而那段正文
+为止有「追加一」到「追加五」),所以这份文件的末尾会一直长出新的记录来,而那段正文
 始终是当时的样子。**2026-10-14 收工时又加了「整份归档二」** —— 那一版 TODO 的原样
 快照,连同"旧号怎么对上新号"那张表。
 
@@ -695,3 +695,109 @@ biscuit 能力令牌),边界见 [DESIGN.md](DESIGN.md) §一 和 §六。
 要么变成上面某一条。
 
 
+
+---
+
+# 追加五:那条窄路做到 socket 上 —— ✅ 已做完(2026-10-14)
+
+上面「整份归档二」那一版 TODO 的 §二(注册那个挑战签名)是一个**要人拍的岔口**,
+拍的是第二条:**开一条比 `Raw` 窄的路**。这一条记录的是把它做到 socket 上之后,
+那条路到底长什么样 —— 因为它和计划里那句"比 `Raw` 窄"之间有一段距离,而那段
+距离如果只留在代码里,下一个人会以为这条路**有形状**。
+
+## 它落在哪儿
+
+**是 `SIGN` 的第三个变体,不是新消息类型。** `SignRequest::Challenge`(tag `0x03`)
+和 `Structured`(`0x01`)/ `Raw`(`0x02`)并列 —— 线上还是六种请求,§三 那句"不加
+消息类型"照旧成立。所以这一件从协议层到 CLI 是四层各加一处:
+
+| 层 | 加了什么 |
+|---|---|
+| `daemon/wire.rs` | `SignRequest::Challenge { did, kid, challenge }`;`MAX_CHALLENGE_LEN = 256`;`ErrorCode::ChallengeDisabled = 0x000C` |
+| `daemon/state.rs` | `SigningGates`(`raw` + `challenge` 两个开关);`sign_challenge` |
+| `daemon/handlers.rs` | 一条 `SIGN` 的分支;`Event::ChallengeSigned` |
+| `cli.rs` | `serve --allow-challenge-signing`;`sign --challenge PATH` |
+| `client/mod.rs` | `sign_challenge` |
+
+`mcp` **一处都没接**,而且不是漏了 —— 门面的模块头写清了理由:`SIGN(Challenge)`
+签的是调用方给的、没有任何消息语义的字节,本质上是小一号的 `Raw`;需要它的是
+**协议客户端**(注册流程里那一步),它直接走 socket 问,agent 没有理由问这个。
+
+## 边界:能钉住的只有那道 256 字节的墙
+
+**"比 `Raw` 窄"在密码学上是句空话。** 256 字节以内的挑战签名和 `Raw` 产出的
+是**同一个东西**:同一把钥匙、同样签调用方给的原字节、同样验证方拿公钥直接验。
+分开它们的只有四样,而且全部是程序上的:
+
+- **那道上限是唯一有实质重量的东西。** 256 字节卡在任何一份 DID 文档之下(一份
+  文档是它的十几倍),所以这条路**结构上长不成**"帮我把文档签了"。这一条写进了
+  `MAX_CHALLENGE_LEN` 的文档注释,也写进了 §3.3 —— 它就是这条路和 `Raw` 之间
+  全部的、以及仅有的距离。
+- **不解释字节,也不做字符集过滤。** 和 §3.1 的 `nonce` 正相反:那里过滤,是因为
+  `nonce` 要**进签名基**,一个带换行的值会把签名基划开;这里原样签,正是对端的
+  要求(`challenge.encode("utf-8")` 之后直接验)。
+- **单独一条审计**(`CHALLENGE_SIGNED`,和 `RAW_SIGNED` 分开)、**单独一个开关**
+  (`--allow-challenge-signing`,默认关)。
+
+**开关的粒度有个不对称,是有意的:** `--allow-raw-signing` 打开时挑战签名**自动
+也开**(`SigningGates::new` 里 `raw || challenge`),反过来不成立。理由是包含关系 ——
+`Raw` 严格更宽,宽的那条开着时再拦窄的那条,拦不住任何东西,只会让人以为这里有
+一层实际不存在的保护。反过来,窄的那条开着**就是**"不开宽的那条",这是一条真的
+约束,不是形式主义。
+
+## 两处是写完之后回头改的
+
+- **`SigningGates` 的字段原来是 `pub` 的。** 那样 `SigningGates { raw: true,
+  challenge: false }` 这个字面量能写出一个绕开 `raw || challenge` 的两开关组合,
+  而不变式(宽的开着 ⇒ 窄的开着)只写在 `new()` 里。改成字段私有 + 两个 getter,
+  让"用别的写法绕过去"这件事在类型上就做不到。
+- **`SignRequest::Challenge` 的文档注释原来写着这条路"能签的东西有形状"。**
+  那句话是错的,而且错得正好是这个条目最容易被误读的那一点:它签的字节**没有
+  形状**,和 `Raw` 一样。注释和 ADAPTER §3.3 最后两段现在说的是同一句话:差别
+  在**有上界**,不在**有形状**。
+
+先写出一个"听起来更安全"的说法,再回头改成实话 —— 这种事在这份仓库里是按缺陷
+处理的。那一行如果说反了,后面每个人都会拿它当理由去顺手放宽别的东西。
+
+## 新测试
+
+- `wire.rs::a_challenge_at_the_cap_is_accepted_and_one_byte_over_is_refused` ——
+  边界那一格:**正好** 256 签得出来,257 在**解码**层就被拒(报 `Protocol`),
+  连钥匙都不碰。
+- `state.rs` 五条:`challenge_signing_is_off_unless_its_switch_is_on`、
+  `the_challenge_switch_is_checked_before_the_lock_state`(关着的时候拒的理由是
+  "这个开关没开",不是"锁着"——不然人会去解锁,然后撞上同一面墙)、
+  `an_unlocked_key_is_usable_for_challenge_signing_when_the_switch_is_on`,
+  以及那条不对称关系的两面:`opening_the_wider_raw_door_also_opens_the_narrow_challenge_one`
+  / `opening_the_challenge_door_does_not_open_raw`。
+- `handlers.rs` 两条:拒绝的话里要有 `--allow-challenge-signing`;签得成的那条
+  顺带断言日志里是 `challenge_digest`,**挑战本身不在日志里**。
+- `tests/signature_end_to_end.rs::a_challenge_signature_verifies_with_an_outside_verifier`
+  —— 真的 socket、真的守护进程,签的是**顶到上限**的 256 字节,交给 `ed25519_dalek`
+  拿**磁盘上那份已发布文档**里的公钥验;紧跟着量 257 字节在 socket 那头被拒。
+  验签的人是外面的实现,不是这个 crate 里的代码 —— 这条证的是"对端真能验过",
+  不是"我们自己觉得对"。
+- `tests/cli.rs::the_challenge_flag_is_its_own_door` —— 走两条真的命令行:开关
+  关着时拒、而且话里说出那个开关的名字(而且是在**解了锁之后**拒的,否则拒的
+  理由可以是"没解锁");开着时签得出、外面验得过,`--raw` 同时仍被拒,日志里那条
+  叫 `CHALLENGE_SIGNED`、记长度和摘要而不是挑战本身。
+
+`tests/cli.rs` 的夹具加了 `Daemon::start_with(dir, extra)`(原来的 `Daemon::start`
+成了它的一层薄包装),因为这个开关是**命令行上**的东西。测试用了两个根,不在同一个
+根上起两遍守护进程:`Daemon::start` 等的是 socket **文件**出现,而上一个守护进程
+留下的那个文件还在,于是它会立刻返回,下一条命令撞在一个还没绑好的 socket 上。
+
+## 落地清单
+
+| 文件 | 改了什么 |
+|---|---|
+| `src/daemon/wire.rs` | 第三个变体 + `MAX_CHALLENGE_LEN` + `ChallengeDisabled`;解码处的上限检查;一条边界测试 |
+| `src/daemon/state.rs` | `SigningGates`(字段私有 + getter);`sign_challenge`;五条测试 |
+| `src/daemon/handlers.rs` | `SIGN` 的分支 + `CHALLENGE_SIGNED`;两条测试 |
+| `src/audit/log.rs` | `Event::ChallengeSigned`(刻意和 `RawSigned` 分开);封闭 tag 集合那条测试补上第八个 |
+| `src/cli.rs` | `serve --allow-challenge-signing`;`sign --challenge`,和结构化那套、以及和 `--raw` 互相排除 |
+| `src/client/mod.rs` | `sign_challenge` |
+| `src/mcp/mod.rs` | **不加工具**,只在模块头写明为什么 |
+| `src/error.rs` | `ChallengeDisabled` 的消息带上该开哪个开关 |
+| `docs/ADAPTER.md` §3.3 / §3.1 / §三 / §八 / §九 / §十 / §十一 / §十二 | 岔口落定:四样边界、为什么不是另外两条、以及"密码学上同一个东西"那段实话 |
+| `TODO.md` §一 / §五 | §一 拍定、§五 这一件做完,都在原地留下指向本条的一行 |

@@ -23,7 +23,7 @@ use anp_keyd::crypto::hygiene::LockedBytes;
 use anp_keyd::crypto::kdf::Argon2Config;
 use anp_keyd::daemon::peer::{self, PeerPolicy};
 use anp_keyd::daemon::autolock::Autolock;
-use anp_keyd::daemon::state::{DaemonState, Roots};
+use anp_keyd::daemon::state::{DaemonState, Roots, SigningGates};
 use anp_keyd::did::document::DidDocumentSpec;
 use anp_keyd::error::KeydError;
 use anp_keyd::keystore::layout::KeydLayout;
@@ -117,7 +117,7 @@ fn state_for(layout: KeydLayout, raw_signing: bool) -> DaemonState {
         Roots::Single(layout),
         PeerPolicy::default(),
         Autolock::idle(Duration::from_secs(900)),
-        raw_signing,
+        SigningGates::new(raw_signing, false),
     )
 }
 

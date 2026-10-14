@@ -25,7 +25,7 @@ use crate::audit::{AuditLog, Event};
 use crate::client::Client;
 use crate::crypto::kdf::Argon2Config;
 use crate::daemon::peer::{BinaryIdentity, PeerPolicy};
-use crate::daemon::state::{autolock_from_secs, thumbprint_of, DaemonState, Roots};
+use crate::daemon::state::{autolock_from_secs, thumbprint_of, DaemonState, Roots, SigningGates};
 use crate::daemon::wire::{KeySummary, SignRequest};
 use crate::daemon::{self, server, ServerConfig};
 use crate::did::document::{self, DidDocumentSpec};
@@ -271,6 +271,18 @@ pub struct ServeArgs {
     #[arg(long)]
     pub allow_raw_signing: bool,
 
+    /// Open the challenged-bytes signing path (`SIGN(Challenge)`). Off by
+    /// default.
+    ///
+    /// A **narrower** door than `--allow-raw-signing`: it signs caller-supplied
+    /// bytes, but only up to 256 of them, and 256 is below any DID document and
+    /// any signature base — so it structurally cannot become "sign my document".
+    /// It exists for flows like registration that prove possession of the key by
+    /// signing a server-issued challenge. Because raw is the wider door, passing
+    /// `--allow-raw-signing` opens this one too; the reverse does not hold.
+    #[arg(long)]
+    pub allow_challenge_signing: bool,
+
     /// Besides this process's own uid, which uids may connect (repeatable).
     #[arg(long = "allow-uid", value_name = "UID")]
     pub allow_uids: Vec<u32>,
@@ -475,9 +487,9 @@ pub struct SignArgs {
 
     /// The full request URI — this is RFC 9421's `@target-uri`.
     ///
-    /// Only the `--raw` path does not need it, so it is required unless `--raw`
-    /// is present.
-    #[arg(long, value_name = "URL", required_unless_present = "raw")]
+    /// Only the `--raw` and `--challenge` paths do not need it, so it is
+    /// required unless one of them is present.
+    #[arg(long, value_name = "URL", required_unless_present_any = ["raw", "challenge"])]
     pub url: Option<String>,
 
     /// Headers already on the request, `name: value` (repeatable). Names are
@@ -524,9 +536,27 @@ pub struct SignArgs {
     #[arg(
         long,
         value_name = "PATH",
-        conflicts_with_all = ["url", "headers", "body", "cover", "nonce"]
+        conflicts_with_all = ["url", "headers", "body", "cover", "nonce", "challenge"]
     )]
     pub raw: Option<PathBuf>,
+
+    // 和 `--raw` 一样，它和结构化那一套、以及和 `--raw` 本身互相排除。
+    // 理由也照旧：这不是"多种输入凑在一起"的场合，而是"输入到底是哪一种"——
+    // 让 clap 把话说清楚，比运行时挑一个先撞上的分支强。
+    /// Challenge signing: sign exactly the contents of this file, print base64.
+    ///
+    /// For flows like registration, where a server issues a challenge and the
+    /// caller has to prove possession of the key by signing its raw bytes. Needs
+    /// the daemon running with `--allow-challenge-signing`. **The file must be
+    /// at most 256 bytes** — that cap is what keeps this path from becoming
+    /// "sign my document". **Mutually exclusive** with the structured flags and
+    /// with `--raw`: one kind of input or the other.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["url", "headers", "body", "cover", "nonce", "raw"]
+    )]
+    pub challenge: Option<PathBuf>,
 
     /// Socket path (derived from the directory layout by default).
     #[arg(long, value_name = "PATH")]
@@ -907,7 +937,7 @@ fn serve_here(layout: &KeydLayout, args: ServeArgs, sock_path: PathBuf) -> Resul
         roots,
         policy,
         autolock_from_secs(args.idle),
-        args.allow_raw_signing,
+        SigningGates::new(args.allow_raw_signing, args.allow_challenge_signing),
     ));
     let config = ServerConfig { sock_path: sock_path.clone(), policy: state.policy().clone() };
 
@@ -1383,14 +1413,21 @@ fn sign(root: Option<&Path>, args: SignArgs) -> Result<()> {
         return Ok(());
     }
 
+    if let Some(path) = &args.challenge {
+        let challenge = read_flag_file(path, "--challenge")?;
+        let signature = client.sign_challenge(&args.did, args.kid.as_deref(), challenge)?;
+        println!("{}", base64(&signature));
+        return Ok(());
+    }
+
     let body = match &args.body {
         Some(path) => Some(read_flag_file(path, "--body")?),
         None => None,
     };
 
     // clap 保证了走到这里 `url` 一定在:要么给了 `--url`,要么给了 `--raw`
-    // 而这个分支处理不了 —— 所以这里的 `ok_or` 不是"用户传错了",是"我们
-    // 自己把两条路的分支写漏了",报出来比 unwrap 好。
+    // 或 `--challenge` 而这个分支处理不了 —— 所以这里的 `ok_or` 不是"用户传错
+    // 了",是"我们自己把几条路的分支写漏了",报出来比 unwrap 好。
     let target_uri = args.url.clone().ok_or_else(|| {
         KeydError::Protocol("no --url was given, so there is nothing to sign".into())
     })?;
@@ -1689,6 +1726,7 @@ mod tests {
             foreground: false,
             idle: DEFAULT_IDLE_SECS,
             allow_raw_signing: false,
+            allow_challenge_signing: false,
             allow_uids: vec![],
             allow_binaries: vec!["not-a-pin".into()],
         }

@@ -15,8 +15,8 @@ use std::sync::Arc;
 use anp_keyd::client::Client;
 use anp_keyd::crypto::kdf::Argon2Config;
 use anp_keyd::daemon::peer::PeerPolicy;
-use anp_keyd::daemon::state::{autolock_from_secs, DaemonState, Roots};
-use anp_keyd::daemon::wire::SignRequest;
+use anp_keyd::daemon::state::{autolock_from_secs, DaemonState, Roots, SigningGates};
+use anp_keyd::daemon::wire::{SignRequest, MAX_CHALLENGE_LEN};
 use anp_keyd::daemon::{self, server, ServerConfig};
 use anp_keyd::did::document::{self, DidDocumentSpec};
 use anp_keyd::keystore::layout::KeydLayout;
@@ -85,6 +85,11 @@ struct Running {
 
 impl Running {
     fn start() -> Self {
+        Self::start_with_gates(false, false)
+    }
+
+    /// 同一套夹具,两个签名开关自己定 —— 挑战签名那一条要真的开着才测得出来。
+    fn start_with_gates(raw: bool, challenge: bool) -> Self {
         let dir = TempDir::new("e2e");
         let root = dir.path().join("root");
         let layout = KeydLayout::at(root.clone());
@@ -108,7 +113,7 @@ impl Running {
             Roots::Single(KeydLayout::at(root)),
             PeerPolicy { allowed_uids: vec![], allowed_binaries: vec![] },
             autolock_from_secs(900),
-            false,
+            SigningGates::new(raw, challenge),
         ));
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -186,6 +191,30 @@ fn verify(
 ) -> Result<anp::authentication::http_signatures::SignatureMetadata, String> {
     anp::authentication::verify_http_message_signature(document, method, url, headers, body)
         .map_err(|error| error.to_string())
+}
+
+/// 挑战签名的验法 —— **和对端做的事一模一样**:从已发布的文档里取出公钥,
+/// 拿它对 `challenge` 的**原字节**验一次签名。没有签名基、没有 nonce,
+/// 这一份密文里也没有第二个字段可以挑。
+///
+/// 验签的人是 `ed25519_dalek`,不是这个 crate 里的任何代码;公钥则是从
+/// **磁盘上那份文档**里读出来的,不是内存里刚造的那把钥匙 —— 中间任何一步
+/// 把字节换了地方,这里都会红。
+fn verify_challenge(document: &Value, signature: &[u8], challenge: &[u8]) -> Result<(), String> {
+    let methods = document["verificationMethod"]
+        .as_array()
+        .ok_or_else(|| "the document has no verificationMethod".to_string())?;
+    assert_eq!(methods.len(), 1, "this fixture creates exactly one key");
+    let multibase = methods[0]["publicKeyMultibase"]
+        .as_str()
+        .ok_or_else(|| "a verification method without publicKeyMultibase".to_string())?;
+
+    let key = anp_keyd::crypto::thumbprint::ed25519_from_multibase(multibase)
+        .map_err(|error| error.to_string())?;
+    let signature = ed25519_dalek::Signature::from_slice(signature).map_err(|e| e.to_string())?;
+
+    use ed25519_dalek::Verifier;
+    key.verify(challenge, &signature).map_err(|error| error.to_string())
 }
 
 /// **这是那一条测试。** 一条连着 socket 的请求,签出来,交给上游验。
@@ -441,6 +470,59 @@ async fn two_concurrent_signers_do_not_interleave() {
     }
 
     assert_ne!(nonces[0], nonces[1], "two signatures shared a nonce");
+}
+
+/// **第二条端到端的测试。** 挑战签名:一条真的 socket 请求,签的是调用方
+/// 给的**原字节**,交给外面的验签实现验;边上量一下那道 256 字节的墙。
+///
+/// 这一条和第 256 个字节是同一个东西的两面 —— 上限**就是**这条路和 `Raw`
+/// 之间全部的差别(见 ADAPTER §3.3),所以它得在"真的能签"旁边一起被量。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_challenge_signature_verifies_with_an_outside_verifier() {
+    let running = Running::start_with_gates(false, true);
+    let did = running.did.clone();
+
+    // 正好顶到上限:不是随手挑的短串 —— 边界那一格也得真的签得出来。
+    let challenge = vec![b'a'; MAX_CHALLENGE_LEN];
+
+    let signature = running
+        .session({
+            let did = did.clone();
+            let challenge = challenge.clone();
+            move |client| {
+                client
+                    .unlock(&did, None, std::str::from_utf8(PASSPHRASE).unwrap())
+                    .unwrap();
+                client.sign(SignRequest::Challenge { did, kid: None, challenge }).unwrap()
+            }
+        })
+        .await;
+
+    verify_challenge(&running.document, &signature, &challenge)
+        .expect("a challenge signed over the socket must verify against the published document");
+
+    // 往上一格:多一个字节,在协议层就被拦下,连钥匙都不碰。
+    let error = running
+        .session({
+            let did = did.clone();
+            move |client| {
+                client
+                    .sign(SignRequest::Challenge {
+                        did,
+                        kid: None,
+                        challenge: vec![b'a'; MAX_CHALLENGE_LEN + 1],
+                    })
+                    .unwrap_err()
+            }
+        })
+        .await;
+
+    assert_eq!(
+        error.wire_code(),
+        anp_keyd::daemon::wire::ErrorCode::Protocol,
+        "one byte over the cap must be a protocol error, not a signature: {error}"
+    );
+    assert!(error.to_string().contains("257"), "{error}");
 }
 
 /// 目录布局:测试结束后没必要留东西,但这个断言顺手确认 socket 真的建在

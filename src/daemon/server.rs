@@ -438,7 +438,7 @@ mod tests {
     use crate::client::Client;
     use crate::crypto::kdf::Argon2Config;
     use crate::daemon::peer::BinaryIdentity;
-    use crate::daemon::state::Roots;
+    use crate::daemon::state::{Roots, SigningGates};
     use crate::did::DidDocumentSpec;
     use crate::error::KeydError;
     use crate::keystore::hardware::HardwareChoice;
@@ -484,7 +484,7 @@ mod tests {
                 Roots::Single(KeydLayout::at(dir.path().to_path_buf())),
                 policy.clone(),
                 crate::daemon::autolock::Autolock::idle(std::time::Duration::from_secs(900)),
-                false,
+                SigningGates::new(false, false),
             ));
 
             let sock = dir.path().join("keyd.sock");

@@ -30,7 +30,7 @@ use anp_keyd::crypto::hygiene::LockedBytes;
 use anp_keyd::crypto::kdf::Argon2Config;
 use anp_keyd::crypto::thumbprint::e1_segment;
 use anp_keyd::daemon::peer::PeerPolicy;
-use anp_keyd::daemon::state::{autolock_from_secs, DaemonState, Roots};
+use anp_keyd::daemon::state::{autolock_from_secs, DaemonState, Roots, SigningGates};
 use anp_keyd::daemon::wire::SignRequest;
 use anp_keyd::daemon::{server, ServerConfig};
 use anp_keyd::keystore::layout::KeydLayout;
@@ -207,7 +207,7 @@ impl Machine {
             Roots::Single(KeydLayout::at(dir.path().join("root"))),
             PeerPolicy { allowed_uids: vec![], allowed_binaries: vec![] },
             autolock_from_secs(900),
-            false,
+            SigningGates::new(false, false),
         ));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
