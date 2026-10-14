@@ -5,17 +5,41 @@
 //! open:  TPM2_TRFromTPM(持久句柄) → TPM2_Unseal → 那 32 字节
 //! ```
 //!
-//! # ⚠️ 这个文件**从来没有被编译过**
+//! # 它已经在 Linux 上编译过、也跑过端到端了(2026-10-14)
 //!
 //! 写它的机器是 macOS,`tss-esapi-sys` 的构建脚本在非 Linux 上直接 panic ——
-//! 这里连 `cargo check` 都跑不了(交叉编译也试过,缺 `x86_64-linux-gnu-gcc`
-//! 和 `pkg-config`)。所以这个文件里的每一个函数名、类型名、参数顺序都是
-//! **照着 `~/.cargo/registry/src/` 里 vendored 的 `tss-esapi 7.7.0` 源码
-//! 逐个核对出来的**,而不是照着记忆写的 —— 但"核对过"和"编译过"仍然是两件事。
+//! 这里连 `cargo check` 都跑不了(交叉编译也不行,缺 `x86_64-linux-gnu-gcc`
+//! 和 `pkg-config`)。所以最初那一版的每一个函数名、类型名、参数顺序都是
+//! **照着 vendored 的 `tss-esapi 7.7.0` 源码逐个核对出来的**。
 //!
-//! 第一次在 Linux 上编译它的人请把这句当回事:**先跑
-//! `cargo test --features hardware-tpm`,再跑 `swtpm` 的端到端**。
-//! `TODO.md` 里记着这一条,别把它当成已经验过的。
+//! 现在不是了。第一台 Linux 机器上:**`cargo test --features hardware-tpm`
+//! 全绿(含 `tests/tpm.rs` 那三条),`swtpm` 的端到端也走通了** ——
+//! `keygen --hardware tpm` → `probe` 报 USABLE → `publish` → `serve` →
+//! `unlock` → `sign` 出真的 RFC 9421 头;`swtpm` 重启之后信封照旧打得开;
+//! `tpm2_evictcontrol` 把对象删掉之后解锁**响亮地失败**(`HardwareMissing`),
+//! 信封一个字节没动。
+//!
+//! ## 而"核对过源码"确实漏掉了东西 —— 三个,都只在真信封上才露头
+//!
+//! 这一节留着,是因为它说明**为什么**"核对过"不等于"验过":
+//!
+//! 1. **带会话调 `tr_from_tpm_public` 会段错误。** `tpm2-tss 3.2.1` 的
+//!    `Esys_TR_FromTPMPublic_Finish` 有一处没查空指针的解引用,而密码会话
+//!    恰好就是 `NULL`。详见 [`attach`]。触发条件是"那个句柄上真的有对象",
+//!    所以 `probe` 自己的自我测试碰不到,只有**真信封**才炸 —— 症状是守护
+//!    进程直接 SIGSEGV(退出码 139),客户端只看到连接断了。
+//! 2. **`seal_probe` 以前只做到 `EvictControl` 就返回,报告里却写着
+//!    "read back"。** 于是 `TPM2_Unseal` —— [`Tpm::open`] 唯一真正依赖的
+//!    那条命令 —— 从来没被任何一次体检碰过。见 [`seal_probe`]。
+//! 3. **芯片上能同时装载的对象很少**(`swtpm` 那类实现尤其少),而
+//!    `create_primary` 每调一次就占一格。峰值超了会报 `out of memory for
+//!    object contexts`(0x902),而那句话指向"这颗 TPM 不能持久化",和真正
+//!    发生的事毫无关系。见 [`Tpm::seal`] 和 [`probe`] 第 ① 步。
+//!
+//! 这三条都不是类型错,编译器一条也拦不住 —— 它们是**运行时**的。
+//!
+//! 要重跑那套验证:见 `tests/tpm.rs` 的文件头(一条命令,外加它在哪三种
+//! 情况下会红)。
 //!
 //! # TPM 和 SE 的两处结构差别(不是抄漏了)
 //!
@@ -47,7 +71,7 @@
 
 use std::str::FromStr;
 
-use sha2::{Digest as Sha2Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 use tss_esapi::attributes::ObjectAttributesBuilder;
 use tss_esapi::handles::{ObjectHandle, PersistentTpmHandle, TpmHandle};
 use tss_esapi::interface_types::algorithm::{HashingAlgorithm, PublicAlgorithm, SymmetricMode};
@@ -110,11 +134,28 @@ fn tcti_string() -> String {
         .unwrap_or_else(|| DEFAULT_TCTI.to_string())
 }
 
-/// 开一个和 TPM 说话的上下文。
+/// 开一个和 TPM 说话的上下文,**并且已经装好授权要用的那个会话**。
 ///
 /// **这一步失败的含义是"这台机器上没有能用的 TPM"**,不是"信封不对" ——
 /// 所以它是 [`KeydError::HardwareUnavailable`]。分清楚这一点,人才知道该去
 /// 看 `dmesg` / 装 `swtpm`,而不是去翻信封。
+///
+/// # 那一句 `set_sessions` 为什么钉在这儿
+///
+/// 这个文件里碰的每一个对象,**授权值都是空的**:主键(owner 或 null 层级)、
+/// 密封对象、`probe` 那个探针,一个都没有 authValue。空授权值对应的就是一个
+/// **password 会话**。而一个新建的 `Context` 一个会话都没有 —— 缺了它,
+/// `TPM2_CreatePrimary` 会以
+///
+/// ```text
+/// Not enough sessions provided for the command
+/// ```
+///
+/// 收场。这个报错**不看 TPM 有没有毛病**(`swtpm` 也一样报),所以它曾经让
+/// `probe` 得出"设备不像个 TPM"的结论,而真正的原因是我们自己没给会话。
+///
+/// 放在这里而不是让每个调用方自己记着:那正是这个错的原因 —— `open()` 记了,
+/// `seal()` 和 `probe()` 没记,而这个函数的目的就是"给你一个能用的上下文"。
 fn context() -> Result<Context> {
     let raw = tcti_string();
     let conf = TctiNameConf::from_str(&raw).map_err(|error| {
@@ -123,14 +164,16 @@ fn context() -> Result<Context> {
              like `device:/dev/tpmrm0` or `swtpm:host=localhost,port=2321`"
         ))
     })?;
-    Context::new(conf).map_err(|error| {
+    let mut ctx = Context::new(conf).map_err(|error| {
         KeydError::HardwareUnavailable(format!(
             "could not open a TPM session over {raw:?}: {error}. On a machine with a TPM 2.0 this \
              usually means /dev/tpmrm0 is missing or not readable by this user; without one, \
              `swtpm` can emulate it and `TPM2TOOLS_TCTI=swtpm:host=localhost,port=2321` points \
              this build at the emulator"
         ))
-    })
+    })?;
+    ctx.set_sessions((Some(AuthSession::Password), None, None));
+    Ok(ctx)
 }
 
 fn tpm_failed(what: &str, error: tss_esapi::Error) -> KeydError {
@@ -209,21 +252,60 @@ fn handle_for(tag_hint: &str) -> Result<u32> {
             "{tag_hint:?} is not usable as a TPM sealed-object name"
         )));
     }
-    let digest = Sha2Digest::digest(tag_hint.as_bytes());
+    let digest = Sha256::digest(tag_hint.as_bytes());
     let low = u32::from_be_bytes([0, digest[0], digest[1], digest[2]]);
     Ok(PERSISTENT_FIRST | (low & OWNER_MASK))
 }
 
+/// 把一个持久句柄接进 ESYS 的会话表,返回一个能用的 `ObjectHandle`。
+///
+/// # 这一次调用**刻意不带任何会话**,而且这不是可选的美化
+///
+/// `tpm2-tss 3.2.1` 的 `Esys_TR_FromTPMPublic_Finish` 里有一段"带了会话就
+/// 再问 TPM 一次"的逻辑(为的是防中间人,先无会话取一份元数据、再带会话
+/// 取一份 HMAC 验证过的)。那段代码把第二、第三个会话都做了空指针检查,
+/// **第一个没有**:
+///
+/// ```c
+/// r = Esys_TR_FromTPMPublic_Async(esys_context, objectHandleNode->rsrc.handle,
+///                                 esys_context->session_tab[0]->esys_handle,  /* ← 没查 */
+///                                 esys_context->session_tab[1] ? ... : ESYS_TR_NONE,
+///                                 esys_context->session_tab[2] ? ... : ESYS_TR_NONE);
+/// ```
+///
+/// 而同一个文件里的 `init_session_tab` 对 **password 会话**做的正好是
+/// `session_tab[i] = NULL`(密码会话不是真会话,没有 HMAC 可算)。两者一碰
+/// 就是 `NULL->esys_handle` —— **段错误**。
+///
+/// 实测过,不是照着源码推的:同一颗芯片上 `tpm2_readpublic -c 0x813258BA`
+/// 一切正常,这边 `ldr w2, [x2]` / `si_addr = 0x0`,进程收 SIGSEGV。
+/// 触发条件是"句柄上**真的**有对象"——没有对象的路径在更早的 `ReadPublic`
+/// 就报错返回了,压根走不到那一段。所以这个 bug 只在**真信封**上炸,
+/// 而 `probe` 那点自我测试碰不到它(见 [`seal_probe`])。
+///
+/// 绕开的办法就是不给它会话:走 [`Context::execute_with_session`] 传 `None`,
+/// 跑完它自己把原来的会话放回去。这**不损失任何东西** —— `TPM2_ReadPublic`
+/// 是公开命令,本来就不需要授权,递一个密码会话进去什么也证明不了
+/// (ESYS 自己那段注释也写着要 HMAC 会话才有意义)。
+fn attach(ctx: &mut Context, persistent: PersistentTpmHandle) -> tss_esapi::Result<ObjectHandle> {
+    ctx.execute_with_session(None, |ctx| {
+        ctx.tr_from_tpm_public(TpmHandle::Persistent(persistent))
+    })
+}
+
 /// 那个持久句柄上是不是已经蹲着一个对象。
 ///
-/// 用 `tr_from_tpm_public` 探 —— 它是**只读**的(只是把一个 TPM 句柄接进
-/// ESYS 的会话表),探完立刻关掉;不会像"先试着 unseal 一下"那样动到任何
-/// 计数器,也不会因为对象其实属于别的类型而读出什么来。
+/// 用 [`attach`] 探 —— 它是**只读**的(只是把一个 TPM 句柄接进 ESYS 的会话
+/// 表),探完立刻关掉;不会像"先试着 unseal 一下"那样动到任何计数器,也不会
+/// 因为对象其实属于别的类型而读出什么来。
+///
+/// **接不进来就当作"没有"** —— 判反了是安全的:说"有"只是让 [`Tpm::seal`]
+/// 保守地拒绝,"说没有但其实有"不可能发生(接一个存在的句柄不会失败)。
 fn object_is_there(ctx: &mut Context, handle: u32) -> bool {
     let Ok(persistent) = PersistentTpmHandle::new(handle) else {
         return false;
     };
-    let Ok(mut object) = ctx.tr_from_tpm_public(TpmHandle::Persistent(persistent)) else {
+    let Ok(mut object) = attach(ctx, persistent) else {
         return false;
     };
     let _ = ctx.tr_close(&mut object);
@@ -293,6 +375,16 @@ impl HardwareBackend for Tpm {
             .load(primary, created.out_private, created.out_public)
             .map_err(|error| tpm_failed("load the sealed object back", error))?;
 
+        // 主键的用处到此为止(`create` 和 `load` 各用了一次),还回去 —— 和
+        // [`seal_probe`] 里同一条理由,而且这里更要紧:芯片上的对象表很小
+        // (swtpm 那类实现尤其小,而且它是"**同时**装载几个"的上限,不是累计),
+        // 而 `seal` 是可以**并发**跑的(守护进程把连接处理放在阻塞池上)。
+        // 每次封存少占一格,几把钥匙同时生成时的余量就多一格。实测过:
+        // 封存和探针同时在跑的那一轮把 swtpm 顶到 `out of memory for object
+        // contexts`(0x902),而报出来的话是"这颗 TPM 不能持久化" ——
+        // 指向错误的地方。
+        let _ = ctx.flush_context(primary.into());
+
         // 持久化:`create` 出来的是个 transient 对象,重启就没了,而"重启之后
         // 信封还在"是普通人对一台机器的预期(见 `HardwareRoot::Tpm` 的注释)。
         //
@@ -335,14 +427,12 @@ impl HardwareBackend for Tpm {
 
         // 接不进来就是"这台机器上没有那个对象" —— 换机器、或者有人手动
         // `tpm2_evictcontrol` 清掉了,都是这一种。**不是**口令问题。
-        let object = ctx
-            .tr_from_tpm_public(TpmHandle::Persistent(persistent))
-            .map_err(|_| missing(*handle))?;
+        // (`attach` 为什么不带会话,见它自己的注释:带会话会段错误。)
+        let object = attach(&mut ctx, persistent).map_err(|_| missing(*handle))?;
 
-        // 密封对象的授权值是空的,所以一个 password 会话就够。`Context` 的
-        // `Drop` 会在最后把这个对象和会话一起收掉,这里不需要手工 `tr_close`。
-        ctx.set_sessions((Some(AuthSession::Password), None, None));
-
+        // 密封对象的授权值是空的,而 [`context`] 给的上下文已经装好了那个
+        // password 会话 —— 这里不用再设一遍。`Context` 的 `Drop` 会在最后把
+        // 这个对象和会话一起收掉,所以也不需要手工 `tr_close`。
         let sealed = ctx.unseal(object).map_err(|error| {
             KeydError::HardwareMissing(format!(
                 "the TPM holds an object at {handle:#010x} but refused to unseal it ({error}); the \
@@ -423,27 +513,36 @@ pub fn probe() -> RootProbe {
             };
         }
     };
-    if let Err(error) = ctx.create_primary(Hierarchy::Null, template, None, None, None, None) {
-        return RootProbe {
-            kind: KIND,
-            compiled: true,
-            usable: false,
-            detail: format!(
-                "a TPM session opened but the device did not act like a TPM: creating a primary \
-                 key in the null hierarchy failed ({error})"
-            ),
-            remedy: Some(
-                "This usually means the TCTI points at something that is not a working TPM 2.0 — \
-                 a half-started `swtpm`, or a device node that is not the one you think it is. \
-                 Check `tpm2_getcap properties-fixed` against the same TCTI."
-                    .into(),
-            ),
-        };
+    // **问完立刻冲掉。** 芯片上的对象表很小(swtpm 这类实现尤其小),而后面
+    // 还要建自己的主键、密封对象、再解封回来 —— 把这把主键留在表里,实测会
+    // 让第 ③ 步的 `ReadPublic` 以 `out of memory for object contexts`
+    // (0x902)收场,报告出来却是"这颗 TPM 不能持久化",指向完全错误的地方。
+    match ctx.create_primary(Hierarchy::Null, template, None, None, None, None) {
+        Err(error) => {
+            return RootProbe {
+                kind: KIND,
+                compiled: true,
+                usable: false,
+                detail: format!(
+                    "a TPM session opened but the device did not act like a TPM: creating a primary \
+                     key in the null hierarchy failed ({error})"
+                ),
+                remedy: Some(
+                    "This usually means the TCTI points at something that is not a working TPM 2.0 \
+                     — a half-started `swtpm`, or a device node that is not the one you think it \
+                     is. Check `tpm2_getcap properties-fixed` against the same TCTI."
+                        .into(),
+                ),
+            };
+        }
+        Ok(null_primary) => {
+            let _ = ctx.flush_context(null_primary.key_handle.into());
+        }
     }
 
     // ② 封一个探针对象并持久化 —— 这一步才是 `seal`/`open` 真正依赖的能力。
     // 上一次崩溃留下的残留先清掉,再封。
-    evict_probe(&mut ctx);
+    let _ = evict_probe(&mut ctx);
 
     let detail = match seal_probe(&mut ctx) {
         Err(error) => {
@@ -466,32 +565,44 @@ pub fn probe() -> RootProbe {
         Ok(()) => "a sealed object was created, persisted, and read back".to_string(),
     };
 
-    // ③ 别留痕 —— 而且删不掉要说出来,不能让报告看起来是干净的。
-    let (usable, detail, remedy) = if evict_probe(&mut ctx) {
-        (true, format!("{detail}, then removed again"), None)
-    } else {
-        (
+    // ③ 别留痕 —— 而删不掉要说出来,不能让报告看起来是干净的。
+    let (usable, detail, remedy) = match evict_probe(&mut ctx) {
+        Ok(()) => (true, format!("{detail}, then removed again"), None),
+        Err(error) => (
             true,
             format!(
                 "{detail}, but the probe could not remove its own object at \
-                 {PROBE_HANDLE:#010x} again — that leftover protects nothing, but you may want to \
-                 clear it by hand with `tpm2_evictcontrol -c {PROBE_HANDLE:#010x}`"
+                 {PROBE_HANDLE:#010x} again: {error}. That leftover protects nothing, but you may \
+                 want to clear it by hand with `tpm2_evictcontrol -c {PROBE_HANDLE:#010x}`"
             ),
             None,
-        )
+        ),
     };
 
     RootProbe { kind: KIND, compiled: true, usable, detail, remedy }
 }
 
-/// 在 [`PROBE_HANDLE`] 上封一个探针对象。成不成返回 `Result`。
+/// 在 [`PROBE_HANDLE`] 上封一个探针对象,**持久化,再解封回来核对一遍**。
+///
+/// # 最后那一步解封不是走形式
+///
+/// 这里以前只做到 `EvictControl` 就返回了,报告里却写着 "read back" ——
+/// 于是 `TPM2_Unseal`(也就是 [`Tpm::open`] **唯一**真正依赖的那条命令)
+/// 从来没被任何一次体检碰过。一颗芯片上能不能存密封对象、和能不能解回来,
+/// 是两件事,而这套代码的整个价值就压在后者上。
+///
+/// 这个空白是有代价的:`open()` 在真信封上段错误过一次,而 `probe` 报的是
+/// "USABLE" —— 因为它压根没走到会崩的那条路。现在它走。
 fn seal_probe(ctx: &mut Context) -> Result<()> {
+    // **不是全零。** 全零的"封进去、解出来"连"数据真的走了一趟"都证明不了
+    // —— 一块没被写过的缓冲区也是全零。用一个可辨认的花样,核对才有内容。
+    let probe_secret: [u8; HS_LEN] = std::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(3));
+
     let primary = ctx
         .create_primary(Hierarchy::Owner, primary_template()?, None, None, None, None)
         .map_err(|error| tpm_failed("create the probe's primary key", error))?
         .key_handle;
 
-    let probe_secret = [0u8; HS_LEN];
     let sensitive = SensitiveData::try_from(&probe_secret[..])
         .map_err(|error| tpm_failed("hand the probe secret to the TPM", error))?;
 
@@ -503,29 +614,58 @@ fn seal_probe(ctx: &mut Context) -> Result<()> {
         .load(primary, created.out_private, created.out_public)
         .map_err(|error| tpm_failed("load the probe object back", error))?;
 
+    // 主键的用处到此为止(`create` 和 `load` 各用了一次),还回去 —— 对象表
+    // 是芯片上很紧的一份资源,理由和 `probe()` 第 ① 步那段注释同一条。
+    //
+    // 失败的那几条路上不特意还:`Context` 收尾时会把它们一起冲掉(实测过:
+    // 一次干净的运行之后 `tpm2_getcap handles-transient` 是空的)。**但崩掉的
+    // 进程不是** —— 它没有收尾,那些 transient 对象就一直占在芯片上,直到
+    // 有人重启 TPM(实测:一次 SIGSEGV 之后表里留着好几格,重启 `swtpm` 才
+    // 清掉)。而 `probe` 第 ② 步开头那一下只能抹掉**持久**的探针对象,
+    // 对崩溃留下的 transient 无能为力 —— 那种时候要报的就是 0x902。
+    let _ = ctx.flush_context(primary.into());
+
     let persistent = PersistentTpmHandle::new(PROBE_HANDLE)
         .map_err(|error| tpm_failed("address the probe handle", error))?;
     ctx.evict_control(Provision::Owner, loaded.into(), Persistent::Persistent(persistent))
         .map_err(|error| tpm_failed("persist the probe object", error))?;
+
+    // 现在它是一颗持久对象了 —— 走一遍 `open()` 的路:接进来,解封,比字节。
+    let attached = attach(ctx, persistent)
+        .map_err(|error| tpm_failed("attach the probe object it just persisted", error))?;
+    let unsealed = ctx
+        .unseal(attached)
+        .map_err(|error| tpm_failed("unseal the probe object it just persisted", error))?;
+    if unsealed.value() != probe_secret {
+        return Err(KeydError::HardwareUnavailable(
+            "the TPM sealed the probe secret and handed back different bytes; this chip cannot be \
+             trusted to hold a key envelope"
+                .into(),
+        ));
+    }
     Ok(())
 }
 
-/// 把 [`PROBE_HANDLE`] 上的探针对象清掉。返回"现在那儿是空的吗"。
+/// 把 [`PROBE_HANDLE`] 上的探针对象清掉。
 ///
-/// 顺手也是幂等的:那儿本来就是空的也返回 `true`。
-fn evict_probe(ctx: &mut Context) -> bool {
+/// 幂等:那儿本来就是空的也算成功。
+///
+/// 失败时**返回理由**而不是一个光秃秃的 `false` —— 报告里那句"删不掉、你
+/// 自己看着办"要能让人判断该不该管它,而"换个会话就删掉了"和"这块芯片
+/// 根本不让你删"是两件事。
+fn evict_probe(ctx: &mut Context) -> Result<()> {
     if !object_is_there(ctx, PROBE_HANDLE) {
-        return true;
+        return Ok(());
     }
-    let Ok(persistent) = PersistentTpmHandle::new(PROBE_HANDLE) else {
-        return false;
-    };
-    let Ok(object) = ctx.tr_from_tpm_public(TpmHandle::Persistent(persistent)) else {
-        return false;
-    };
+    let persistent = PersistentTpmHandle::new(PROBE_HANDLE)
+        .map_err(|error| tpm_failed("address the probe handle", error))?;
+    let object = attach(ctx, persistent)
+        .map_err(|error| tpm_failed("attach the probe object in order to remove it", error))?;
     // `Persistent::Persistent` 传进去、同名的句柄传回来,就是"把这个持久对象
     // 抹掉"的写法(TPM 规范里 evict 就是"把一个持久句柄映射到 TPM_RH_NULL")。
-    ctx.evict_control(Provision::Owner, object, Persistent::Persistent(persistent)).is_ok()
+    ctx.evict_control(Provision::Owner, object, Persistent::Persistent(persistent))
+        .map_err(|error| tpm_failed("remove the probe object", error))?;
+    Ok(())
 }
 
 // ————————————————————————————————————————————————————————————————————————

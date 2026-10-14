@@ -47,18 +47,53 @@ pub fn is_same_executable(ours: &std::path::Path, pid: i32) -> bool {
     theirs.dev() == ours.dev() && theirs.ino() == ours.ino()
 }
 
-/// 这个 pid 现在存不存在。
+/// `pid` 是不是一个**还在跑**的进程。
 ///
 /// 用的是 `kill(pid, 0)`:它只做权限和存在性检查,**不发任何信号**。
 /// `EPERM` 也算活着 —— 那个进程在,只是不是我们的。
+///
+/// **但"存在"不等于"还在跑":僵尸也算存在。** 一个已经退出、父进程还没
+/// `wait` 掉的进程,`kill(pid, 0)` 照样成功 —— 它已经死了,只是还占着一个
+/// pid 槽位等着收尸。这里回答的是"它还在跑吗",所以僵尸算**不在**。
+///
+/// 这个区别在 Linux 上是看得见的,而且不是只在测试里:守护进程是 `serve`
+/// **重新执行自己**放出去的,退出之后归 PID 1 收尸。systemd 和 launchd 都会
+/// 收,但容器里那个 PID 1(`sleep`、`bash`、`sh` 这类)不会 —— 而容器恰恰是
+/// 跑一个守护进程的常见地方。症状是 `stop` 发完 SIGTERM 老老实实等满 5 秒,
+/// 然后报"pid N still there",而它其实早就没了。
 pub fn is_alive(pid: i32) -> bool {
     if pid <= 0 {
         return false;
     }
-    if unsafe { nix::libc::kill(pid, 0) } == 0 {
-        return true;
+    if unsafe { nix::libc::kill(pid, 0) } != 0 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(nix::libc::EPERM);
     }
-    std::io::Error::last_os_error().raw_os_error() == Some(nix::libc::EPERM)
+    !is_a_zombie(pid)
+}
+
+/// 这个 pid 是不是一具还没被收走的尸体。
+///
+/// Linux 上读 `/proc/<pid>/stat` 的第三个字段。**不能按空白切**:那个文件的
+/// 第二个字段是 `(comm)`,而 comm 里可以有空格和括号 —— 得从**最后一个**
+/// `)` 之后再切,才有保证。
+///
+/// macOS 上没做这一步:那边的 PID 1 是 launchd,重挂上来的孤儿它都会收,
+/// 所以这个情形在那儿不出现。
+#[cfg(target_os = "linux")]
+fn is_a_zombie(pid: i32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        // 读不到 = 它的 `/proc` 项正在消失,也就是它正在被收走。上面那句
+        // `kill` 刚说过它还在,这里保守地信那一句。
+        return false;
+    };
+    stat.rfind(')')
+        .and_then(|end| stat[end + 1..].split_whitespace().next())
+        .is_some_and(|state| state == "Z")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_a_zombie(_pid: i32) -> bool {
+    false
 }
 
 #[cfg(target_os = "linux")]

@@ -866,12 +866,7 @@ fn serve_here(layout: &KeydLayout, args: ServeArgs, sock_path: PathBuf) -> Resul
         Roots::Single(KeydLayout::at(layout.root().to_path_buf()))
     };
 
-    // **先绑定,后写 pid 文件。** 绑定成功才是这个 socket 的守护进程;写在
-    // 前面的话,一个注定要失败的第二个 `serve`(比如 socket 已经被占了)
-    // 会先覆盖正在跑的那个的 pid 文件,再在退出时把它删掉 —— `stop` 之后
-    // 就只能对着一个活着的守护进程说 "nothing is running"。
-    let listener = server::bind(&sock_path)?;
-    let _pid_file = crate::daemon::service::PidFile::write(layout.pid_path())?;
+    let pid_path = layout.pid_path().to_path_buf();
 
     let state = std::sync::Arc::new(DaemonState::new(
         roots,
@@ -879,17 +874,40 @@ fn serve_here(layout: &KeydLayout, args: ServeArgs, sock_path: PathBuf) -> Resul
         autolock_from_secs(args.idle),
         args.allow_raw_signing,
     ));
-    let config = ServerConfig { sock_path, policy: state.policy().clone() };
+    let config = ServerConfig { sock_path: sock_path.clone(), policy: state.policy().clone() };
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
 
     let outcome = runtime.block_on(async move {
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
+        // **先把停机信号接上,再让 socket 出现。** 这两句的先后是这儿的重点。
+        //
+        // [`service::detach`] 判"起来了"用的是"那个 socket 文件不是原来那个
+        // 了",所以 `bind()` 一发生,父进程就打印 `listening on`、把终端还给
+        // 人。而在这之后、信号处理器装上之前收到一个 SIGTERM,走的是**默认
+        // 动作**:进程当场死掉 —— 不停清扫、不删 socket。症状是 `serve` 紧跟
+        // 着一句 `stop`:命令报成功,磁盘上却留着一具尸体(对着刚出现的 pid
+        // 文件立刻发 SIGTERM,修之前 30/30 次都留)。
+        //
+        // 所以 `bind` 和 pid 文件的写入都在下面。顺带把另一条也修了:起
+        // runtime 或装配 state 要是失败,现在磁盘上什么都不会留下。
+        //
+        // [`StopSignals::install`] 必须在这一层直接调,不能只把注册塞进一个
+        // `tokio::spawn` 里 —— spawn 出去的任务什么时候被轮询是调度器说了算,
+        // 那样等于没有提前。
+        let stop_signals = StopSignals::install()?;
         tokio::spawn(async move {
-            wait_for_a_stop_signal().await;
+            stop_signals.wait_for_a_stop_signal().await;
             let _ = stop_tx.send(true);
         });
+
+        // **先绑定,后写 pid 文件。** 绑定成功才是这个 socket 的守护进程;
+        // 写在前面的话,一个注定要失败的第二个 `serve`(比如 socket 已经被
+        // 占了)会先覆盖正在跑的那个的 pid 文件,再在退出时把它删掉 ——
+        // `stop` 之后就只会对着一个活着的守护进程说 "nothing is running"。
+        let listener = server::bind(&sock_path)?;
+        let _pid_file = crate::daemon::service::PidFile::write(pid_path)?;
 
         server::serve_on(state, config, stop_rx, listener).await
     });
@@ -981,32 +999,42 @@ fn stop(root: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-/// 等 SIGINT 或 SIGTERM。
+/// 装好了的停机信号。
 ///
-/// 两者都要:交互时人按的是 Ctrl-C,而 init 系统停服务时发的是 SIGTERM。
-/// 只处理一个的话,另一种情况会**直接把进程打死** —— 内存里的钥匙来不及
-/// 放掉,socket 文件也留在磁盘上,下一次启动还得先清那具尸体。
-async fn wait_for_a_stop_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
+/// 分成"装"和"等"两步,是因为**装的时刻**有约束:它必须早于 socket 文件
+/// 出现,否则 `bind()` 之后、装好之前那一段里来的 SIGTERM 会把进程按默认
+/// 动作打死。理由写在 [`serve_here`] 里。
+struct StopSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
 
-    let mut interrupt = match signal(SignalKind::interrupt()) {
-        Ok(stream) => stream,
-        Err(error) => {
-            tracing::error!("cannot listen for SIGINT: {error}");
-            return;
-        }
-    };
-    let mut terminate = match signal(SignalKind::terminate()) {
-        Ok(stream) => stream,
-        Err(error) => {
-            tracing::error!("cannot listen for SIGTERM: {error}");
-            return;
-        }
-    };
+impl StopSignals {
+    /// 让 SIGINT 和 SIGTERM 都走这个进程自己的停机路径。
+    ///
+    /// 两者都要:交互时人按的是 Ctrl-C,而 init 系统停服务时发的是 SIGTERM。
+    /// 只处理一个的话,另一种情况会**直接把进程打死** —— 内存里的钥匙来不及
+    /// 放掉,socket 文件也留在磁盘上,下一次启动还得先清那具尸体。
+    ///
+    /// **返回时处理器已经在内核里挂上了**,不是"等下挂上"。
+    fn install() -> Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
 
-    tokio::select! {
-        _ = interrupt.recv() => tracing::info!("stopping: SIGINT"),
-        _ = terminate.recv() => tracing::info!("stopping: SIGTERM"),
+        // 装不上的话**要失败**,不能像从前那样记一句 log 就往下走:那两个
+        // 流装不上,就等于这个守护进程没有停机路径,而它会一直跑下去、谁也
+        // 停不掉。现在这条路走在 socket 出现之前,所以失败什么也不留在盘上。
+        let interrupt = signal(SignalKind::interrupt())
+            .map_err(|error| KeydError::Misuse(format!("cannot listen for SIGINT: {error}")))?;
+        let terminate = signal(SignalKind::terminate())
+            .map_err(|error| KeydError::Misuse(format!("cannot listen for SIGTERM: {error}")))?;
+        Ok(Self { interrupt, terminate })
+    }
+
+    async fn wait_for_a_stop_signal(mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => tracing::info!("stopping: SIGINT"),
+            _ = self.terminate.recv() => tracing::info!("stopping: SIGTERM"),
+        }
     }
 }
 

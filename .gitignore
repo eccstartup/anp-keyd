@@ -1,2 +1,5 @@
 /target
 .DS_Store
+# 崩溃留下的 core dump。容器里的 cwd 就是挂进来的仓库根,所以守护进程一崩,
+# 它就落在仓库根上 —— 而一份 `anp-keyd` 的 core 里可能有信封的半边秘密。
+core

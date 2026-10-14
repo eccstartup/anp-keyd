@@ -49,7 +49,24 @@ impl Drop for TempDir {
     }
 }
 
+/// **一次只让一个 `probe` 跑。**
+///
+/// 平时看不出区别 —— 直到这个构建里编进了 `hardware-tpm`,而这台机器上又有
+/// 一颗 TPM(或 `swtpm`)。那时 `probe` 的硬件那一节会**真的往芯片上写**
+/// (建主键、封一个探针对象、再删掉),而芯片上**同时**能装载的对象是个很小
+/// 的数。这里有好几条测试各自起一个 `probe` 子进程,并行起来就互相顶:
+/// 实测过,`cargo test --features hardware-tpm` 连跑三次,中间那一次在芯片上
+/// 留下了一个删不掉的持久对象(报告里照实说了,但那是**并发**造成的,
+/// 不是那块芯片的毛病)。
+///
+/// 所以这把锁不是为了保护测试自己,是为了**让被测的东西不受测试的干扰** ——
+/// 一份体检报告的结论不该取决于同时有几个人在体检。
+static ONE_PROBE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn probe(root: &Path, did: Option<&str>) -> std::process::Output {
+    let _one_at_a_time = ONE_PROBE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut command = Command::new(env!("CARGO_BIN_EXE_anp-keyd"));
     command.arg("probe").arg("--root").arg(root);
     if let Some(did) = did {
@@ -82,20 +99,36 @@ fn machine(tag: &str) -> (TempDir, KeydLayout, String) {
 /// 硬件根就是补它的那一层。一台没有可用硬件根的机器只能兑现**旧的**承诺 ——
 /// 报成通过的话,"体检过了"这四个字会让人觉得缺口已经补上了。
 ///
-/// 所以现在的断言是:**别的每一节都照常报真话,而整体不通过,理由指名道姓
-/// 地写在屏幕上**。默认构建在这台机器上一根真后端都没有,于是这一条在默认
-/// 构建和 `hardware-*` 构建里都成立。
+/// # 但"这台机器没有硬件根"不是这条测试能假定的事
+///
+/// 一台装着真 TPM 2.0、或者起来了 `swtpm` 的机器上,`probe` 会报 USABLE,
+/// 而且**应该**退出 0 —— 那是同一份报告在说真话。把"没有根"写进断言,等于让
+/// 一份正确的报告变红(实测过:Linux + `--features hardware-tpm` + swtpm 上
+/// 红的正是这一条)。
+///
+/// 所以要断言的是那条规矩本身:**结论跟着硬件那一节走** —— 没有可用的根就
+/// 不许报通过,有的话就不许报失败。环境是环境,规矩是规矩。
 #[test]
 fn a_machine_with_a_key_reports_every_section_and_fails_on_the_hardware_root() {
     let (_dir, layout, did) = machine("clean");
     let output = probe(layout.root(), Some(&did));
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert_ne!(
-        output.status.code(),
-        Some(0),
-        "a machine with no usable hardware root must not report success: {stdout}"
-    );
+    // 这段原文出现 = 硬件那一节没过;没出现 = 过了。
+    let no_usable_root = stdout.contains("This machine has no usable hardware root");
+    if no_usable_root {
+        assert_ne!(
+            output.status.code(),
+            Some(0),
+            "a machine with no usable hardware root must not report success: {stdout}"
+        );
+    } else {
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "the report says a hardware root is usable, so the probe must not fail: {stdout}"
+        );
+    }
 
     // 内存那一节照常报,而且这篇报告里没有假话。
     assert!(stdout.contains("locked memory"), "{stdout}");
@@ -106,10 +139,12 @@ fn a_machine_with_a_key_reports_every_section_and_fails_on_the_hardware_root() {
     // 硬件那一节必须**指名道姓地说出该装什么、该改什么** —— "不通过"而
     // 不说怎么做,等于把人丢在原地。
     assert!(stdout.contains("hardware root (M5)"), "{stdout}");
-    assert!(
-        stdout.contains("This machine has no usable hardware root"),
-        "the report must say, in words, what the conclusion is: {stdout}"
-    );
+    if no_usable_root {
+        assert!(
+            stdout.contains("This machine has no usable hardware root"),
+            "the report must say, in words, what the conclusion is: {stdout}"
+        );
+    }
     assert!(
         stdout.contains("--features hardware-se") || stdout.contains("--features hardware-tpm"),
         "the report must name the feature to build with: {stdout}"

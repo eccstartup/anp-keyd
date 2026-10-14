@@ -6,32 +6,36 @@
 M0–M5 的代码已经写完并提交,不在这个文件里。剩下来的是三件**不能在这里做完**
 的事(只有一台机器、没有签名身份)、一件**做不了**的事、和一份对照表。
 
+原来排在第一条的"TPM 后端从来没有被编译过"**已经做完了**(2026-10-14)——
+记录留在下面,因为它是"核对源码"和"验过"之间那道差距的实证。
+
 ---
 
-## 一、TPM 后端:从来没有被编译过
+## 一、TPM 后端:✅ 已在 Linux 上编译并端到端验过(2026-10-14)
 
-`src/keystore/hardware/tpm.rs` 是**唯一一个没有编译过的文件**。
+`cargo test --features hardware-tpm` 全绿(含新增的 `tests/tpm.rs` 三条),
+`swtpm` 的端到端也走通了:`keygen --hardware tpm` → `probe` USABLE →
+`publish` → `serve` → `unlock` → `sign` 出真的 RFC 9421 头;`swtpm` 重启
+之后信封照旧打得开;`tpm2_evictcontrol` 删掉密封对象之后解锁**响亮地失败**
+(`HardwareMissing`),信封一个字节没动 —— **没有静默降级**。
 
-它是照着 `~/.cargo/registry/.../tss-esapi-7.7.0/` 的源码逐名核对写的 ——
-每一个类型、方法、字段、变体都对着源码查过(`set_sessions` 收的是**元组**、
-`SymmetricDefinitionObject` 是带字段的枚举、`RsaExponent::ZERO_EXPONENT`
-而不是 `default()`……),`rustfmt` 也解析得通。但**没有编译过**。
+**"逐个对着源码核对"漏掉了三样,而三样都只在真信封上才露头**(都不是类型错,
+编译器一条也拦不住):
 
-为什么编译不了:这台开发机上没有 Linux 交叉编译工具链 ——
-`cc-rs: failed to find tool "x86_64-linux-gnu-gcc"`,而 `tss-esapi-sys 0.6.0`
-的 `build.rs` 还要 `pkg-config` 找 `tss2-*`。装一套多 GB 的交叉工具链不该是
-顺手做的事。
+1. `tpm2-tss 3.2.1` 的 `Esys_TR_FromTPMPublic_Finish` 有一处没查空指针的
+   解引用,而密码会话恰好就是 `NULL` —— 带会话调 `tr_from_tpm_public` **段
+   错误**,守护进程直接 SIGSEGV(139)。修法是那次调用刻意不带会话。
+2. `seal_probe` 只做到 `EvictControl` 就返回,报告里却写着 "read back" ——
+   `TPM2_Unseal`(也就是 `open` 唯一真正依赖的命令)从来没被任何一次体检
+   碰过。
+3. 芯片上**同时**装载的对象很少(swtpm 尤其少),`create_primary` 每调一次
+   占一格。峰值超了报 `0x902 out of memory for object contexts`,而那句话
+   指向"这颗 TPM 不能持久化"。
 
-**第一个在 Linux 上构建它的人必须先做的两件事:**
+细节在 `src/keystore/hardware/tpm.rs` 的模块头(逐条带注释);重跑验证的命令
+在 `tests/tpm.rs` 的文件头。
 
-1. `cargo test --features hardware-tpm` —— 至少让它编过一遍。
-2. 用 `swtpm` 走一遍端到端:`TPM2TOOLS_TCTI=swtpm:... anp-keyd probe` 看
-   那一节报 USABLE,然后 `keygen --hardware tpm` → `unwrap` → 删掉密封对象
-   → 必须打不开。`swtpm` 能在本机模拟,所以这条路是**可以**真测的。
-
-在那之前,文件头那句"从来没有被编译过"就是它的准确状态,别删。
-
-**已知的一处平台陷阱**(写代码时就避开了,记在这儿免得后人踩):持久化句柄
+**还剩一处平台陷阱**(写代码时就避开了,记在这儿免得后人踩):持久化句柄
 `0x81000000`–`0x81FFFFFF` 里,`>= 0x81800000` 那一段属于
 `TPM2_PLATFORM_PERSISTENT`,要的是 **platformAuth** 而不是 owner auth。所以
 `handle_for` 把句柄掩进 `0x81000000..=0x817FFFFF`。

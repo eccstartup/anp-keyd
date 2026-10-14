@@ -387,16 +387,22 @@ fn verify_method(
 /// 这一层是整个授权模型的地基:uid 是它给的。它一旦有降级路径,降级的那条
 /// 就是"任何人都能连上来签"。
 ///
-/// 构造方式是最朴素的那种:一对 socketpair,把对端关掉,于是
-/// `getpeereid` / `SO_PEERCRED` 真的失败了 —— 不是模拟失败,是真的取不到。
+/// 构造方式是最朴素的那种:**一个从没有对端的 Unix socket**,于是内核真的
+/// 答不出来 —— 不是模拟失败,是真的取不到。
+///
+/// 注意这里不是"把 socketpair 的一头关掉":两端都答得出来(凭证在连接建立
+/// 时就冻结了,人走了它还在)。得是一个从没连上过的 socket。
+///
+/// **两个平台"答不出来"的样子不一样,而这一条正是要它们归一:**
+/// - macOS:`getpeereid` / `SO_PEERCRED` 报 ENOTCONN,直接是一条错误;
+/// - Linux:`SO_PEERCRED` **成功返回** `{pid: 0, uid: -1, gid: -1}` 这个哨兵
+///   (实测,内核 6.x),得由 `linux_creds` 自己认出来再转成同一个拒绝。
+///
+/// 所以这条测试在两边是同一个断言、同一个变体 —— 如果哪天 Linux 那边又
+/// 开始"成功"返回一个 uid,红的会是这里。
 #[test]
 fn a_connection_whose_credentials_cannot_be_read_is_refused() {
     // 一个**没有对端**的 Unix socket。
-    //
-    // 注意这里不是"把 socketpair 的一头关掉":macOS 上 `getpeereid` 对已关闭的
-    // 对端照样答得出来(凭证是连接建立时抓的,人走了它还在)。要真的让内核
-    // 答不出来,得是一个从没连上过的 socket —— 于是 `getpeereid` / `SO_PEERCRED`
-    // 返回 ENOTCONN,而这正是那个失败分支。
     let raw = nix::sys::socket::socket(
         nix::sys::socket::AddressFamily::Unix,
         nix::sys::socket::SockType::Stream,

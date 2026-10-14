@@ -26,7 +26,8 @@ Signature: sig1=:VwRcADsdxfIJ5rQAXCXX3ygFsAP3l1ho+gdpNxcHzlZCdx/mef9yKzHgy9P1QzV
 动这两样东西之前请先读 [docs/DESIGN.md](docs/DESIGN.md) 第三节。
 
 **硬件根(信封的第三路熵)已经写好了,但默认构建里没有。** macOS 那一半在真
-芯片上验过 ECDH;Linux/TPM 那一半**从来没有被编译过**。细节在下面的
+芯片上验过 ECDH;Linux/TPM 那一半**已经在 Linux 上编译过、也跑过 `swtpm` 的
+端到端**(2026-10-14)。细节在下面的
 [硬件根](#硬件根)一节、[docs/DESIGN.md](docs/DESIGN.md) 第九节,以及还没做完
 的部分(第十节)。
 
@@ -457,9 +458,11 @@ cargo clippy --all-targets --all-features
 
 `hardware-se` / `hardware-tpm` 那两条路不在 `--all-features` 里,因为
 `#[cfg(target_os)]` 挡着:一台机器只能编出其中一条。SE 的 ECDH 在真芯片上
-验过;**TPM 那条从来没被编译过**,见 [docs/DESIGN.md](docs/DESIGN.md) 第十节。
+验过,**持久化还差签名身份**;TPM 那条在 Linux 上编过、也跑过 `swtpm` 的
+端到端(`tests/tpm.rs`,三条都标了 `#[ignore]`,要 `-- --ignored` 才跑,
+见那个文件头)。两边各自的缺口见 [docs/DESIGN.md](docs/DESIGN.md) 第十节。
 
-五类测试,失败的含义不一样:
+六类测试,失败的含义不一样:
 
 | 文件 | 回答的问题 | 红了意味着 |
 |---|---|---|
@@ -467,6 +470,7 @@ cargo clippy --all-targets --all-features
 | `tests/cli.rs` | 真起一个二进制、真在一个终端上敲命令 | 给人看的那一层坏了 |
 | `tests/signature_end_to_end.rs` | 整条路走通没有 | 接口对不上了 |
 | `tests/negative.rs` | **产品承诺的那十件事今天还成立吗** | **有人把一道墙拆了** |
+| `tests/tpm.rs` | **真芯片上:封得住、开得回、根没了就拒绝** | 第三路熵那一层坏了 |
 | `tests/vectors/` + `tests/vectors.rs` | 外部标准还认不认我们的实现 | 先怀疑实现,别改向量 |
 
 另有四个单一命题,每个一个文件:`tests/probe.rs`(体检说的都是真的)、

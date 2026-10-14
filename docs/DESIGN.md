@@ -481,12 +481,15 @@ SE 私钥**唯一的持久化机制就是钥匙串**,写钥匙串要 `applicatio
 
 ## 十、还没有做的
 
-- **TPM 后端从来没有被编译过。** `src/keystore/hardware/tpm.rs` 是照着
-  `tss-esapi 7.7` 的源码逐名核对写的,也在 `rustfmt` 下解析得通,但**这台
-  开发机上没有 Linux 交叉编译工具链**(`cc-rs` 找不到 `x86_64-linux-gnu-gcc`,
-  `tss-esapi-sys` 还要 `pkg-config`)。第一个在 Linux 上构建它的人**必须**先
-  `cargo test --features hardware-tpm`,再用 `swtpm` 走一遍端到端,然后才谈得
-  上相信它。文件头也是这么写的。
+- ~~**TPM 后端从来没有被编译过。**~~ **2026-10-14 补上了。** `cargo test
+  --features hardware-tpm` 全绿(含新增的 `tests/tpm.rs`),`swtpm` 的端到端也
+  走通了。**而"逐个对着 `tss-esapi 7.7` 源码核对"确实漏掉了三样,三样都是
+  运行时的、编译器一条也拦不住**:带会话调 `tr_from_tpm_public` 会**段错误**
+  (`tpm2-tss 3.2.1` 的一处空指针解引用 × 密码会话恰好是 `NULL`);`seal_probe`
+  报告里写着 "read back" 却从来没调过 `TPM2_Unseal`;以及芯片上同时装载的
+  对象很少,而 `create_primary` 每次都占一格,峰值超了会报一句和真正的原因
+  毫不相干的话。三条都在 `src/keystore/hardware/tpm.rs` 的模块头里。
+  这一条留着不删,是因为它正是"核对过"和"验过"之间那道差距的实证。
 - **SE 那半边的持久化没验过。** ECDH 那条路在真芯片上验过(单元测试),
   但"SE key 留在钥匙串里、进程重启之后还开得了"需要签名身份,而这台机器上
   `security find-identity -v -p codesigning` 是 **0 个**。没有身份就只能停在

@@ -65,8 +65,28 @@ fn peer_pid(stream: &UnixStream) -> Option<i32> {
 #[cfg(target_os = "linux")]
 fn linux_creds(stream: &UnixStream) -> Result<nix::sys::socket::UnixCredentials> {
     use nix::sys::socket::sockopt::PeerCredentials;
-    nix::sys::socket::getsockopt(stream, PeerCredentials)
-        .map_err(|e| KeydError::PeerCredentialUnavailable(format!("SO_PEERCRED failed: {e}")))
+    let creds = nix::sys::socket::getsockopt(stream, PeerCredentials)
+        .map_err(|e| KeydError::PeerCredentialUnavailable(format!("SO_PEERCRED failed: {e}")))?;
+
+    // **Linux 用哨兵值表示"没有对端",不是用错误。** 在一个从没连上过的
+    // AF_UNIX socket 上,`SO_PEERCRED` **成功返回**,内容是
+    // `{pid: 0, uid: -1, gid: -1}` —— 实测如此(内核 6.x / aarch64),而
+    // macOS 的 `getpeereid` 在同样的构造上报 ENOTCONN。不认这个哨兵的话,
+    // 我们就把"拿不到身份"当成了"拿到了一个 uid = 4294967295 的对端"。
+    //
+    // 授权那一层碰巧会拒掉它(真进程不可能有这个 uid),但那是**碰巧**:
+    // [`peer_identity`] 的契约是"取不到 uid 就报错,不返回任何默认值"。
+    // 靠上一层碰巧拦住,和真的报错,是两件事 —— 而且失败时的审计行会变成
+    // `uid=4294967295 gid=4294967295 pid=0` 这种没人看得懂的乱码。
+    //
+    // `(uid_t)-1` 是 POSIX 的无效 uid:内核不允许把进程设成它,所以拿它当
+    // "没有"的哨兵是可靠的,不会和任何一个真 uid 撞。
+    if creds.uid() == u32::MAX {
+        return Err(KeydError::PeerCredentialUnavailable(
+            "SO_PEERCRED reported no peer (uid -1, pid 0): the socket was never connected".into(),
+        ));
+    }
+    Ok(creds)
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -576,9 +596,11 @@ mod tests {
     /// 真拿内核给的 audit token 去问一次代码身份。
     ///
     /// 两个答案都算过:
-    /// - `Some(cdhash)`:测试二进制有签名(cargo 在 arm64 上默认 ad-hoc 签),
-    ///   这时摘要必须非空 —— 空摘要要是被当成"有身份",白名单就形同虚设。
-    /// - `None`:没有签名。是一个确定答案,policy 会拒。
+    /// - `Some(身份)`:摘要必须非空 —— 空摘要要是被当成"有身份",白名单就
+    ///   形同虚设。**是哪一种身份看平台**:macOS 上 cargo 默认 ad-hoc 签,
+    ///   内核答得出 `cdhash`;Linux 上没有代码签名,答的是可执行文件自己的
+    ///   `sha256`。断言的是"这个平台上该答的那一种",不是 macOS 那一种。
+    /// - `None`:没有身份。是一个确定答案,policy 会拒。
     ///
     /// 但**不能是 `Err`**:那意味着我们连问都没问成,而那会让整个第三层
     /// 在真机上永远不可用。
@@ -590,11 +612,15 @@ mod tests {
         let identity = binary_identity(&a, &peer).expect("asking must not fail");
 
         if let Some(identity) = identity {
+            // 第三层在 macOS 上经 `SecCode` 拿 cdhash,在 Linux 上经
+            // `/proc/<pid>/exe` 拿文件摘要 —— `pin()` 的两条分支。
+            let expected =
+                if cfg!(any(target_os = "macos", target_os = "ios")) { "cdhash" } else { "sha256" };
             let (kind, digest) = identity.pin();
-            assert_eq!(kind, "cdhash");
+            assert_eq!(kind, expected);
             assert!(!digest.is_empty(), "an empty digest is not an identity");
             let text = identity.audit_label();
-            assert!(text.starts_with("cdhash="), "{text}");
+            assert!(text.starts_with(&format!("{expected}=")), "{text}");
         }
     }
 
