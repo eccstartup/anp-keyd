@@ -157,8 +157,9 @@ anp-keyd sign --did … --method POST --url https://… \
   --nonce "$(jq -r .nonce request.json)"
 ```
 
-它同时出现在两处,所以守护进程没法替你挑:它只会把你给的这个值原样放进
-`@signature-params`。不给就一个都不放,不会自己编一个。
+它同时出现在两处,所以守护进程没法替你挑:你给了,它就把这个值原样放进
+`@signature-params`;不给,签名库里会随机挑一个 —— 但那个值只活在签名头上,
+不会进你的请求体,两边自然对不上。所以**要两处同值,就必须由调用方给**。
 
 agent 要证明自己是谁,手上得有 `publish` 出来的那份文档。它也从 socket 上
 取,而且**不用解锁** —— 那份文档本来就是给外面看的:
@@ -344,8 +345,9 @@ anp-keyd keygen --spec mybot.spec.json --hardware secure-enclave
 
 **Linux/TPM 没有这道门槛。** 走 `/dev/tpmrm0`,不要 entitlement,可选绑 PCR
 (**默认不绑** —— 绑了的话内核或固件一升级就把用户锁在门外)。`swtpm` 能在
-本机把它模拟出来,所以那条代码路径是可以真测的 —— 但**它到目前为止还没有在
-任何 Linux 机器上编译过**,见 [docs/DESIGN.md](docs/DESIGN.md) 第十节。
+本机把它模拟出来,所以那条代码路径是可以真测的 —— 2026-10-14 已经在 Linux 上
+编过、也跑通了 `swtpm` 的端到端(见 [docs/DESIGN.md](docs/DESIGN.md) 第十节,
+那里记着三个只有运行时才露头的 bug)。
 
 ## 磁盘布局
 
