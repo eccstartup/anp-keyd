@@ -15,6 +15,11 @@ Signature: sig1=:VwRcADsdxfIJ5rQAXCXX3ygFsAP3l1ho+gdpNxcHzlZCdx/mef9yKzHgy9P1QzV
 **什么时候会想要这个:** 你想让一个 agent 替你去访问别人的服务,但你不愿意
 把身份交给它。你给它的是一条"请求签名"的通道,而不是那把钥匙。
 
+想从头读一遍,有文档站:[anp-keyd.vercel.app](https://anp-keyd.vercel.app)。
+那儿的正文是为网站重写的,和这一份不是同一套 —— 这里要的是"拿起来就干",
+那儿要的是"先看明白";设计说明则是构建时从 [docs/DESIGN.md](docs/DESIGN.md)
+原样引进去的,不重写。
+
 [RFC 9421]: https://www.rfc-editor.org/rfc/rfc9421
 
 ---
