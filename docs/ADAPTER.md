@@ -592,21 +592,36 @@ connectx 有两个接缝,要挑对的那一个:
    形状就是 §3.1 / §3.2 那两条;而且 `AnpIdentitySigner` 已经是"custody 在别处"的
    现成先例,keyd 照它再做一份即可。注册不发 `challenge_signature`。**剩下要单独想
    的只有一处**:`sign_document_proof` 收调用方构造的文档,和 keyd 的不变量 3 错位。
-   另外 `../anp` 这个 path 依赖本机没有 checkout,**1.0.3 ↔ 1.0.6 的签名基逐字节比对
-   还没跑过** —— 见下一条。
-3. **上游版本错位,现在量准了。** 整条 awiki(Rust CLI 的 path 依赖 `=1.0.3` +
-   Python 服务端的 wheel `anp-1.0.3`)都在 **1.0.3**,只有 anp-keyd 钉的是
-   **`=1.0.6`**。差的是**一个 minor 里的补丁版**,但不能靠"补丁版不会动签名基"来推
-   —— 要把 1.0.3 的 `serialize_signature_params` / `build_signature_base` 和 1.0.6 摆
-   一起看一遍,或者直接拿 1.0.3 拼出来的基和 keyd 拼的比一次。**这是 §十二 里现在最
-   实的一条未核实项。**
+3. **上游版本错位 —— 已核,签名基逐字节一致,不构成风险。** 整条 awiki(Rust CLI 的
+   path 依赖 `=1.0.3` + Python 服务端的 wheel `anp-1.0.3`)都在 **1.0.3**,只有
+   anp-keyd 钉 **`=1.0.6`** —— 差一个补丁版。把 keyd 真正**产字节**的三个入口各自
+   比了一遍(`~/code/github/anp` 里有 1.0.3 那个 pin 的 commit `096ca3e`,与 crates.io
+   上的 1.0.6 对拉):
+
+   | keyd 调的 | 住在哪 | 1.0.3 ↔ 1.0.6 |
+   |---|---|---|
+   | `prepare/complete_http_signature_headers`、`build_content_digest` | `authentication/http_signatures.rs` | **两份文件逐字节相同**(548 行,`diff` 空) |
+   | `compute_multikey_fingerprint` | `authentication/did_wba.rs` | **不在差异清单里** |
+   | `prepare/complete_w3c_proof` | `proof/mod.rs:103,170` | 文件有差异,但改动在**验证那一支**(行 270 之后,紧挨 `public_key.verify_message`) |
+
+   `proof/mod.rs` 那处改动是"验证时也认 multibase base58(`z…`)的 `proof_value`",
+   上游自己写着 *"Keep legacy base64url **signing/generation** bytes unchanged"* ——
+   **生成字节没动**。所以 1.0.3 和 1.0.6 拼出来的基是同一串字节,版本错位**不动签名
+   基**。其余差异与签名无关:`device_manifest.rs`(253 行)、`did_resolver.rs`(135 行)、
+   新模块 `did_web.rs` 都是 did:web;`group_e2ee/*` 是 rusqlite 事务 API 改写加一个
+   `prepare_recovery`。唯一值得记一笔的是 `verification_methods.rs`:1.0.6 把
+   `Multikey` 按 multicodec 前缀分流(`0xec 0x01` → X25519,否则 Ed25519),上游注释
+   写着"agreement keys must never enter the signing parser" —— **对 keyd 是空操作**:
+   keyd 的签名键是 `0xed 0x01` 的 `Multikey`,agreement 那一档用的是
+   `X25519KeyAgreementKey2019` 而不是 `Multikey`,而且这个 build **根本不做 X25519
+   密钥**(`src/did/document.rs:58`)。
 4. **签名基 —— 已核到序列化这一层;还差拿真对端跑一次。** 覆盖面、参数顺序
    (`created;expires;nonce;keyid`,两边都不带 `alg`)、`@signature-params` 那一行的拼法、
    行分隔 `\n`,以及 300 秒的 `expires`,四种拼法(Rust `anp` crate / Python 服务端 /
-   connectx 的 JS)逐字节相同。**已知一处分岔**:`@authority` 对显式默认端口 `:443` 的
-   处理不一致(connectx 用 WHATWG `URL.host`,吃掉它;keyd 从 URL 文本切,保留它)。
-   加上上面第 3 条那道版本差 —— **必须拿真对端(以及 1.0.3 那份)跑一次,不能靠
-   "都按 RFC 9421 写的"来推。**
+   connectx 的 JS)逐字节相同,而且第 3 条已排掉"两边 `anp` 版本不同"这个变量。
+   **已知一处分岔**:`@authority` 对显式默认端口 `:443` 的处理不一致(connectx 用
+   WHATWG `URL.host`,吃掉它;keyd 从 URL 文本切,保留它)。**仍然必须拿真对端跑一次,
+   不能靠"都按 RFC 9421 写的"来推。**
 5. **§3.3 那个岔口 —— 是一条前瞻性的线,不是眼下的拦路石。** 核过两个客户端
    (connectx、awiki-cli-rs2),**没有一个发那个挑战签名**,所以三条路里"不签"这条
    今天零成本。要拍的不是"现在怎么办",是"**将来对端把它翻成必需时怎么办**" ——

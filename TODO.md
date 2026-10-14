@@ -60,7 +60,7 @@ awiki-open-server 的注册,除了 DID 文档自签,还要一次一次性挑战�
 - **验收是 §十一 那五条反证。** 核心是第一条:**停掉守护进程,connectx 必须失败**
   —— 不然只是多了一条可选路径,不叫抽出来了。
 
-## 四、适配层:动手前要核实的(这次已经核掉三条)
+## 四、适配层:动手前要核实的(这次已经核掉四条)
 
 1. **DID 推导 —— 已核对,两边一致。** connectx 的 `ed25519Fingerprint`(RFC 7638
    JWK 指纹 → SHA-256 → base64url 无填充 → `e1_`)和守护进程走的 `anp` 上游
@@ -75,11 +75,16 @@ awiki-open-server 的注册,除了 DID 文档自签,还要一次一次性挑战�
    **还剩一处会对不上:** `@authority`。connectx 用 WHATWG `URL.host`,显式写出默认
    端口时会把 `:443` 吃掉;守护进程无网络构建下是从 URL 文本里切出来的,会**保留**
    `:443`。平时没人那么写,但"差一个字符就是另一条签名"正是这类地方的代价。
-3. **上游版本错位 —— 现在量准了,但还没比过。** 整条 awiki 都在 `anp 1.0.3`(Rust CLI
-   的 path 依赖 `=1.0.3` + Python 服务端的 wheel `anp-1.0.3`),只有 anp-keyd 钉
-   `=1.0.6`。差的是一个补丁版,但**不能靠"补丁版不会动签名基"来推** —— 把 1.0.3 拼的
-   基和 keyd 拼的比一次才算数。`../anp` 那个 path 依赖本机没有 checkout,要比先得
-   有那份源码。**这是第四节里现在最实的一条。**
+3. **上游版本错位 —— 已核掉,签名基逐字节一致。** 整条 awiki 都在 `anp 1.0.3`
+   (Rust CLI 的 path 依赖 `=1.0.3` + Python 服务端的 wheel `anp-1.0.3`),只有 anp-keyd
+   钉 `=1.0.6`。拿 1.0.3 那个 pin 的 commit(`096ca3e`)和 crates.io 上的 1.0.6 对拉了
+   keyd **真正产字节**的三个入口:`http_signatures.rs`(签名基 + `content-digest`)
+   **两份文件逐字节相同**;`compute_multikey_fingerprint` 所在的 `did_wba.rs` 不在差异
+   清单里;唯一有差异且参与拼基的 `proof/mod.rs`,改动落在**验证那一支**,上游自己
+   写着 *"Keep legacy base64url signing/generation bytes unchanged"*。**所以那一个补丁
+   版的差不动签名基** —— 结论和比对过程记在 ADAPTER §十二 第 3 条。**这条关掉之后,
+   这一节里剩下的字节级问题就只剩第 2 条那处 `@authority`**,而它靠"拿真对端跑一次"
+   来收(§三 那两件客户端的验收,ADAPTER §十一)。
 4. **`LIST_KEYS` 要不要报出密钥角色。** 判断仍是"不加",而且新证据是往这个方向弱的:
    `IdentitySigner` 里确实有一套角色词表(`DeviceAssertion` / `Authentication` /
    `KeyAgreement` / `RootControl`),但它**从文档里推**(读 `proof.verificationMethod`
