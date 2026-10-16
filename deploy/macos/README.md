@@ -57,6 +57,9 @@ launchd startup and limited read-only acceptance), the human may run:
 sudo bash deploy/macos/setup-local.sh YOUR_HUMAN_ACCOUNT VERIFIED_SHA256
 ```
 
+The setup script already runs `launchctl bootstrap`; do not bootstrap it again.
+To inspect a loaded job use `launchctl print system/org.anp-keyd.local`.
+
 Enter the sudo password only in your own terminal. Run from a human-controlled
 checkout after reviewing the scripts and exact binary digest. The script refuses
 existing/partial installations; it is not an update or repair tool. The longer
@@ -155,3 +158,25 @@ Recorded 2026-10-16 before host installation: macOS default 494 tests, MCP 506
 tests, six installer policy tests, strict Clippy and local release build passed.
 Rust 1.90 Linux container regression passed 492 default tests, one explicit fixture
 generator and 124 boundary checks. Live macOS installation/UI checks remain pending.
+
+After installation, additional bounded runtime checks can be run separately:
+
+```sh
+sudo python3 deploy/macos/test-runtime.py
+```
+
+This uses the existing accounts with a separate temporary configuration, state and
+daemon under a new `/Library/ANPKeydChecks-*` directory. It tests Agent task-port
+access denial, socket cleanup/restart boot epochs, and a fake root listener whose
+socket has forged expected ownership and mode. The native unlock client must
+reject it without showing a window or sending request/secret bytes. Temporary
+files are removed after stopping that temporary daemon; installed launchd state,
+keys and configuration are not changed. This does not test actual key/grant
+restart invalidation, full escape resistance or native UI appearance.
+
+Live installation evidence, 2026-10-16: operator setup reported administrator
+service authentication and UID 601 PTY/admin-socket/state-read denials. Independent
+read-only follow-up confirmed launchd `running` as UID 600, daemon `OK`,
+`boot_epoch=1`, and healthy audit projection. A subsequent bootstrap error 5 was
+a duplicate load; the existing job remained healthy. Extended runtime checks and
+interactive UI/key tests remain pending.
