@@ -10,12 +10,7 @@
 //! 重连"会把一个已经失去意义的签名请求重放上去 —— 签名不是幂等的。
 //! 调用方要重试,自己重连,并且**自己知道重试的是哪一次签名**。
 //!
-//! ## 口令为什么是 `String`
-//!
-//! [`Client::unlock`] 收的是普通 `String`。调用方(CLI)负责在读完 TTY 后
-//! 立刻交给 `Zeroizing`,这里不收 `Zeroizing<String>` 是因为**这个 crate
-//! 的公开 API 不该强迫别人引入 zeroize**。代价是这一层多一次拷贝,收益是
-//! 别人抄得动。
+//! 解锁请求和编码缓冲使用可清零封装。v1 尚未提供受保护服务端认证。
 
 use std::collections::BTreeMap;
 use std::os::unix::net::UnixStream;
@@ -77,7 +72,7 @@ impl Client {
         match self.call(Request::Unlock {
             did: did.to_string(),
             kid: kid.map(str::to_string),
-            passphrase: passphrase.to_string(),
+            passphrase: zeroize::Zeroizing::new(passphrase.to_string()),
         })? {
             Response::Ok => Ok(()),
             other => Err(unexpected("unlock", &other)),

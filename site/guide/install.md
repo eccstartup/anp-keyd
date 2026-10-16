@@ -13,7 +13,7 @@ cargo install --path .
 ::: warning 一条纪律
 凡是需要口令的命令,都要求一个**真的控制终端**。cron、CI、systemd 的 `ExecStartPre`、被 agent 拉起来的子进程都在这一条外面 —— 这是设计,不是遗漏。
 
-口令从 `/dev/tty` 读,不走命令行参数、不走环境变量、不走 stdin、不走 socket。
+口令从 `/dev/tty` 读,不走命令行参数、不走环境变量、不走 stdin；CLI 解锁时会经过 v1 socket。TTY 不是人类身份认证。
 :::
 
 ## 只在特定构建里存在的几个

@@ -17,6 +17,8 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 
+use zeroize::Zeroizing;
+
 use crate::error::{KeydError, Result};
 use crate::keystore::record::KeyAlgorithm;
 
@@ -30,17 +32,8 @@ pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 /// 请求体上限。比整帧小,好让头字段一定有地方放。
 pub const MAX_BODY: usize = 4 * 1024 * 1024;
 
-/// 挑战字节的上限。**这条上限就是边界本身。**
-///
-/// 挑战签名这条路([`SignRequest::Challenge`])开得下去,全靠这个数:256
-/// 字节**比任何一份 DID 文档、也比任何一条签名基都小**,所以它结构上长不成
-/// "把我这份文档签了" —— 而那正是 `docs/ADAPTER.md` §3.2 担心的滥用。调大它,
-/// 打开的就不是一条更宽的挑战通道,而是 §十 关掉的那条 [`SignRequest::Raw`]。
-///
-/// 值和 `sign::rfc9421::MAX_NONCE_LEN` 对齐不是巧合:两个都是"调用方给的、
-/// 要进签名的一条不透明字节"的长度上限(base64url 编 32 字节的随机值才 43 个
-/// 字符,任何会真实出现的挑战都在这之内)。差别在它们各自的去处:nonce 进的是
-/// 我们重建出来的签名基,而这些字节**本身就是被签的内容**。
+/// Challenge resource limit only. A DID proof signing input is 64 bytes,
+/// so this cap provides no purpose isolation. Development mode only.
 pub const MAX_CHALLENGE_LEN: usize = 256;
 
 // —— 消息类型 ——
@@ -60,9 +53,8 @@ pub const ERR: u8 = 0x81;
 /// 的请求",是**根本不存在的一个类型** —— 它只在一个进程自己的 `/dev/tty` 上
 /// 发生,由坐在终端前的人操作(见 `ops::export` 开头那一节)。
 ///
-/// 这条性质挡的不是"agent 不知道密码",而是"agent 够不到那条通道":一个被
-/// 注入的 agent 完全可以编一个像样的提示框骗人把密码敲进去,但只要导出不是
-/// socket 上的消息类型,它**送不到守护进程**。
+/// 没有 socket 导出消息，但这不阻止同 UID 进程调用本地维护命令。
+/// `/dev/tty` 不是人类身份凭证，受保护管理域仍需单独实现。
 ///
 /// 所以:加一个类型到这张表里,等于改变整个授权模型。它必须是一次看得见的
 /// 决定,而不是顺手写下的下一个编号。
@@ -226,9 +218,8 @@ impl KeydError {
 
 /// `SIGN` 的请求体。
 ///
-/// 这是本设计里最重要的一个决定,所以它有两个变体而不是一个 `Vec<u8>`:
-/// 主路径给的是**结构化字段**,签名基由守护进程自己拼;只有 `Raw` 才是
-/// "你给字节我签",而那条路默认关着。
+/// 主路径提供结构化字段，由 daemon 重建签名基。
+/// Raw 与 Challenge 均签调用方原字节，仅供显式开发兼容。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignRequest {
     /// 主路径。守护进程从这里重建签名基,并自己决定覆盖面下限。
@@ -291,13 +282,27 @@ pub struct KeySummary {
     pub algorithm: KeyAlgorithm,
 }
 
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unlock { did, kid, .. } => f.debug_struct("Unlock")
+                .field("did", did).field("kid", kid).field("passphrase", &"[REDACTED]").finish(),
+            Self::Sign(sign) => f.debug_tuple("Sign").field(sign).finish(),
+            Self::ListKeys => f.write_str("ListKeys"),
+            Self::Status => f.write_str("Status"),
+            Self::Lock { did, kid } => f.debug_struct("Lock").field("did", did).field("kid", kid).finish(),
+            Self::GetDocument { did } => f.debug_struct("GetDocument").field("did", did).finish(),
+        }
+    }
+}
+
 /// 一条连接上收到的请求。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Request {
     ListKeys,
     Sign(SignRequest),
     /// 解锁一把钥匙。`passphrase` 是**明文**,只在内存里活到用完为止。
-    Unlock { did: String, kid: Option<String>, passphrase: String },
+    Unlock { did: String, kid: Option<String>, passphrase: Zeroizing<String> },
     /// 锁上。**两级**:`did` 为空表示全锁;只给 `did` 表示把这个 DID 底下
     /// 解锁着的全放掉;再给 `kid` 就是精确到一把。
     Lock { did: Option<String>, kid: Option<String> },
@@ -375,13 +380,13 @@ pub fn write_response<W: Write>(writer: &mut W, response: &Response) -> Result<(
 }
 
 pub fn write_request<W: Write>(writer: &mut W, request: &Request) -> Result<()> {
-    let payload = encode_request(request)?;
+    let payload = Zeroizing::new(encode_request(request)?);
     write_frame(writer, &payload)?;
     writer.flush()?;
     Ok(())
 }
 
-fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
+fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Zeroizing<Vec<u8>>>> {
     let mut header = [0u8; 4];
     match reader.read_exact(&mut header) {
         Ok(()) => {}
@@ -402,7 +407,7 @@ fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
         )));
     }
 
-    let mut payload = vec![0u8; len];
+    let mut payload = Zeroizing::new(vec![0u8; len]);
     reader.read_exact(&mut payload).map_err(|e| {
         if e.kind() == io::ErrorKind::UnexpectedEof {
             // 说了 len 字节却只给了一半就断 —— 这不是干净关闭。
@@ -446,7 +451,7 @@ fn decode_request(payload: &[u8]) -> Result<Request> {
             let mut c = Cursor::new(body);
             let did = c.string16()?;
             let kid = c.opt_string16()?;
-            let passphrase = c.string16()?;
+            let passphrase = Zeroizing::new(c.string16()?);
             c.expect_end("UNLOCK")?;
             Ok(Request::Unlock { did, kid, passphrase })
         }
@@ -858,12 +863,12 @@ impl<'a> Cursor<'a> {
 /// 的音高(field 长过 u16)在写入这一刻就报错,而不是在线上被悄悄截断。
 #[derive(Default)]
 struct Encoder {
-    out: Vec<u8>,
+    out: Zeroizing<Vec<u8>>,
 }
 
 impl Encoder {
     fn with_capacity(capacity: usize) -> Self {
-        Self { out: Vec::with_capacity(capacity) }
+        Self { out: Zeroizing::new(Vec::with_capacity(capacity)) }
     }
 
     fn push(&mut self, byte: u8) {
@@ -882,8 +887,8 @@ impl Encoder {
         self.out.extend_from_slice(bytes);
     }
 
-    fn into_vec(self) -> Vec<u8> {
-        self.out
+    fn into_vec(mut self) -> Vec<u8> {
+        std::mem::take(&mut *self.out)
     }
 
     fn u16(&mut self, value: u16) {
@@ -994,6 +999,19 @@ mod tests {
             covered: vec!["content-type".into()],
             nonce: None,
         }
+    }
+
+    #[test]
+    fn unlock_debug_redacts_secret_and_malformed_tail_is_rejected() {
+        let request = Request::Unlock {
+            did: "did:wba:example.com:test".into(), kid: None,
+            passphrase: Zeroizing::new("temporary-secret-never-log".into()),
+        };
+        assert!(!format!("{request:?}").contains("temporary-secret-never-log"));
+        let mut encoded = Zeroizing::new(encode_request(&request).unwrap());
+        encoded.push(0xff);
+        let error = decode_request(&encoded).unwrap_err();
+        assert!(!error.to_string().contains("temporary-secret-never-log"));
     }
 
     /// **导出不是一个 socket 消息类型。这一条是导出策略的地基。**
@@ -1123,7 +1141,7 @@ mod tests {
             Request::Unlock {
                 did: "did:wba:x".into(),
                 kid: None,
-                passphrase: "hunter2".into(),
+                passphrase: Zeroizing::new("hunter2".into()),
             },
             Request::Lock { did: Some("did:wba:x".into()), kid: None },
             Request::Lock { did: None, kid: None },
@@ -1135,10 +1153,7 @@ mod tests {
         }
     }
 
-    /// **256 就是边界,整数位。** 末尾那一个字节之差,是这条路和 `Raw` 之间
-    /// 全部的距离 —— 所以它值得一条自己的测试,而不是靠"超长字段会被拒"那条
-    /// 泛泛的边界测试顺带盖住(base64url 编 32 字节的挑战才 43 个字符,会真实
-    /// 出现的都在这之内)。
+    /// Challenge 长度仅限制资源消耗，不提供用途隔离。
     #[test]
     fn a_challenge_at_the_cap_is_accepted_and_one_byte_over_is_refused() {
         let with_len = |len: usize| SignRequest::Challenge {

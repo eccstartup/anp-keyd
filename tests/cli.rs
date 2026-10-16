@@ -1092,7 +1092,7 @@ fn the_challenge_flag_is_its_own_door() {
     std::fs::write(&path, challenge).expect("write the challenge");
     let path = path.display().to_string();
 
-    let _daemon = Daemon::start_with(&dir, &["--allow-challenge-signing"]);
+    let _daemon = Daemon::start_with(&dir, &["--development", "--allow-challenge-signing"]);
     unlock(&dir, &did).expect_ok();
     let printed = run(dir.path(), &["sign", "--did", &did, "--challenge", &path]);
     let printed = printed.expect_ok();

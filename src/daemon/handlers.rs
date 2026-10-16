@@ -43,7 +43,7 @@ fn dispatch(state: &DaemonState, peer: &PeerIdentity, request: Request) -> Resul
 
         Request::Unlock { did, kid, passphrase } => {
             // 口令从 socket 上传过来，用完就在 daemon 侧擦掉。
-            state.unlock(peer.uid, &did, kid.as_deref(), zeroize::Zeroizing::new(passphrase))?;
+            state.unlock(peer.uid, &did, kid.as_deref(), passphrase)?;
             state.record(peer.uid, &Event::Unlocked { uid: peer.uid, did })?;
             Ok(Response::Ok)
         }
@@ -271,7 +271,7 @@ mod tests {
                 Request::Unlock {
                     did: self.did.clone(),
                     kid: None,
-                    passphrase: PASSPHRASE.to_string(),
+                    passphrase: zeroize::Zeroizing::new(PASSPHRASE.to_string()),
                 },
             )
         }
@@ -492,6 +492,43 @@ mod tests {
     /// 打开之后它回的是一次真签名，并且只把**摘要**记进审计 —— 挑战原文
     /// 不该落进那个会被备份走的文件里，和 [`Event::RawSigned`] 同一个道理。
     #[test]
+    fn document_proof_input_fits_legacy_challenge_but_is_denied_by_default() {
+        // Use the actual upstream proof builder, not a guessed 64-byte payload.
+        for enabled in [false, true] {
+            let f = Fixture::new(SigningGates::new(false, enabled));
+            assert_eq!(f.unlock(), Response::Ok);
+            let layout = f.state.layout_for(f.peer().uid).unwrap();
+            let wrapped = store::load_all(&layout).unwrap().remove(0);
+            let device = crate::keystore::device::load(&layout).unwrap();
+            let key = crate::keystore::unwrap::unlock(&wrapped, PASSPHRASE.as_bytes(), &device).unwrap();
+            let document = crate::did::document::rebuild(&f.did, &key.verifying_key()).unwrap();
+            let prepared = anp::proof::prepare_w3c_proof(
+                &document, &key.anp_public_key(), &wrapped.id.kid,
+                anp::proof::ProofGenerationOptions {
+                    proof_purpose: Some("assertionMethod".into()),
+                    proof_type: Some(anp::proof::PROOF_TYPE_DATA_INTEGRITY.into()),
+                    cryptosuite: Some(anp::proof::CRYPTOSUITE_EDDSA_JCS_2022.into()),
+                    created: None, domain: None, challenge: None,
+                },
+            ).unwrap();
+            assert_eq!(prepared.signing_input().len(), 64);
+            assert!(prepared.signing_input().len() <= crate::daemon::wire::MAX_CHALLENGE_LEN);
+            let response = handle(&f.state, &f.peer(), Request::Sign(SignRequest::Challenge {
+                did: f.did.clone(), kid: None, challenge: prepared.signing_input().to_vec(),
+            }));
+            if enabled {
+                // Explicit development compatibility still signs a valid document proof.
+                let Response::Signature(signature) = response else { panic!("{response:?}") };
+                let signed = anp::proof::complete_w3c_proof(prepared, &signature).unwrap();
+                assert!(anp::authentication::validate_did_document_binding(&signed, true));
+            } else {
+                let Response::Error { code, .. } = response else { panic!("{response:?}") };
+                assert_eq!(code, crate::daemon::wire::ErrorCode::ChallengeDisabled);
+            }
+        }
+    }
+
+    #[test]
     fn challenge_signing_signs_the_challenge_bytes_when_on() {
         let f = Fixture::new(SigningGates::new(false, true));
         f.unlock();
@@ -529,7 +566,7 @@ mod tests {
             Request::Unlock {
                 kid: None,
                 did: f.did.clone(),
-                passphrase: "wrong".into(),
+                passphrase: zeroize::Zeroizing::new("wrong".into()),
             },
         ) else {
             panic!("expected a refusal");
@@ -548,7 +585,7 @@ mod tests {
             Request::Unlock {
                 kid: None,
                 did: "did:wba:example.com:user:bob:e1_zzz".into(),
-                passphrase: PASSPHRASE.into(),
+                passphrase: zeroize::Zeroizing::new(PASSPHRASE.into()),
             },
         ) else {
             panic!("expected a refusal");

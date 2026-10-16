@@ -9,7 +9,7 @@
 //! 2. 它**碰得到外部状态**(钥匙串、`/dev/tpmrm0`),所以要放在一个"头已经被
 //!    认证过"的位置上:顺序反了,就成了让一个没被认证的字符串去指路。
 
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::aead;
 use crate::crypto::hygiene::LockedBytes;
@@ -94,10 +94,10 @@ fn seed_of(wrapped: &WrappedKey, passphrase: &[u8], device_secret: &LockedBytes)
         wrapped.kdf.t_cost,
         wrapped.kdf.p_cost,
     )?;
-    let kek = match &hs {
+    let kek = Zeroizing::new(match &hs {
         Some(hs) => kdf::derive_kek_bound(&pass_key, device_secret, &salt, hs),
         None => kdf::derive_kek(&pass_key, device_secret, &salt),
-    };
+    });
     pass_key.zeroize();
 
     let nonce = wrapped.aead.nonce_bytes()?;

@@ -10,7 +10,7 @@
 //! 一个字都不用动。信封的分层正是为了这个。
 
 use rand::RngCore;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::aead::{self, NONCE_LEN};
 use crate::crypto::hygiene::LockedBytes;
@@ -110,10 +110,10 @@ pub fn seal(req: SealRequest<'_>) -> Result<WrappedKey> {
     let mut pass_key = kdf::argon2id(passphrase, &salt, argon.m_cost, argon.t_cost, argon.p_cost)?;
 
     // ②/③ KEK —— 分版。绑了硬件就是三路熵,没绑就是两路。
-    let kek = match &hardware {
+    let kek = Zeroizing::new(match &hardware {
         Some(sealed) => kdf::derive_kek_bound(&pass_key, device_secret, &salt, &sealed.hs),
         None => kdf::derive_kek(&pass_key, device_secret, &salt),
-    };
+    });
     pass_key.zeroize();
 
     // 每把 key 一把自己的 DEK,随机生成、不落盘。

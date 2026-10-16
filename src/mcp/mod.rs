@@ -1,63 +1,6 @@
-//! MCP 前端:stdin/stdout 上暴露五个工具。
-//!
-//! # 为什么是"socket 客户端",而不是把守护进程搬进来
-//!
-//! 这个模块里**没有任何密码学操作**,一次都没有。它做的全部事情是:接一条
-//! MCP 请求 → 连上守护进程的 Unix socket → 转发 → 把应答变成工具结果。
-//!
-//! 三条理由,一条比一条要紧:
-//!
-//! 1. `client` 里已经有正好这几个操作了,一行不多一行不少。
-//! 2. 自动上锁、审计、覆盖面下限这些判断**只有一处**。MCP 是第二个门面,
-//!    不是第二套实现 —— 门面各自实现一遍,迟早会有一边的墙少砌一块。
-//! 3. 这个进程是**agent 拉起来的**,它跑在 agent 的 uid 下。走 socket 意味着
-//!    守护进程那边的对端凭证检查、策略、按 uid 分命名空间**照旧生效**;
-//!    如果把密钥库读进来在本地解封,这一整层就被绕过去了,而且绕过它的是
-//!    "我们自己的 MCP 服务器"这种听起来很正当的东西。
-//!
-//! # 五个工具,而且没有一个是 raw
-//!
-//! `list_my_keys` / `sign_request` / `unlock` / `status` / `get_did_document`。
-//!
-//! **没有 raw 签名,没有 keygen,没有导出,没有生命周期操作。** 这不是还没做,
-//! 是不做:
-//!
-//! - raw 签名是守护进程里唯一一条能给调用方**任意签名**的路(见
-//!   `sign::raw`)。它在 CLI 里藏在 `--allow-raw-signing` 后面;把它做成一个
-//!   MCP 工具,等于让 agent 手里那条口子**默认开着**,而那正是那道开关要挡的。
-//! - 挑战签名(`SIGN(Challenge)`)同理,**不做成工具**。它签的是调用方给的、
-//!   没有任何消息语义的字节 —— 本质上就是小一号的 raw,同样要落在
-//!   `--allow-challenge-signing` 后面才开。需要一个挑战签名的是**协议客户端**
-//!   (注册流程里那一步),它直接走 socket 问;agent 没有理由问这个,所以门面
-//!   也不给它。
-//! - 生成、轮换、注销、迁移要改文档、要签文档,走的是本地文件而不是 socket
-//!   (见 `cli.rs` 开头那一节)。MCP 是给**运行期签名**用的门面,不是给身份
-//!   管理用的。
-//!
-//! `get_did_document` 是第五个,它和上面那条界限不冲突:**它只读,不改任何
-//! 东西,也不需要解锁。** 文档本来就是 0644 的可公开成品。加它的理由是登录
-//! 这件事本身:agent 要证明自己是谁,手上就得有那份文档,而文档躺在
-//! `0700` 的目录里、还可能被 `publish --out` 挪到别处 —— 让它去猜路径、去
-//! 读内部布局,不如给一个说得清的口子。移掉它,症状不会是报错,而是**走 MCP
-//! 的 agent 登不了录,同一个 agent 在命令行上怎么试都是好的**。
-//!
-//! # `unlock` 这个工具要多说一句
-//!
-//! 它是这几个工具里唯一一个**会把口令带过 MCP 通道**的 —— 也就是说,接了它的
-//! agent 手里会有口令。这一点必须写明白,不能装作没发生。三条限制让它不至于
-//! 变成灾难,但它是**一个权衡,不是一个免费的东西**:
-//!
-//! 1. **口令只是两个因子里的一个。** 信封的另外一半熵是 `device.secret`,
-//!    它留在守护进程那边、从不经手 MCP。拿到口令的人手上剩下的东西不比一个
-//!    口令保护的压缩包多。
-//! 2. **它没有给出新的能力。** `sign_request` 本来就让 agent 能签 —— 这是
-//!    这个产品的用途。`unlock` 省掉的只是"某个人得在终端前敲一次",它不是
-//!    那把钥匙的授予,是那道锁的开关。
-//! 3. **不想要就别开这个门面。** `mcp` 是编译期特性,不构建它,这个模块不在
-//!    二进制里;不用它,agent 就够不到这条路。
-//!
-//! 反过来,如果哪天有人想给 `unlock` 加一个"记住口令"的缓存,那才是真的把
-//! 两因子变成一因子 —— 到时候请回到这一节重新读一遍。
+//! MCP 数据适配器：仅提供列表、状态、结构化 HTTP 签名和公开文档。
+//! 不接受密码，不提供解锁、raw/challenge 或生命周期操作。
+//! 当前仍使用开发模式 v1；同 UID 不构成 Agent 隔离。
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -84,7 +27,7 @@ use crate::keystore::layout::KeydLayout;
 // "type alias takes 1 generic argument"。所以这里只导 `KeydError`,自家那个
 // alias 一律写全 `crate::error::Result`。
 
-/// 五个工具的实现体。
+/// 四个工具的实现体。
 ///
 /// 它只持有一个东西:**守护进程的 socket 在哪**。不持有口令、不持有密钥、
 /// 不持有连接 —— 一次调用一条连接,和 `client` 的约定一致(签名不是幂等的,
@@ -107,20 +50,6 @@ pub struct NoArgs {}
 #[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
 pub struct ListArgs {
     /// 不给就是当前用户默认的那个密钥库。
-    #[serde(default)]
-    pub root: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
-pub struct UnlockArgs {
-    /// 要解锁的 DID。
-    pub did: String,
-    /// 用哪把钥匙,写 fragment(`key-2`、`recovery-1`……)。
-    /// 不给就是 `did` 名下默认那把 —— 也就是**绑定密钥**。
-    #[serde(default)]
-    pub kid: Option<String>,
-    /// 口令。见模块头 "`unlock` 这个工具要多说一句"。
-    pub passphrase: String,
     #[serde(default)]
     pub root: Option<String>,
 }
@@ -212,26 +141,6 @@ impl Keyd {
                 "unlocked_secs": key.unlocked_secs,
             })).collect::<Vec<_>>(),
         }))
-    }
-
-    #[tool(description = "解锁一把密钥。口令会经过 MCP 通道 —— 见文档")]
-    async fn unlock(
-        &self,
-        Parameters(args): Parameters<UnlockArgs>,
-    ) -> std::result::Result<CallToolResult, ErrorData> {
-        let did = args.did;
-        let kid = args.kid;
-        // 口令进闭包之后就被 `Zeroizing` 包住,读完即擦。`client::unlock`
-        // 收的是普通 `String`(它不强迫调用方引入 zeroize),所以这里的
-        // `Zeroizing` 是**这一层**能给的最好的东西。
-        let passphrase = zeroize::Zeroizing::new(args.passphrase);
-
-        let caller = did.clone();
-        self.with_daemon(&args.root, "unlock", move |client| {
-            client.unlock(&did, kid.as_deref(), &passphrase)
-        })
-        .await?;
-        text(serde_json::json!({"unlocked": caller}))
     }
 
     #[tool(description = "签一条 RFC 9421 HTTP 消息签名,返回要挂到请求上的头")]
@@ -408,29 +317,38 @@ pub fn serve(socket: Option<PathBuf>) -> crate::error::Result<()> {
 mod tests {
     use super::*;
 
-    /// **工具表就是这五个,而且没有一个能把任意字节签出去。**
+    /// **工具表就是这四个,而且没有一个能把任意字节签出去。**
     ///
     /// 这条测试挡的是"顺手加一个工具":MCP 是 agent 直接够得着的面,多一个
     /// 工具就是多一条 agent 能走的路。所以工具集合被钉死在这儿,改动它必须
     /// 先改这条测试 —— 而那次改动会被 review 看见。
     ///
-    /// 第五个 `get_did_document` 是**只读**的,加它的理由写在模块头里:登录
+    /// 第四个 `get_did_document` 是**只读**的,加它的理由写在模块头里:登录
     /// 需要它,而它不开放任何新的授权。往这张表里再加东西,请先回答模块头
     /// 那一节的问题。
     #[test]
-    fn exactly_five_tools_and_none_of_them_signs_raw_bytes() {
+    fn exactly_four_tools_and_none_of_them_signs_raw_bytes() {
         let router = Keyd::tool_router();
         let mut names: Vec<String> = router.list_all().into_iter().map(|tool| tool.name.to_string()).collect();
         names.sort();
 
         assert_eq!(
             names,
-            ["get_did_document", "list_my_keys", "sign_request", "status", "unlock"]
+            ["get_did_document", "list_my_keys", "sign_request", "status"]
         );
         assert!(
             !names.iter().any(|name| name.contains("raw")),
             "raw signing must never be reachable from the MCP front end: {names:?}"
         );
+    }
+
+    #[test]
+    fn tool_schemas_have_no_password_parameters() {
+        let tools = Keyd::tool_router().list_all();
+        let rendered = serde_json::to_string(&tools).unwrap();
+        assert!(!rendered.contains("passphrase"));
+        assert!(!rendered.contains("password"));
+        assert!(!tools.iter().any(|tool| tool.name == "unlock"));
     }
 
     /// 通往守护进程的失败是**粗码**,不带内部细节。

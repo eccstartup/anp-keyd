@@ -1,3 +1,7 @@
+> 当前仅支持开发模式，尚未完成受保护部署和有限 grant。相同 UID 的 Agent
+> 不隔离；TTY 不是人类身份凭证；v1 解锁口令会经过 socket。软件信封与
+> device.secret 整套复制后可用口令解封。硬件仅保护解封材料，Ed25519 在进程内执行。
+
 # anp-keyd
 
 一个跑在你自己机器上的守护进程,替 agent 保管 did:wba 的 Ed25519 私钥,
@@ -254,13 +258,11 @@ cargo install --path . --features hardware-tpm   # Linux:钥匙可以绑到 TPM 
 - **`serve` 默认进后台,`stop` 靠 pid 文件找到它。** pid 文件会被核对:
   里面那个号码现在跑的**不是这个二进制**就拒绝动手(pid 会被回收,而
   `stop` 发的是 SIGTERM)。对不上时它不杀、也不删那个文件。
-- **`sign --raw` 默认关着。** 那是守护进程里唯一一条能给调用方任意签名的路,
-  要用得先 `serve --allow-raw-signing`。
-- **`sign --challenge` 也是一个开关,默认同样关着**(`serve --allow-challenge-signing`),
-  而且它签的东西和 `--raw` 是**一回事**:同一把钥匙、同样签你给的原字节。唯一的
-  区别是**它的输入有上界** —— 文件最多 256 字节,超出在协议层就被拒,连钥匙都不碰。
-  那道墙是它存在的全部理由:有上界,它就长不成"帮我把这份文档签了"。它给注册这类
-  流程用(服务端发一个随机串,你签它的原字节),用不着就不开。
+- **`sign --raw` / `sign --challenge` 默认关闭。** 启用必须同时指定
+  `serve --development --allow-raw-signing` 或
+  `serve --development --allow-challenge-signing`，不能与 `--system` 同用。
+  challenge 的 256 字节只是资源上限：文档 proof 输入只有 64 字节，仍能跨用途签名。
+  启用任一路径均属于开发兼容能力，不构成用途隔离。
 - **`sign --url` 里的 URL 会按 URL 解析器的写法规范化。** host 归一成小写,默认
   端口去掉(`https://example.com:443/x` 按 `https://example.com/x` 签)。验签方
   是**自己解析 URL 再算一遍** `@authority` 的,两边必须是同一串 —— 照字面签
@@ -278,18 +280,12 @@ cargo install --path . --features hardware-tpm   # Linux:钥匙可以绑到 TPM 
 
 ## 它挡什么,不挡什么
 
-**挡的:** agent 被注入之后拿不到私钥字节;同一个 uid 下的另一个进程读不到
-口令;磁盘被偷(信封的熵一半在口令、一半在 `device.secret`);审计日志被
-事后编辑;**绑了硬件根的话,连"把整个目录拷到另一台机器 + 知道口令"也不成**
-(见[硬件根](#硬件根))。
+当前只有开发模式。socket 不返回私钥；信封提供静态加密，但同 UID 任意代码执行
+可接触文件与进程，不能承诺 Agent 拿不到私钥。`/dev/tty` 不能认证人类。
 
-**不挡的:** 同一个 uid 下的另一个 agent 冒充你(uid 是授权模型的地基,粒度
-就是 uid,要再细一层得靠可执行文件身份);你亲手把 `export-seed` 敲了一遍;
-归档文件本身的离线爆破;**没绑硬件根的信封,今天仍然是一个拷贝就走得掉的
-东西**。
-
-每一条是怎么成立的、为什么某些做法被**故意**排除,见
-[docs/DESIGN.md](docs/DESIGN.md)。
+只复制不含 device.secret 的信封不足以解封；整套软件目录加口令可以解封。
+硬件绑定增加本机解封依赖，签名仍在 daemon 普通内存执行。本地审计链与锚
+可检测部分修改，不能抵御整套回滚。独立 UID 管理域和有限 grant 尚未交付。
 
 ## 硬件根
 
@@ -446,7 +442,7 @@ issue 里。
 ## 接到 agent 上
 
 `mcp` 子命令在 stdin/stdout 上说 MCP,把几个工具(`list_my_keys` /
-`status` / `sign_request` / `unlock` / `get_did_document`)转发给守护进程。
+`status` / `sign_request` / `get_did_document`)转发给守护进程。
 它自己不开密钥库,也不碰密码学。
 
 ```bash
@@ -463,9 +459,9 @@ MCP 客户端的配置里,那一行 `command` 就指向这个子命令,参数是
 }
 ```
 
-五个工具里只有 `unlock` 会把口令带过那条通道,而它是个**权衡不是免费的
-东西**:口令只是两个因子之一(`device.secret` 从不经手 MCP),而且它给的
-不是新能力 —— `sign_request` 本来就能签。不想要就别构建这个特性。
+MCP 仅有四个工具，没有密码参数或解锁工具。需要解锁时，用户在自己的终端
+执行 CLI。当前 v1 CLI 会向 daemon 发送口令，尚无受保护的服务端互认；
+不要将这个开发流程视为独立管理员认证。
 
 ### 写给 agent 看的说明
 
@@ -516,7 +512,7 @@ cargo clippy --all-targets --all-features
 | `tests/vectors/` + `tests/vectors.rs` | 外部标准和兄弟实现还认不认我们的实现 | **看它是哪一类出处**:RFC 抄本红了先怀疑实现;兄弟实现的值红了是两边分家了 |
 
 另有四个单一命题,每个一个文件:`tests/probe.rs`(体检说的都是真的)、
-`tests/mcp.rs`(MCP 那五个工具就是全部)、`tests/hardware.rs`(硬件绑定那
+`tests/mcp.rs`(MCP 的四个工具就是全部)、`tests/hardware.rs`(硬件绑定那
 条路的**形状**:版本分派、AAD、硬件不在、口令错、拒绝降级)、
 `tests/no_key_material_on_disk.rs`(走完一遍之后,磁盘上扫不出任何密钥材料)。
 

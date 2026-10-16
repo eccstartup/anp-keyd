@@ -896,8 +896,7 @@ mod tests {
             .is_ok());
     }
 
-    /// 反过来不成立:窄门开着,宽门还是关的。`raw` 能签的是一份文档,
-    /// `challenge` 那条路没答应过。
+    /// Challenge 不会打开 Raw，但仍能签 64 字节文档 proof 输入。
     #[test]
     fn opening_the_challenge_door_does_not_open_raw() {
         let f = Fixture::new(SigningGates::new(false, true));

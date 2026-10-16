@@ -243,16 +243,16 @@ fn payload(result: &Value) -> Value {
 }
 
 // ————————————————————————————————————————————————————————————
-// 1. 五个工具,握手就列得出来
+// 1. 四个工具,握手就列得出来
 // ————————————————————————————————————————————————————————————
 
-/// **工具表就是这五个,和 `mcp` 模块里那条单元测试说的是同一件事。**
+/// **工具表就是这四个,和 `mcp` 模块里那条单元测试说的是同一件事。**
 ///
 /// 两条测试不重复:那条守的是"我们的代码里注册了几个",这条守的是"一个真的
 /// MCP 客户端**看得见**几个"。中间隔着 rmcp 的 schema 生成和协议编解码,
 /// 而一个工具在客户端看不见,等于不存在。
 #[test]
-fn a_client_sees_exactly_the_five_documented_tools() {
+fn a_client_sees_exactly_the_four_documented_tools() {
     let daemon = Daemon::start();
     let mut mcp = Mcp::start(&daemon.sock);
 
@@ -267,7 +267,7 @@ fn a_client_sees_exactly_the_five_documented_tools() {
 
     assert_eq!(
         names,
-        ["get_did_document", "list_my_keys", "sign_request", "status", "unlock"]
+        ["get_did_document", "list_my_keys", "sign_request", "status"]
     );
     assert!(
         !names.iter().any(|name| name.contains("raw")),
@@ -363,10 +363,8 @@ fn unlock_then_sign_request_produces_headers_upstream_accepts() {
     let daemon = Daemon::start();
     let mut mcp = Mcp::start(&daemon.sock);
 
-    mcp.call_tool(5, "unlock", json!({
-        "did": daemon.did,
-        "passphrase": String::from_utf8_lossy(PASSPHRASE),
-    }));
+    anp_keyd::client::Client::connect(&daemon.sock).unwrap()
+        .unlock(&daemon.did, None, std::str::from_utf8(PASSPHRASE).unwrap()).unwrap();
 
     let unlocked = payload(&mcp.call_tool(6, "status", json!({})));
     assert_eq!(
@@ -429,10 +427,8 @@ fn a_caller_supplied_nonce_reaches_the_signature_over_mcp() {
     let daemon = Daemon::start();
     let mut mcp = Mcp::start(&daemon.sock);
 
-    mcp.call_tool(1, "unlock", json!({
-        "did": daemon.did,
-        "passphrase": String::from_utf8_lossy(PASSPHRASE),
-    }));
+    anp_keyd::client::Client::connect(&daemon.sock).unwrap()
+        .unlock(&daemon.did, None, std::str::from_utf8(PASSPHRASE).unwrap()).unwrap();
 
     let url = "https://example.com/api/nonce";
     let nonce = "caller-chosen-42";
@@ -474,12 +470,9 @@ fn a_caller_supplied_nonce_reaches_the_signature_over_mcp() {
 // 4. 失败的时候不许多嘴
 // ————————————————————————————————————————————————————————————
 
-/// **口令错,递回来的是一句粗话,不是一个口令错误。**
-///
-/// 协议层早就决定过哪些细节不出门(`wire::Response::from_error` 那条路),
-/// MCP 这一层如果把 `Display` 直接 `to_string()` 出去,刚关上的门就又开了。
+/// An old client cannot unlock through MCP; rejection must not echo its secret.
 #[test]
-fn a_wrong_passphrase_comes_back_as_a_coarse_refusal() {
+fn unlock_is_not_available_over_mcp() {
     let daemon = Daemon::start();
     let mut mcp = Mcp::start(&daemon.sock);
 
@@ -489,7 +482,7 @@ fn a_wrong_passphrase_comes_back_as_a_coarse_refusal() {
     }));
 
     let error = message.get("error").unwrap_or_else(|| {
-        panic!("a wrong passphrase must come back as an MCP error: {message}")
+        panic!("the removed unlock tool must return an MCP error: {message}")
     });
     let rendered = error.to_string();
     assert!(
@@ -497,7 +490,7 @@ fn a_wrong_passphrase_comes_back_as_a_coarse_refusal() {
         "the refusal must not echo the passphrase back: {rendered}"
     );
     assert!(
-        rendered.to_lowercase().contains("credential"),
-        "the refusal should be the coarse one from the protocol layer: {rendered}"
+        !rendered.to_lowercase().contains("credential"),
+        "the removed tool must not reach daemon credential verification: {rendered}"
     );
 }

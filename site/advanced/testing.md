@@ -28,7 +28,7 @@ cargo clippy --all-targets --all-features
 | 文件 | 命题 |
 |---|---|
 | `tests/probe.rs` | 体检说的都是真的 |
-| `tests/mcp.rs` | MCP 那五个工具就是全部 |
+| `tests/mcp.rs` | MCP 那四个工具就是全部 |
 | `tests/hardware.rs` | 硬件绑定那条路的**形状**:版本分派、AAD、硬件不在、口令错、拒绝降级 |
 | `tests/no_key_material_on_disk.rs` | 走完一遍之后,磁盘上扫不出任何密钥材料 |
 

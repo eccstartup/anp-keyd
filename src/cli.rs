@@ -6,14 +6,9 @@
 //! **给 agent 用的** —— 它们连上守护进程,拿签名,从始至终不碰私钥字节,
 //! 也不需要口令(除了 `unlock`,那是人做的)。
 //!
-//! **不走 socket 的**:`serve` 之外的其余命令。`keygen` / `publish` /
-//! `verify-doc` 是身份的生命周期操作,由人发起、在终端上做、当场打开信封
-//! (或当场验签)。它们留在人类自己的进程里,agent 够不着。
-//!
-//! 为什么不把生命周期操作也做成 socket 消息:`publish` 要签的正是**一份
-//! 文档**,如果把它做成消息类型,调用方就能让守护进程签任意一份文档 ——
-//! 那等于把防盲签那套设计从后门拆掉。这个取舍和"导出不做成消息类型"是
-//! 同一条道理。
+//! **不走 socket 的**生命周期命令直接打开本地信封，仅用于当前开发流程。
+//! 同 UID 的 Agent 能启动这些命令或创建 PTY；TTY 不能证明人类身份。
+//! 受保护部署需要独立管理 UID、服务端互认和结构化生命周期协议，尚未交付。
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -71,7 +66,7 @@ pub struct Cli {
 /// 分节的依据是模块头那条分界线:`serve` 是守护进程本体;`sign` / `list` /
 /// `status` / `lock` / `document` 走 socket 且不要口令,agent 够得着;
 /// `unlock` 也走 socket 但口令只从终端读,单独一节;其余的在人的进程里开
-/// 信封,agent 够不着。
+/// 信封；同 UID 不隔离。
 ///
 /// 特性门控的两条只在对应构建里存在,所以按 `#[cfg]` 追加,不能写死进来 ——
 /// 默认构建的 help 里出现一条敲了也没用的命令,比不列更糟。
@@ -266,21 +261,17 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = DEFAULT_IDLE_SECS, value_name = "SECS")]
     pub idle: u64,
 
-    /// Open the raw-bytes signing path. Off by default — read the docs before
-    /// turning it on.
+    /// Explicitly acknowledge legacy development mode. No Agent isolation.
     #[arg(long)]
+    pub development: bool,
+
+    /// Enable arbitrary-byte signatures in development mode only.
+    #[arg(long, requires = "development", conflicts_with = "system")]
     pub allow_raw_signing: bool,
 
-    /// Open the challenged-bytes signing path (`SIGN(Challenge)`). Off by
-    /// default.
-    ///
-    /// A **narrower** door than `--allow-raw-signing`: it signs caller-supplied
-    /// bytes, but only up to 256 of them, and 256 is below any DID document and
-    /// any signature base — so it structurally cannot become "sign my document".
-    /// It exists for flows like registration that prove possession of the key by
-    /// signing a server-issued challenge. Because raw is the wider door, passing
-    /// `--allow-raw-signing` opens this one too; the reverse does not hold.
-    #[arg(long)]
+    /// Enable caller-supplied challenge signatures in development mode only.
+    /// The 256-byte limit is a resource limit, not purpose isolation.
+    #[arg(long, requires = "development", conflicts_with = "system")]
     pub allow_challenge_signing: bool,
 
     /// Besides this process's own uid, which uids may connect (repeatable).
@@ -547,10 +538,9 @@ pub struct SignArgs {
     ///
     /// For flows like registration, where a server issues a challenge and the
     /// caller has to prove possession of the key by signing its raw bytes. Needs
-    /// the daemon running with `--allow-challenge-signing`. **The file must be
-    /// at most 256 bytes** — that cap is what keeps this path from becoming
-    /// "sign my document". **Mutually exclusive** with the structured flags and
-    /// with `--raw`: one kind of input or the other.
+    /// the daemon running with `--development --allow-challenge-signing`.
+    /// The file must be at most 256 bytes. This resource limit does not prevent
+    /// document proof signing. Mutually exclusive with structured flags and raw.
     #[arg(
         long,
         value_name = "PATH",
@@ -907,8 +897,15 @@ fn socket_of(layout: &KeydLayout, args: &ServeArgs) -> PathBuf {
 
 /// 守护进程本体 —— 前台跑、后台跑、被服务管理器拉起来,走的都是这里。
 fn serve_here(layout: &KeydLayout, args: ServeArgs, sock_path: PathBuf) -> Result<()> {
+    if (args.allow_raw_signing || args.allow_challenge_signing) && (!args.development || args.system) {
+        return Err(KeydError::Misuse("raw/challenge signing requires --development and cannot use --system".into()));
+    }
     layout.ensure()?;
     crate::daemon::service::install_logging()?;
+    tracing::warn!("legacy development mode: no grant enforcement or same-UID Agent isolation");
+    if args.allow_raw_signing || args.allow_challenge_signing {
+        tracing::warn!("arbitrary-byte signing enabled: challenge length does not prevent DID document proof signing");
+    }
 
     let policy = args.policy()?;
 
@@ -1504,6 +1501,15 @@ mod tests {
         Cli::try_parse_from(full)
     }
 
+    #[test]
+    fn arbitrary_byte_signing_requires_explicit_development_and_rejects_system() {
+        for flag in ["--allow-raw-signing", "--allow-challenge-signing"] {
+            assert!(parse(&["serve", flag]).is_err());
+            assert!(parse(&["serve", "--development", flag]).is_ok());
+            assert!(parse(&["serve", "--development", "--system", flag]).is_err());
+        }
+    }
+
     /// **每一条子命令都得在 `--help` 里出现。**
     ///
     /// `help_template()` 里那份分节清单是手写的(理由见那个函数的文档注释),
@@ -1725,6 +1731,7 @@ mod tests {
             system: false,
             foreground: false,
             idle: DEFAULT_IDLE_SECS,
+            development: false,
             allow_raw_signing: false,
             allow_challenge_signing: false,
             allow_uids: vec![],
