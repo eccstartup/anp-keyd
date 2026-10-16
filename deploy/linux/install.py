@@ -119,6 +119,11 @@ def install(args):
     write(Path('/etc/tmpfiles.d/anp-keyd.conf'),
           f"d /run/anp-keyd 0755 root root -\nd /run/anp-keyd/sign 0750 {SERVICE} {AGENTS} -\nd /run/anp-keyd/admin 0750 {SERVICE} {ADMINS} -\n")
     write(Path('/etc/systemd/system/anp-keyd.service'), Path(__file__).with_name('anp-keyd.service').read_text())
+    def service_identity():
+        os.initgroups(SERVICE, service.pw_gid)
+        os.setgid(service.pw_gid)
+        os.setuid(service.pw_uid)
+    subprocess.run([str(BINARY), 'init-protected-state', '--config', str(CONFIG)], preexec_fn=service_identity, check=True)
     print("Installed boundary preview. No signing/grants or vault migration enabled.")
     print("Review config, then run: systemctl daemon-reload && systemctl enable --now anp-keyd")
     print("Agents/admins need fresh login sessions for group membership. Keep Agents away from sudo, Docker and admin IPC.")

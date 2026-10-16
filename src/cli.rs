@@ -80,6 +80,7 @@ fn help_template() -> String {
          \x20 serve               Run the daemon: answer signing requests over a Unix socket.\n\
          \x20 serve-protected     Linux boundary preview (signing unavailable).\n\
          \x20 admin               Use the independent Linux management channel.\n\
+         \x20 init-protected-state  Initialize a NEW service database explicitly.\n\
          \x20 stop                Stop the daemon `serve` left running in the background.\n\
          \n\
          For agents — over the socket, no passphrase:\n\
@@ -144,6 +145,8 @@ pub enum Command {
     Serve(ServeArgs),
     /// Linux boundary preview; signing is unavailable until grant enforcement ships.
     ServeProtected(ProtectedArgs),
+    /// Explicit one-time SQLite initialization, as the dedicated service UID.
+    InitProtectedState(ProtectedArgs),
     /// Authenticate to the independent Linux management socket.
     Admin(AdminArgs),
     /// Stop the daemon that `serve` left running in the background.
@@ -251,6 +254,21 @@ pub struct AdminArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum AdminCommand {
+    ListPrincipals,
+    PrepareRegisterPrincipal {
+        #[arg(long)]
+        uid: u32,
+    },
+    PrepareDisablePrincipal {
+        #[arg(long)]
+        principal_id: String,
+    },
+    Commit {
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        digest: String,
+    },
     Status,
     LockAll,
     Unlock {
@@ -785,6 +803,17 @@ pub fn run(cli: Cli) -> Result<()> {
                 crate::ops::probe::probe(root, args.did.as_deref())
             }
         }
+        Command::InitProtectedState(args) => {
+            if root.is_some() {
+                return Err(KeydError::Misuse(
+                    "state initialization cannot use --root".into(),
+                ));
+            }
+            crate::security::require_linux()?;
+            let config = crate::security::config::ServiceConfig::load(&args.config)?;
+            use crate::persistence::clock::{Clock, SystemClock};
+            crate::persistence::Database::initialize(&config, SystemClock.now()?)
+        }
         Command::ServeProtected(args) => {
             if root.is_some() {
                 return Err(KeydError::Misuse(
@@ -826,6 +855,17 @@ pub fn run(cli: Cli) -> Result<()> {
             use crate::security::client::Client as AdminClient;
             let client = AdminClient::connect(&args.config, true)?;
             let reply = match args.operation {
+                AdminCommand::ListPrincipals => client.principals()?,
+                AdminCommand::PrepareRegisterPrincipal { uid } => {
+                    client.prepare(crate::persistence::Change::RegisterPrincipal { uid })?
+                }
+                AdminCommand::PrepareDisablePrincipal { principal_id } => {
+                    client.prepare(crate::persistence::Change::DisablePrincipal { principal_id })?
+                }
+                AdminCommand::Commit {
+                    operation_id,
+                    digest,
+                } => client.commit(operation_id, digest)?,
                 AdminCommand::Status => client.capabilities()?,
                 AdminCommand::LockAll => client.lock_all()?,
                 AdminCommand::Unlock { vault_id, did, kid } => {

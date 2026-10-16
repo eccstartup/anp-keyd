@@ -9,6 +9,7 @@ import pwd
 import select
 import shutil
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -38,6 +39,9 @@ shutil.copytree('/tmp/keyd-boundary-fixture', vault)
 service = pwd.getpwnam('anp-keyd')
 for path in [vault, *vault.rglob('*')]:
     os.chown(path, service.pw_uid, service.pw_gid)
+# Test-only staging under root while the service is stopped; not a migration API.
+with sqlite3.connect(Path(config['state_dir']) / 'state.sqlite') as database:
+    database.execute("INSERT INTO vaults VALUES(?,?,'active')", (vault_id, 'vaults/' + vault_id))
 binary = '/usr/local/libexec/anp-keyd'
 passed = []
 
@@ -182,8 +186,9 @@ assert s.recv(1)==b''
     unlocked = subprocess.run([sys.executable, '-c', admin_call, config['admin_socket'], json.dumps(unlock)], preexec_fn=identity('boundary-admin'), capture_output=True, text=True, timeout=12)
     check(unlocked.returncode == 0 and json.loads(unlocked.stdout)['code'] == 'OK', 'authenticated admin unlocks temporary vault, connection closes: ' + unlocked.stdout + unlocked.stderr)
     check(command('boundary-admin', 'admin', 'lock-all').returncode == 0, 'independent management lock works')
-    audit = ''.join(path.read_text() for path in (vault / 'audit').glob('*.jsonl'))
-    check('temporary-boundary-test-secret' not in audit and '"dropped":1' in audit.replace(' ', ''), 'audit records actual management lock count without secrets')
+    with sqlite3.connect(Path(config['state_dir']) / 'state.sqlite') as database:
+        audit = ''.join(row[0].decode() for row in database.execute('SELECT event_data FROM audit_events'))
+    check('temporary-boundary-test-secret' not in audit and '"dropped":1' in audit.replace(' ', ''), 'transactional audit records management lock count without secrets')
     # The old data wire must fail, not downgrade. A known principal sends LIST_KEYS.
     legacy = code.replace("data=json.dumps({'version':2,'request':{'operation':'GET_CAPABILITIES'}}).encode()", "data=bytes([1])")
     refused = subprocess.run([sys.executable, '-c', legacy, config['sign_socket']], preexec_fn=identity('boundary-agent-b'), capture_output=True, text=True, timeout=8)
@@ -259,13 +264,63 @@ os.chmod(config['sign_socket'], 0o660)
 process = start()
 check(command('boundary-admin', 'admin', 'status').returncode == 0, 'verified stale socket is recovered')
 stop(process)
-# Disabling a bootstrap principal is effective after the documented restart.
-config['principals'][1]['enabled'] = False
-config_path.write_text(json.dumps(config))
+# Two-phase persistent management: no config edit can re-enable old principals.
 process = start()
 try:
-    check(as_agent('boundary-agent-b')['code'] == 'PRINCIPAL_DISABLED', 'disabled principal denied after reload')
+    prepared = command('boundary-admin', 'admin', 'prepare-disable-principal', '--principal-id', b['principal_id'])
+    assert prepared.returncode == 0, prepared.stderr
+    operation = json.loads(prepared.stdout)['prepared']
+    wrong = command('boundary-admin', 'admin', 'commit', '--operation-id', operation['operation_id'], '--digest', 'wrong')
+    check(wrong.returncode != 0 and as_agent('boundary-agent-b')['code'] == 'OK', 'digest substitution does not disable principal')
+    committed = command('boundary-admin', 'admin', 'commit', '--operation-id', operation['operation_id'], '--digest', operation['digest'])
+    check(committed.returncode == 0 and as_agent('boundary-agent-b')['code'] == 'PRINCIPAL_DISABLED', 'principal disable is durable and immediate')
+    check(command('boundary-admin', 'admin', 'commit', '--operation-id', operation['operation_id'], '--digest', operation['digest']).returncode != 0, 'admin commit cannot replay')
     check(as_agent('boundary-agent-a')['code'] == 'OK', 'other principal continues after disable')
 finally:
     stop(process)
+process = start()
+try:
+    check(config['principals'][1]['enabled'] and as_agent('boundary-agent-b')['code'] == 'PRINCIPAL_DISABLED', 'restart never resurrects principal from bootstrap config')
+    prepared = command('boundary-admin', 'admin', 'prepare-register-principal', '--uid', str(pwd.getpwnam('boundary-agent-b').pw_uid))
+    operation = json.loads(prepared.stdout)['prepared']
+    committed = command('boundary-admin', 'admin', 'commit', '--operation-id', operation['operation_id'], '--digest', operation['digest'])
+    check(committed.returncode == 0 and as_agent('boundary-agent-b')['principal_id'] != b['principal_id'], 'reused UID receives a new principal identity')
+    listed = command('boundary-admin', 'admin', 'list-principals')
+    principals = json.loads(listed.stdout)['principals']
+    check(len([p for p in principals if p['uid'] == pwd.getpwnam('boundary-agent-b').pw_uid]) == 2, 'administrator sees retired and replacement principal generations')
+    with sqlite3.connect(Path(config['state_dir']) / 'state.sqlite') as database:
+        database.execute("CREATE TRIGGER fail_audit BEFORE INSERT ON audit_events BEGIN SELECT RAISE(ABORT,'injected failure'); END")
+    check(command('boundary-admin', 'admin', 'lock-all').returncode != 0 and as_agent('boundary-agent-a')['code'] == 'AUDIT_UNAVAILABLE', 'audit persistence failure latches emergency stop')
+    with sqlite3.connect(Path(config['state_dir']) / 'state.sqlite') as database:
+        database.execute('DROP TRIGGER fail_audit')
+    check(as_agent('boundary-agent-a')['code'] == 'AUDIT_UNAVAILABLE', 'repair alone cannot clear emergency stop without restart')
+finally:
+    stop(process)
+state_path = Path(config['state_dir']) / 'state.sqlite'
+check(b'temporary-boundary-test-secret' not in state_path.read_bytes(), 'SQLite contains no unlock password')
+check(command('anp-keyd', 'init-protected-state').returncode != 0, 'explicit initialization refuses an existing database')
+saved = state_path.with_suffix('.saved')
+state_path.rename(saved)
+try:
+    result = command('anp-keyd', 'serve-protected')
+    check(result.returncode != 0 and not state_path.exists(), 'missing database stops startup without implicit recreation')
+finally:
+    saved.rename(state_path)
+state_path.rename(saved)
+try:
+    state_path.symlink_to(saved)
+    check(command('anp-keyd', 'serve-protected').returncode != 0, 'symlink database rejected')
+    state_path.unlink()
+    os.link(saved, state_path)
+    check(command('anp-keyd', 'serve-protected').returncode != 0, 'multiply linked database rejected')
+    state_path.unlink()
+finally:
+    saved.rename(state_path)
+with sqlite3.connect(state_path) as database:
+    database.execute('PRAGMA user_version=2')
+check(command('anp-keyd', 'serve-protected').returncode != 0, 'newer schema stops startup')
+with sqlite3.connect(state_path) as database:
+    database.execute('PRAGMA user_version=1')
+    database.execute("UPDATE audit_events SET event_data=x'00' WHERE seq=1")
+check(command('anp-keyd', 'serve-protected').returncode != 0, 'corrupt audit stops startup')
 print(json.dumps({'passed': len(passed), 'protected_supported': False}), flush=True)

@@ -9,7 +9,7 @@ license = "Apache-2.0"
 [dependencies]
 # —— 上游接口:did:wba 文档 + supplied-public-key E1 builder + 两阶段签名
 # default-features = false 是关键:默认会拉进 mls(openmls/rusqlite)与 network(reqwest),
-# 一个持有私钥的守护进程不应该有这些。
+# 不启用上游联网/MLS；本地授权持久化单独使用受限 SQLite 依赖。
 anp = { version = "=1.0.6", default-features = false }
 
 # —— MCP:官方 Rust SDK。**可选** —— 不装 MCP 的人不该被拖进它的依赖树。
@@ -17,6 +17,9 @@ anp = { version = "=1.0.6", default-features = false }
 # (3.5.1),而且 1.x 之后 API 变过(`#[tool_router(server_handler)]`、
 # `serve_with_lifecycle` 都是 3.x 才有的)—— 所以这里跟着计划钉住,别顺手升。
 rmcp = { version = "0.15", optional = true, features = ["server", "transport-io", "macros", "schemars"] }
+
+# —— 本地状态：固定版本，bundled 避免系统 SQLite 语义漂移。
+rusqlite = { version = "=0.39.0", default-features = false, features = ["bundled"] }
 
 # —— 运行时
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-std", "macros", "time", "signal", "sync"] }

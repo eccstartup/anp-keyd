@@ -12,7 +12,8 @@ use crate::principal::{validate_uuid, Principal};
 
 pub const DEFAULT_CONFIG: &str = "/etc/anp-keyd/service.json";
 
-/// Root-owned bootstrap registry. M2 will move mutable state into SQLite.
+/// Root-owned deployment config. Principals are initialization inputs only;
+/// live mutable principal state is read from SQLite on each data request.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {

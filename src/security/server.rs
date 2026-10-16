@@ -13,12 +13,15 @@ use tokio::task::JoinSet;
 
 use super::protocol::{AdminRequest, DataRequest, Envelope, Reply, VERSION};
 use super::{config::ServiceConfig, paths, protocol, DeadlineStream};
-use crate::audit::Event;
 use crate::daemon::autolock::Autolock;
 use crate::daemon::peer::{peer_identity, self_uid, PeerPolicy};
 use crate::daemon::state::{DaemonState, Roots, SigningGates};
 use crate::error::{KeydError, Result};
 use crate::keystore::layout::KeydLayout;
+use crate::persistence::clock::{Clock, SystemClock};
+use crate::persistence::{Change, Database};
+use serde_json::json;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct Boundary {
     config: ServiceConfig,
@@ -26,10 +29,12 @@ pub struct Boundary {
     // Management operations serialize, including KDF, so LOCK_ALL cannot be
     // acknowledged while an older unlock can still install a key.
     admin_gate: Mutex<()>,
+    database: Mutex<Database>,
+    stopped: AtomicBool,
 }
 
 impl Boundary {
-    pub fn new(config: ServiceConfig) -> Result<Self> {
+    pub fn new(config: ServiceConfig, database: Database) -> Result<Self> {
         config.validate()?;
         let vaults = config
             .vault_ids
@@ -50,6 +55,8 @@ impl Boundary {
             config,
             vaults,
             admin_gate: Mutex::new(()),
+            database: Mutex::new(database),
+            stopped: AtomicBool::new(false),
         })
     }
 
@@ -57,6 +64,13 @@ impl Boundary {
         let mut reply = Reply::code("OK");
         reply.instance_id = Some(self.config.instance_id.clone());
         reply.principal_id = principal_id;
+        match self.database.lock() {
+            Ok(db) => reply.boot_epoch = Some(db.boot_epoch),
+            Err(_) => {
+                self.emergency();
+                return Reply::code("AUDIT_UNAVAILABLE");
+            }
+        }
         reply
     }
 
@@ -77,10 +91,23 @@ impl Boundary {
             }
             None
         } else {
-            match crate::principal::resolve(&self.config.principals, peer.uid) {
-                Ok(principal) => Some(principal.principal_id.clone()),
-                Err(_) => {
+            if self.stopped.load(Ordering::SeqCst) {
+                protocol::write(&mut io, &Reply::code("AUDIT_UNAVAILABLE"))?;
+                return Ok(());
+            }
+            let principal = match self.database.lock() {
+                Ok(db) => db.principal(peer.uid),
+                Err(_) => Err(KeydError::Protocol("PERSISTENCE_UNAVAILABLE".into())),
+            };
+            match principal {
+                Ok(Some(principal)) => Some(principal.principal_id),
+                Ok(None) => {
                     protocol::write(&mut io, &Reply::code("PRINCIPAL_DISABLED"))?;
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.emergency();
+                    protocol::write(&mut io, &Reply::code("AUDIT_UNAVAILABLE"))?;
                     return Ok(());
                 }
             }
@@ -123,12 +150,34 @@ impl Boundary {
         // Exactly one request; dropping the stream rejects inherited old sessions.
     }
 
+    fn emergency(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.lock_all();
+    }
+    fn record(&self, event: serde_json::Value) -> bool {
+        let result = self
+            .database
+            .lock()
+            .map_err(|_| ())
+            .and_then(|mut db| db.record(event).map_err(|_| ()));
+        if result.is_err() {
+            self.emergency();
+            false
+        } else {
+            true
+        }
+    }
+
     fn admin(
         &self,
         actor: u32,
         request: AdminRequest,
         secret: Option<zeroize::Zeroizing<String>>,
     ) -> Reply {
+        if self.stopped.load(Ordering::SeqCst) {
+            self.lock_all();
+            return Reply::code("AUDIT_UNAVAILABLE");
+        }
         if matches!(request, AdminRequest::Capabilities {}) {
             return self.capabilities(None);
         }
@@ -138,30 +187,90 @@ impl Boundary {
         };
         match request {
             AdminRequest::Capabilities {} => unreachable!(),
+            AdminRequest::ListPrincipals {} => {
+                let result = self
+                    .database
+                    .lock()
+                    .map_err(|_| ())
+                    .and_then(|db| db.principals().map_err(|_| ()));
+                match result {
+                    Ok(principals) => {
+                        let mut reply = Reply::code("OK");
+                        reply.principals = Some(principals);
+                        reply
+                    }
+                    Err(_) => {
+                        self.emergency();
+                        Reply::code("AUDIT_UNAVAILABLE")
+                    }
+                }
+            }
+            AdminRequest::Prepare { change } => {
+                if let Change::RegisterPrincipal { uid } = &change {
+                    if *uid == self.config.service_uid
+                        || self.config.admin_uids.contains(uid)
+                        || *uid == 0
+                    {
+                        return Reply::code("ADMIN_OPERATION_INVALID");
+                    }
+                }
+                let Ok(now) = SystemClock.now() else {
+                    self.emergency();
+                    return Reply::code("AUDIT_UNAVAILABLE");
+                };
+                let result = self
+                    .database
+                    .lock()
+                    .map_err(|_| KeydError::Protocol("PERSISTENCE_UNAVAILABLE".into()))
+                    .and_then(|mut db| db.prepare(actor, change, now));
+                match result {
+                    Ok(prepared) => {
+                        let mut reply = Reply::code("OK");
+                        reply.prepared = Some(prepared);
+                        reply
+                    }
+                    Err(KeydError::Misuse(_)) => Reply::code("ADMIN_OPERATION_INVALID"),
+                    Err(_) => {
+                        self.emergency();
+                        Reply::code("AUDIT_UNAVAILABLE")
+                    }
+                }
+            }
+            AdminRequest::Commit {
+                operation_id,
+                digest,
+            } => {
+                let Ok(now) = SystemClock.now() else {
+                    self.emergency();
+                    return Reply::code("AUDIT_UNAVAILABLE");
+                };
+                let result = self
+                    .database
+                    .lock()
+                    .map_err(|_| KeydError::Protocol("PERSISTENCE_UNAVAILABLE".into()))
+                    .and_then(|mut db| db.commit(actor, &operation_id, &digest, now));
+                match result {
+                    Ok(()) => Reply::code("OK"),
+                    Err(KeydError::Misuse(_)) => Reply::code("ADMIN_OPERATION_INVALID"),
+                    Err(_) => {
+                        self.emergency();
+                        Reply::code("AUDIT_UNAVAILABLE")
+                    }
+                }
+            }
             AdminRequest::LockAll {} => {
-                // Lock every vault before attempting audit delivery. On any failure,
-                // remaining keys are still cleared and no success is acknowledged.
-                let mut counts = Vec::new();
+                let mut dropped = 0;
                 for state in self.vaults.values() {
                     match state.lock(self.config.service_uid, None, None) {
-                        Ok(dropped) => counts.push((state, dropped)),
+                        Ok(count) => dropped += count,
                         Err(_) => {
-                            self.lock_all();
+                            self.emergency();
                             return Reply::code("RESOURCE_BUSY");
                         }
                     }
                 }
-                for (state, dropped) in counts {
-                    if state
-                        .record_service(&Event::Locked {
-                            uid: actor,
-                            did: None,
-                            dropped,
-                        })
-                        .is_err()
-                    {
-                        return Reply::code("AUDIT_UNAVAILABLE");
-                    }
+                if !self.record(json!({"event":"LOCKED","actor":actor,"dropped":dropped})) {
+                    return Reply::code("AUDIT_UNAVAILABLE");
                 }
                 Reply::code("OK")
             }
@@ -182,16 +291,7 @@ impl Boundary {
                 };
                 let outcome =
                     state.unlock(self.config.service_uid, &did, Some(fragment), passphrase);
-                let event = match &outcome {
-                    Ok(()) => Event::Unlocked { uid: actor, did },
-                    Err(error) => Event::Denied {
-                        uid: Some(actor),
-                        pid: None,
-                        reason: error.wire_message(),
-                    },
-                };
-                if state.record_service(&event).is_err() {
-                    self.lock_all();
+                if !self.record(json!({"event":if outcome.is_ok() {"UNLOCKED"} else {"UNLOCK_REFUSED"},"actor":actor,"vault_id":vault_id,"kid":kid})) {
                     return Reply::code("AUDIT_UNAVAILABLE");
                 }
                 match outcome {
@@ -343,9 +443,10 @@ pub async fn serve(config: ServiceConfig, mut stop: watch::Receiver<bool>) -> Re
     for id in &config.vault_ids {
         paths::state_directory(&config.vault(id)?, config.service_uid)?;
     }
+    let database = Database::recover(&config, SystemClock.now()?)?;
     let (sign, _sign_guard) = bind(&config.sign_socket, config.service_uid, config.agent_gid)?;
     let (admin, _admin_guard) = bind(&config.admin_socket, config.service_uid, config.admin_gid)?;
-    let boundary = Arc::new(Boundary::new(config)?);
+    let boundary = Arc::new(Boundary::new(config, database)?);
     tracing::info!("Linux boundary preview listening; signing and protected support unavailable");
     let (shutdown, shutdown_rx) = watch::channel(false);
     let sweeper = {

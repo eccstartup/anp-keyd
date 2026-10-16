@@ -23,6 +23,7 @@ pub fn validate_uuid(value: &str) -> bool {
         })
 }
 
+/// Resolve an initialization snapshot only. Protected request admission uses SQLite.
 pub fn resolve(principals: &[Principal], uid: u32) -> Result<&Principal> {
     principals
         .iter()

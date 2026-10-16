@@ -67,6 +67,43 @@ impl Client {
         self.reply()
     }
 
+    pub fn principals(mut self) -> Result<Reply> {
+        self.management()?;
+        protocol::write(
+            &mut self.stream,
+            &Envelope {
+                version: VERSION,
+                request: AdminRequest::ListPrincipals {},
+            },
+        )?;
+        self.reply()
+    }
+    pub fn prepare(mut self, change: crate::persistence::Change) -> Result<Reply> {
+        self.management()?;
+        protocol::write(
+            &mut self.stream,
+            &Envelope {
+                version: VERSION,
+                request: AdminRequest::Prepare { change },
+            },
+        )?;
+        self.reply()
+    }
+    pub fn commit(mut self, operation_id: String, digest: String) -> Result<Reply> {
+        self.management()?;
+        protocol::write(
+            &mut self.stream,
+            &Envelope {
+                version: VERSION,
+                request: AdminRequest::Commit {
+                    operation_id,
+                    digest,
+                },
+            },
+        )?;
+        self.reply()
+    }
+
     pub fn lock_all(mut self) -> Result<Reply> {
         self.management()?;
         protocol::write(

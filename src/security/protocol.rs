@@ -27,6 +27,15 @@ pub enum DataRequest {
 pub enum AdminRequest {
     #[serde(rename = "GET_CAPABILITIES")]
     Capabilities {},
+    #[serde(rename = "LIST_PRINCIPALS")]
+    ListPrincipals {},
+    #[serde(rename = "PREPARE_OPERATION")]
+    Prepare { change: crate::persistence::Change },
+    #[serde(rename = "COMMIT_OPERATION")]
+    Commit {
+        operation_id: String,
+        digest: String,
+    },
     #[serde(rename = "LOCK_ALL")]
     LockAll {},
     #[serde(rename = "UNLOCK_KEY")]
@@ -72,6 +81,12 @@ pub struct Reply {
     pub principal_id: Option<String>,
     pub signing_available: bool,
     pub protected_supported: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared: Option<crate::persistence::Prepared>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_epoch: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principals: Option<Vec<crate::principal::Principal>>,
 }
 impl Reply {
     pub fn code(code: &str) -> Self {
@@ -82,6 +97,9 @@ impl Reply {
             principal_id: None,
             signing_available: false,
             protected_supported: false,
+            prepared: None,
+            boot_epoch: None,
+            principals: None,
         }
     }
 }

@@ -69,7 +69,7 @@ pub fn probe(path: &Path) -> Result<()> {
     println!("admin_uids: {:?}", config.admin_uids);
     for principal in &config.principals {
         println!(
-            "principal: {} uid={} generation={} enabled={}",
+            "bootstrap principal (not live DB state): {} uid={} generation={} enabled={}",
             principal.principal_id, principal.uid, principal.generation, principal.enabled
         );
     }

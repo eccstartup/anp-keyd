@@ -1,5 +1,5 @@
 > 日常签名仍使用开发模式，尚无有限 grant。同 UID 的 Agent 不隔离；
-> v1 解锁口令会经过 socket。Linux 新增 M1 边界预览，但签名入口保持关闭，
+> v1 解锁口令会经过 socket。Linux 边界预览已接入持久状态，但签名入口保持关闭，
 > `protected_supported=false`。软件整套目录加口令仍可解封；硬件仅保护解封材料。
 
 # anp-keyd
@@ -290,6 +290,8 @@ cargo install --path . --features hardware-tpm   # Linux:钥匙可以绑到 TPM 
 ## Linux 边界预览
 
 新增 `serve-protected`、`admin status/lock-all/unlock` 和 `probe --security`。
+M2 首批已接入 SQLite、启动恢复、事务审计，以及两阶段主体注册/禁用；
+数据库须显式初始化，丢失或损坏时不会自动重建。
 服务账号、管理员与 Agent 使用独立 UID，管理面和数据面分别监听；客户端先验证
 服务内核 UID 再发送密码。配置和安装程序由 root 持有。
 

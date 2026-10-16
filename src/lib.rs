@@ -14,6 +14,7 @@ pub mod keystore;
 pub mod mcp;
 pub mod ops;
 pub mod principal;
+pub mod persistence;
 pub mod security;
 pub mod sign;
 pub mod tty;
