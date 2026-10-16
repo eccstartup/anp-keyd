@@ -1,0 +1,34 @@
+[Unit]
+Description=ANP signing boundary preview (signing disabled)
+After=local-fs.target systemd-tmpfiles-setup.service
+
+[Service]
+Type=simple
+User=anp-keyd
+Group=anp-keyd
+SupplementaryGroups=anp-keyd-agent anp-keyd-admin
+ExecStart=/usr/local/libexec/anp-keyd serve-protected --config /etc/anp-keyd/service.json
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitCORE=0
+LimitMEMLOCK=64M
+TasksMax=64
+ReadWritePaths=/var/lib/anp-keyd /run/anp-keyd/sign /run/anp-keyd/admin
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

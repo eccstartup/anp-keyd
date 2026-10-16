@@ -78,6 +78,8 @@ fn help_template() -> String {
          Commands:\n\
          \n\
          \x20 serve               Run the daemon: answer signing requests over a Unix socket.\n\
+         \x20 serve-protected     Linux boundary preview (signing unavailable).\n\
+         \x20 admin               Use the independent Linux management channel.\n\
          \x20 stop                Stop the daemon `serve` left running in the background.\n\
          \n\
          For agents — over the socket, no passphrase:\n\
@@ -140,6 +142,10 @@ fn help_template() -> String {
 pub enum Command {
     /// Run the daemon: answer signing requests over a Unix socket.
     Serve(ServeArgs),
+    /// Linux boundary preview; signing is unavailable until grant enforcement ships.
+    ServeProtected(ProtectedArgs),
+    /// Authenticate to the independent Linux management socket.
+    Admin(AdminArgs),
     /// Stop the daemon that `serve` left running in the background.
     Stop,
 
@@ -230,7 +236,40 @@ pub struct McpArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct ProtectedArgs {
+    #[arg(long, default_value = crate::security::config::DEFAULT_CONFIG)]
+    pub config: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub struct AdminArgs {
+    #[arg(long, default_value = crate::security::config::DEFAULT_CONFIG)]
+    pub config: PathBuf,
+    #[command(subcommand)]
+    pub operation: AdminCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AdminCommand {
+    Status,
+    LockAll,
+    Unlock {
+        #[arg(long)]
+        vault_id: String,
+        #[arg(long)]
+        did: String,
+        #[arg(long)]
+        kid: String,
+    },
+}
+
+#[derive(Args, Debug)]
 pub struct ProbeArgs {
+    /// Inspect the Linux deployment boundary. Remains nonzero until protected release support.
+    #[arg(long)]
+    pub security: bool,
+    #[arg(long, default_value = crate::security::config::DEFAULT_CONFIG, requires = "security")]
+    pub config: PathBuf,
     /// Also report this DID's envelope: kid, thumbprint, and whether the copy on
     /// disk reads back. All of it is public — no passphrase needed.
     #[arg(long)]
@@ -734,7 +773,72 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::VerifyDoc(args) => verify_doc(root, args),
         Command::List => list(root),
         Command::Status => status(root),
-        Command::Probe(args) => crate::ops::probe::probe(root, args.did.as_deref()),
+        Command::Probe(args) => {
+            if args.security {
+                if root.is_some() || args.did.is_some() {
+                    return Err(KeydError::Misuse(
+                        "security probe cannot use --root or --did".into(),
+                    ));
+                }
+                crate::security::probe(&args.config)
+            } else {
+                crate::ops::probe::probe(root, args.did.as_deref())
+            }
+        }
+        Command::ServeProtected(args) => {
+            if root.is_some() {
+                return Err(KeydError::Misuse(
+                    "protected endpoints cannot use --root".into(),
+                ));
+            }
+            crate::security::require_linux()?;
+            let config = crate::security::config::ServiceConfig::load(&args.config)?;
+            crate::daemon::service::install_logging()?;
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async move {
+                let (stop, receiver) = tokio::sync::watch::channel(false);
+                let signals = tokio::spawn(async move {
+                    #[cfg(target_os = "linux")]
+                    {
+                        let mut term = tokio::signal::unix::signal(
+                            tokio::signal::unix::SignalKind::terminate(),
+                        )?;
+                        tokio::select! { _ = term.recv() => {}, _ = tokio::signal::ctrl_c() => {} }
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    tokio::signal::ctrl_c().await?;
+                    let _ = stop.send(true);
+                    Ok::<_, std::io::Error>(())
+                });
+                let result = crate::security::server::serve(config, receiver).await;
+                signals.abort();
+                result
+            })
+        }
+        Command::Admin(args) => {
+            if root.is_some() {
+                return Err(KeydError::Misuse(
+                    "admin endpoints cannot use --root".into(),
+                ));
+            }
+            use crate::security::client::Client as AdminClient;
+            let client = AdminClient::connect(&args.config, true)?;
+            let reply = match args.operation {
+                AdminCommand::Status => client.capabilities()?,
+                AdminCommand::LockAll => client.lock_all()?,
+                AdminCommand::Unlock { vault_id, did, kid } => {
+                    // Preflight before prompting; reconnect and authenticate again before sending.
+                    client.capabilities()?;
+                    let terminal = tty::open()?;
+                    let secret = tty::read_secret(&terminal, "Passphrase: ")?;
+                    AdminClient::connect(&args.config, true)?.unlock(vault_id, did, kid, secret)?
+                }
+            };
+            println!("{}", serde_json::to_string(&reply)?);
+            Ok(())
+        }
         Command::Unlock(args) => unlock(root, args),
         Command::Lock(args) => lock(root, args),
         Command::Sign(args) => sign(root, args),
@@ -1499,6 +1603,15 @@ mod tests {
         let mut full = vec!["anp-keyd"];
         full.extend_from_slice(argv);
         Cli::try_parse_from(full)
+    }
+
+    #[test]
+    fn protected_cli_has_no_socket_or_secret_override() {
+        assert!(parse(&["admin", "--socket", "/tmp/fake", "status"]).is_err());
+        assert!(parse(&["admin", "unlock", "--passphrase", "secret"]).is_err());
+        assert!(parse(&["probe", "--config", "/tmp/fake"]).is_err());
+        assert!(parse(&["probe", "--security"]).is_ok());
+        assert!(parse(&["serve-protected"]).is_ok());
     }
 
     #[test]

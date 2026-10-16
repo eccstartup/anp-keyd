@@ -1,13 +1,13 @@
-> 当前仅支持开发模式，尚未完成受保护部署和有限 grant。相同 UID 的 Agent
-> 不隔离；TTY 不是人类身份凭证；v1 解锁口令会经过 socket。软件信封与
-> device.secret 整套复制后可用口令解封。硬件仅保护解封材料，Ed25519 在进程内执行。
+> 日常签名仍使用开发模式，尚无有限 grant。同 UID 的 Agent 不隔离；
+> v1 解锁口令会经过 socket。Linux 新增 M1 边界预览，但签名入口保持关闭，
+> `protected_supported=false`。软件整套目录加口令仍可解封；硬件仅保护解封材料。
 
 # anp-keyd
 
 一个跑在你自己机器上的守护进程,替 agent 保管 did:wba 的 Ed25519 私钥,
 并按 [RFC 9421] 签 HTTP 消息签名。
 
-**agent 手里从来没有私钥字节。** agent 通过 Unix socket 说话,请求里可以带
+**socket 不返回私钥字节。** agent 通过 Unix socket 说话,请求里可以带
 方法、URL、头、请求体 —— 唯独没有一个字段能装私钥。守护进程自己重建签名基、
 自己决定覆盖面,签完把签名头递回来。
 
@@ -285,7 +285,17 @@ cargo install --path . --features hardware-tpm   # Linux:钥匙可以绑到 TPM 
 
 只复制不含 device.secret 的信封不足以解封；整套软件目录加口令可以解封。
 硬件绑定增加本机解封依赖，签名仍在 daemon 普通内存执行。本地审计链与锚
-可检测部分修改，不能抵御整套回滚。独立 UID 管理域和有限 grant 尚未交付。
+可检测部分修改，不能抵御整套回滚。独立 UID 管理域已有 Linux 预览；有限 grant 尚未交付。
+
+## Linux 边界预览
+
+新增 `serve-protected`、`admin status/lock-all/unlock` 和 `probe --security`。
+服务账号、管理员与 Agent 使用独立 UID，管理面和数据面分别监听；客户端先验证
+服务内核 UID 再发送密码。配置和安装程序由 root 持有。
+
+这一阶段不开放数据面签名、grant 或密钥迁移，不能替代完整受保护版本。
+安装器与一次性 Linux 容器验收见 [deploy/linux](deploy/linux/README.md)。
+旧 `serve`、CLI 和 MCP 开发流程继续保留，两种服务不会自动降级互通。
 
 ## 硬件根
 
