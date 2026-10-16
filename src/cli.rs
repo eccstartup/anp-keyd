@@ -79,6 +79,7 @@ fn help_template() -> String {
          \n\
          \x20 serve               Run the daemon: answer signing requests over a Unix socket.\n\
          \x20 serve-protected     Linux v2 transaction signer (release acceptance pending).\n\
+         \x20 audit-checkpoint    Verify SQLite history against an independently retained checkpoint.\n\
          \x20 build-info          Print build mode and security-sensitive feature flags.\n\
          \x20 inspect-vault       Inspect legacy inventory; --verify tests recovery via tty.\n\
          \x20 data                Send a protected v2 request from --file through trusted config.\n\
@@ -163,6 +164,19 @@ pub enum Command {
     Admin(AdminArgs),
     /// Send one typed v2 data request through the authenticated configured endpoint.
     Data(DataArgs),
+    /// Read-only audit evidence; retain the output in an independent trust domain.
+    AuditCheckpoint {
+        #[arg(long)]
+        database: PathBuf,
+        /// Expected service instance from trusted provisioning, not the database.
+        #[arg(long)]
+        instance_id: String,
+        /// Previously retained checkpoint. Omit only for explicit first enrollment.
+        #[arg(long, required_unless_present = "enroll", conflicts_with = "enroll")]
+        previous: Option<PathBuf>,
+        #[arg(long)]
+        enroll: bool,
+    },
     /// Stop the daemon that `serve` left running in the background.
     Stop,
 
@@ -822,6 +836,29 @@ pub fn run(cli: Cli) -> Result<()> {
     let Cli { root, command } = cli;
     let root = root.as_deref();
     match command {
+        Command::AuditCheckpoint {
+            database,
+            instance_id,
+            previous,
+            enroll: _,
+        } => {
+            if root.is_some() {
+                return Err(KeydError::Misuse(
+                    "audit-checkpoint uses --database, not --root".into(),
+                ));
+            }
+            let previous = previous
+                .as_deref()
+                .map(crate::persistence::checkpoint::read)
+                .transpose()?;
+            let evidence = crate::persistence::checkpoint::inspect(
+                &database,
+                &instance_id,
+                previous.as_ref(),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&evidence)?);
+            Ok(())
+        }
         Command::Serve(args) => serve(root, args),
         Command::Stop => stop(root),
         Command::Keygen(args) => keygen(root, args),

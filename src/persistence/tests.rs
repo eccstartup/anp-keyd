@@ -2147,3 +2147,81 @@ fn durable_http_result_preserves_covered_type_but_not_private_application_header
         .unwrap()
         .contains("must-not-persist"));
 }
+
+#[test]
+fn independent_checkpoint_detects_consistent_rollback_and_fork() {
+    let mut f = Fixture::new();
+    let path = f.dir.join("state.sqlite");
+    let id = &f.config.instance_id.clone();
+    let initial = checkpoint::inspect(&path, id, None).unwrap();
+    let backup = f.dir.join("before.sqlite");
+    std::fs::copy(&path, &backup).unwrap();
+    let op = f.disable();
+    let tip = checkpoint::inspect(&path, id, Some(&initial)).unwrap();
+    assert!(tip.sequence > initial.sequence);
+    assert_eq!(checkpoint::inspect(&path, id, Some(&tip)).unwrap(), tip);
+    // Both histories have valid local chains; the independently saved tip
+    // distinguishes the older snapshot, including after copying all local files.
+    assert!(checkpoint::inspect(&backup, id, Some(&tip)).is_err());
+    let fork = open(&backup).unwrap();
+    let tx = fork.unchecked_transaction().unwrap();
+    append(&tx, &json!({"event":"alternate_branch"})).unwrap();
+    tx.commit().unwrap();
+    drop(fork);
+    assert!(checkpoint::inspect(&backup, id, Some(&tip)).is_err());
+    // A retained prefix says nothing about an unobserved suffix.
+    assert!(checkpoint::inspect(&backup, id, Some(&initial)).is_ok());
+    assert!(checkpoint::inspect(&path, &uuid(), Some(&tip)).is_err());
+    assert!(checkpoint::inspect(&path, id, None).is_ok());
+    f.db.commit(1002, &op.operation_id, &op.digest, now())
+        .unwrap();
+    assert!(checkpoint::inspect(&path, id, Some(&tip)).unwrap().sequence > tip.sequence);
+}
+
+#[test]
+fn checkpoint_rejects_corruption_bad_formats_and_unsafe_inputs_without_writes() {
+    let f = Fixture::new();
+    let path = f.dir.join("state.sqlite");
+    let id = &f.config.instance_id;
+    let before = std::fs::read(&path).unwrap();
+    let tip = checkpoint::inspect(&path, id, None).unwrap();
+    assert_eq!(before, std::fs::read(&path).unwrap());
+    let retained = f.dir.join("retained.json");
+    std::fs::write(&retained, serde_json::to_vec(&tip).unwrap()).unwrap();
+    assert_eq!(checkpoint::read(&retained).unwrap(), tip);
+    for bytes in [
+        b"{}".to_vec(),
+        vec![b' '; 4097],
+        b"{\"version\":2}".to_vec(),
+    ] {
+        std::fs::write(&retained, bytes).unwrap();
+        assert!(checkpoint::read(&retained).is_err());
+    }
+    let link = f.dir.join("link");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    assert!(checkpoint::inspect(&link, id, None).is_err());
+    assert!(checkpoint::read(&link).is_err());
+    for mutate in [
+        "UPDATE audit_events SET event_digest='bad' WHERE seq=1",
+        "PRAGMA user_version=999",
+    ] {
+        let copy = f.dir.join(format!("{}.sqlite", uuid()));
+        std::fs::copy(&path, &copy).unwrap();
+        let db = open(&copy).unwrap();
+        db.execute_batch(mutate).unwrap();
+        drop(db);
+        assert!(checkpoint::inspect(&copy, id, Some(&tip)).is_err());
+    }
+    let mut bad = tip.clone();
+    bad.sequence = 0;
+    assert!(checkpoint::inspect(&path, id, Some(&bad)).is_err());
+    bad = tip.clone();
+    bad.digest = "G".repeat(64);
+    assert!(checkpoint::inspect(&path, id, Some(&bad)).is_err());
+    bad = tip;
+    bad.version = 2;
+    assert!(checkpoint::inspect(&path, id, Some(&bad)).is_err());
+    assert!(!f.dir.join("missing.sqlite").exists());
+    assert!(checkpoint::inspect(&f.dir.join("missing.sqlite"), id, None).is_err());
+    assert!(!f.dir.join("missing.sqlite").exists());
+}

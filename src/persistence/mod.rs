@@ -1,5 +1,6 @@
 //! Single-writer state and transactional audit. Never stores private material.
 pub mod catalog;
+pub mod checkpoint;
 pub mod clock;
 pub mod grants;
 mod policy;
