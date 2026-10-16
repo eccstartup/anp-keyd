@@ -1282,3 +1282,53 @@ fn v2_to_v3_migration_is_atomic_and_invalidates_old_grants() {
     );
     verify_audit(&f.db.connection).unwrap();
 }
+
+#[test]
+fn missing_monotonic_deadline_stops_authorization() {
+    let (mut f, key, policy) = grant_fixture();
+    let g = new_grant(&mut f, &key, &policy);
+    f.db.connection
+        .execute(
+            "DELETE FROM grant_deadlines WHERE grant_id=?1",
+            [&g.grant_id],
+        )
+        .unwrap();
+    assert!(f
+        .db
+        .authorize_http(&g.principal_id, &g.grant_id, &canonical(), now())
+        .is_err());
+}
+#[test]
+fn every_nonhot_role_is_forbidden_for_grants_and_data() {
+    let (mut f, key, policy) = grant_fixture();
+    let g = new_grant(&mut f, &key, &policy);
+    for role in ["root", "recovery", "unclassified", "challenge"] {
+        f.db.connection
+            .execute(
+                "UPDATE keys SET role=?1 WHERE key_id=?2",
+                params![role, key],
+            )
+            .unwrap();
+        assert!(f
+            .db
+            .authorize_http(&g.principal_id, &g.grant_id, &canonical(), now())
+            .is_err());
+        assert!(f
+            .db
+            .prepare(
+                1002,
+                Change::Grant {
+                    change: grants::GrantChange::Create {
+                        principal_id: g.principal_id.clone(),
+                        key_id: key.clone(),
+                        policy_id: policy.clone(),
+                        policy_version: 1,
+                        expiry: 1050,
+                        max_uses: 1
+                    }
+                },
+                now()
+            )
+            .is_err());
+    }
+}

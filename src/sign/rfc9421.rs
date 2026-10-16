@@ -162,6 +162,20 @@ pub fn sign_request(
     key: &LockedSigningKey,
     req: &SignRequest,
 ) -> Result<Signed> {
+    sign_request_with_window(document, key, req, None)
+}
+
+/// Internal profile entry point: only the trusted executor supplies timestamps.
+/// A grant deadline must be converted to a non-extending wall deadline by it.
+pub(crate) fn sign_request_with_window(
+    document: &Value,
+    key: &LockedSigningKey,
+    req: &SignRequest,
+    window: Option<(i64, i64)>,
+) -> Result<Signed> {
+    if window.is_some_and(|(created, expires)| created < 0 || expires <= created) {
+        return Err(KeydError::Protocol("invalid signature validity window".into()));
+    }
     req.validate()?;
     let required = required_components(req);
 
@@ -197,8 +211,8 @@ pub fn sign_request(
             // 签名"的一部分 —— 所以它是**被签的**,调用方改它最多让自己那条
             // 签名对不上服务端的挑战。见 `docs/ADAPTER.md` §3.1。
             nonce: req.nonce.clone(),
-            created: None,
-            expires: None,
+            created: window.map(|v| v.0),
+            expires: window.map(|v| v.1),
             // 这里就是"守护进程决定"落到实处的地方 —— 这个值不是调用方给的,
             // 调用方最多只能让它变大。
             covered_components: Some(wanted.clone()),
@@ -593,6 +607,80 @@ mod tests {
             .as_str()
             .unwrap());
         (with_id, signed)
+    }
+
+    #[test]
+    fn canonical_profile_caps_validity_by_both_grant_clocks_and_covers_empty_body() {
+        use crate::persistence::clock::Time;
+        use crate::security::http::{Body, CanonicalHttpRequest, HttpRequest};
+        let (key, doc) = fixture(46);
+        let canonical = CanonicalHttpRequest::new(HttpRequest {
+            method: "POST".into(),
+            url: "https://EXAMPLE.com:443/x".into(),
+            headers: BTreeMap::from([("Content-Type".into(), "application/json".into())]),
+            body: Body::Present { bytes: vec![] },
+            nonce: Some("test-nonce".into()),
+        })
+        .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for (wall_expiry, mono_deadline, expected) in [
+            (now + 600, 101_000, now + 100),
+            (now + 20, 101_000, now + 20),
+            (now + 1000, 1_001_000, now + 300),
+        ] {
+            let signed = canonical
+                .sign_profile(
+                    &doc,
+                    &key,
+                    Time {
+                        wall: now,
+                        monotonic_ms: 1000,
+                    },
+                    wall_expiry,
+                    mono_deadline,
+                )
+                .unwrap();
+            let req = canonical.signing_request();
+            let mut headers = req.headers.clone();
+            headers.extend(signed.headers);
+            let metadata = anp::authentication::verify_http_message_signature(
+                &doc,
+                &req.method,
+                &req.url,
+                &headers,
+                req.body.as_deref(),
+            )
+            .unwrap();
+            assert_eq!(metadata.created, now);
+            assert_eq!(metadata.expires, Some(expected));
+            assert_eq!(metadata.keyid, key.id().kid);
+            for name in [
+                "@method",
+                "@target-uri",
+                "@authority",
+                "content-digest",
+                "content-type",
+            ] {
+                assert!(metadata.components.contains(&name.to_owned()));
+            }
+        }
+        for (expiry, deadline) in [(now, 101_000), (now + 10, 1000), (now + 10, 1999)] {
+            assert!(canonical
+                .sign_profile(
+                    &doc,
+                    &key,
+                    Time {
+                        wall: now,
+                        monotonic_ms: 1000
+                    },
+                    expiry,
+                    deadline
+                )
+                .is_err());
+        }
     }
 
     fn request(body: Option<&[u8]>) -> SignRequest {

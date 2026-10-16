@@ -130,3 +130,39 @@ pub fn serve(config: PathBuf) -> crate::error::Result<()> {
             Ok(())
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn protected_tools_have_no_identity_endpoint_or_secret_overrides() {
+        let tools = Keyd::tool_router().list_all();
+        assert_eq!(tools.len(), 5);
+        for tool in tools {
+            let schema = serde_json::to_string(&tool.input_schema).unwrap();
+            for name in [
+                "passphrase",
+                "password",
+                "socket",
+                "config",
+                "root",
+                "did",
+                "kid",
+                "covered",
+            ] {
+                assert!(
+                    !schema.contains(&format!("\"{name}\"")),
+                    "{} contains {name}",
+                    tool.name
+                );
+            }
+        }
+        assert!(
+            serde_json::from_value::<NoArgs>(serde_json::json!({"socket":"/tmp/evil"})).is_err()
+        );
+        assert!(serde_json::from_value::<GrantArgs>(
+            serde_json::json!({"grant_id":"x","root":"/tmp/evil"})
+        )
+        .is_err());
+    }
+}

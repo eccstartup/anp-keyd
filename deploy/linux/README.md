@@ -179,3 +179,19 @@ rejection, migration rollback, unknown roles and policy immutability. Strict
 all-targets Clippy passed; the prior hardware import warning's feature guard is
 corrected. These are deterministic crash-boundary tests, not physical power-loss
 experiments. Systemd-host acceptance and the M3/M4 signing executor remain pending.
+
+## M3 authorization preview verification on 2026-10-16
+
+Rust 1.88 and 1.90 disposable Linux containers each passed 467 default tests and
+one explicit temporary-identity fixture. Their independent-UID harnesses passed
+85 and 89 checks respectively; the 1.90 run also builds MCP and verifies real
+stdio initialization, v2 tool schemas, caller-scoped keys and no legacy fallback.
+Set `ANP_KEYD_TEST_MCP=1` to include those MCP checks in the container harness.
+macOS `mcp,hardware-software` passed 481 tests; strict all-targets Clippy passed.
+
+M3 adds exact-hot-key grants, revocation, immutable policy evaluation, dual-clock
+deadlines, schema v3 and authenticated v2 CLI/MCP clients. Valid `SIGN_HTTP`
+requests still return `SIGNING_UNAVAILABLE`: M4 must supply transactional quota
+reservation, idempotency, signing and durable result delivery before activation.
+`protected_supported` remains false. No host accounts or real identities were
+modified; systemd-host and real-service acceptance remain pending.

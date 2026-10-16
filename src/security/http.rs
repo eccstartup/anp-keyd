@@ -187,6 +187,33 @@ impl CanonicalHttpRequest {
     pub fn signing_request(&self) -> &SignRequest {
         &self.request
     }
+    /// Fixed anp-http-v2 signature profile, for the M4 executor after reservation.
+    /// Timestamp arguments come from the service clock and grant, never data input.
+    pub fn sign_profile(
+        &self,
+        document: &serde_json::Value,
+        key: &crate::sign::LockedSigningKey,
+        now: crate::persistence::clock::Time,
+        grant_expiry: i64,
+        monotonic_deadline: i64,
+    ) -> Result<crate::sign::rfc9421::Signed> {
+        let remaining = monotonic_deadline
+            .checked_sub(now.monotonic_ms)
+            .filter(|v| *v > 0)
+            .ok_or_else(denied)?
+            / 1000;
+        let expires = now
+            .wall
+            .checked_add(remaining.min(300))
+            .ok_or_else(denied)?
+            .min(grant_expiry);
+        crate::sign::rfc9421::sign_request_with_window(
+            document,
+            key,
+            &self.request,
+            Some((now.wall, expires)),
+        )
+    }
     pub fn digest(&self) -> Result<String> {
         use sha2::{Digest, Sha256};
         let bytes=serde_json_canonicalizer::to_vec(&serde_json::json!({"profile":"anp-http-v2","method":self.request.method,"url":self.request.url,"headers":self.request.headers,"body":self.request.body,"nonce":self.request.nonce})).map_err(|_|denied())?;

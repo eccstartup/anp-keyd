@@ -868,14 +868,21 @@ pub fn run(cli: Cli) -> Result<()> {
             })
         }
         Command::Data(args) => {
-            if root.is_some() {return Err(KeydError::Misuse("data endpoints cannot use --root".into()));}
+            if root.is_some() {
+                return Err(KeydError::Misuse("data endpoints cannot use --root".into()));
+            }
             use std::io::Read;
-            let mut bytes=Vec::new();
-            std::fs::File::open(args.file)?.take((crate::security::protocol::MAX_FRAME+1) as u64).read_to_end(&mut bytes)?;
-            if bytes.len()>crate::security::protocol::MAX_FRAME {return Err(KeydError::Misuse("data input too large".into()));}
-            let request=crate::security::json::decode(&bytes)?;
-            let reply=crate::security::client::Client::connect(&args.config,false)?.data(request)?;
-            println!("{}",serde_json::to_string(&reply)?);
+            let mut bytes = Vec::new();
+            std::fs::File::open(args.file)?
+                .take((crate::security::protocol::MAX_FRAME + 1) as u64)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > crate::security::protocol::MAX_FRAME {
+                return Err(KeydError::Misuse("data input too large".into()));
+            }
+            let request = crate::security::json::decode(&bytes)?;
+            let reply =
+                crate::security::client::Client::connect(&args.config, false)?.data(request)?;
+            println!("{}", serde_json::to_string(&reply)?);
             Ok(())
         }
         Command::Admin(args) => {
@@ -995,10 +1002,14 @@ pub fn run(cli: Cli) -> Result<()> {
         ),
         #[cfg(feature = "mcp")]
         Command::Mcp(args) => {
-            if let Some(config)=args.config {
-                if root.is_some() {return Err(KeydError::Misuse("protected MCP cannot use --root".into()));}
+            if let Some(config) = args.config {
+                if root.is_some() {
+                    return Err(KeydError::Misuse("protected MCP cannot use --root".into()));
+                }
                 crate::mcp::protected::serve(config)
-            } else {crate::mcp::serve(args.socket)}
+            } else {
+                crate::mcp::serve(args.socket)
+            }
         },
     }
 }

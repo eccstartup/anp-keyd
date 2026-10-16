@@ -220,6 +220,67 @@ assert s.recv(1)==b''
     policy_id = str(uuid.uuid4())
     policy = {'schema_version':1,'name':'read-only','purpose':'http-authentication','origin':'https://example.com','methods':['GET'],'paths':['/test'],'query':{'mode':'none'},'body':{'mode':'empty','max_bytes':0},'signature_profile':'anp-http-v2','grant_limits':{'max_duration_seconds':60,'max_uses':2}}
     commit_change({'kind':'Catalog','change':{'action':'PublishPolicy','policy_id':policy_id,'version':1,'content':policy}})
+    # M3 uses actual OS subjects, signed root/hot documents and typed v2 frames.
+    hot_key = next(k for k in catalog['keys'] if k['kid'].endswith('#http-hot'))
+    commit_change({'kind':'Catalog','change':{'action':'ConfirmRole','key_id':hot_key['key_id'],'role':'hot'}})
+    def data_as(name, operation):
+        script = admin_call.replace("secret=b'temporary-boundary-test-secret';", "secret=b'';").replace("+struct.pack('!I',len(secret))+secret", "")
+        result = subprocess.run([sys.executable,'-c',script,config['sign_socket'],json.dumps({'version':2,'request':operation})],preexec_fn=identity(name),capture_output=True,text=True,timeout=12)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+    check(data_as('boundary-agent-a',{'operation':'LIST_AUTHORIZED_KEYS'})['data']['keys'] == [], 'unlocked or enrolled keys alone give no data authorization')
+    principal_a=a['principal_id']; principal_b=b['principal_id']
+    create_grant={'action':'Create','principal_id':principal_a,'key_id':hot_key['key_id'],'policy_id':policy_id,'policy_version':1,'expiry':int(time.time())+55,'max_uses':2}
+    granted=commit_change({'kind':'Grant','change':create_grant})['effect']['effect']['grant']
+    grant_id=granted['grant_id']
+    check(len(grant_id)==64, 'grant references contain 256 random bits')
+    keys=data_as('boundary-agent-a',{'operation':'LIST_AUTHORIZED_KEYS'})['data']['keys']
+    check(len(keys)==1 and keys[0]['kid']==hot_key['kid'], 'Agent A sees exact granted hot key only')
+    check(data_as('boundary-agent-b',{'operation':'LIST_AUTHORIZED_KEYS'})['data']['keys']==[], 'Agent B cannot list Agent A keys')
+    check(data_as('boundary-agent-b',{'operation':'GET_GRANT_STATUS','grant_id':grant_id})['code']=='GRANT_INVALID', 'cross-principal grant lookup uniformly refused')
+    check(data_as('boundary-agent-b',{'operation':'GET_DOCUMENT','key_id':hot_key['key_id']})['code']=='GRANT_INVALID', 'cross-principal document handle refused')
+    check(data_as('boundary-agent-a',{'operation':'GET_DOCUMENT','key_id':hot_key['key_id']})['data']['document']['id']==fixture['did'], 'authorized public document returned')
+    http={'method':'GET','url':'https://EXAMPLE.com:443/test','headers':{},'body':{'state':'absent'},'nonce':None}
+    signing={'operation':'SIGN_HTTP','grant_id':grant_id,'request_id':str(uuid.uuid4()),'http':http}
+    check(data_as('boundary-agent-a',signing)['code']=='SIGNING_UNAVAILABLE', 'valid M3 request stops before unavailable M4 signing executor')
+    check(data_as('boundary-agent-b',signing)['code']=='GRANT_INVALID', 'cross-principal signing refused')
+    for target in ['https://evil.com/test','https://example.com/other','https://example.com/%74est','https://example.com/a/../test','https://example.com//test','https://example.com/test?a=1&a=2']:
+        denied={**signing,'http':{**http,'url':target}}
+        check(data_as('boundary-agent-a',denied)['code']=='POLICY_DENIED', 'policy and canonical target reject '+target)
+    check(data_as('boundary-agent-a',{**signing,'did':fixture['did']})['code']=='PROTOCOL_INVALID', 'data caller cannot override exact grant key')
+    for operation in ['SIGN_RAW','SIGN_CHALLENGE','LOCK_ALL']:
+        check(data_as('boundary-agent-a',{'operation':operation})['code']=='PROTOCOL_INVALID','v2 excludes '+operation)
+    root_grant={**create_grant,'key_id':root_key['key_id']}
+    source.write_text(json.dumps({'kind':'Grant','change':root_grant}));source.chmod(0o644)
+    check(command('boundary-admin','admin','prepare','--file',str(source)).returncode!=0, 'root role cannot enter an Agent grant')
+    check(data_as('boundary-agent-a',{'operation':'GET_GRANT_STATUS','grant_id':grant_id})['data']['used_uses']==0,'M3 validation does not consume quota or sign')
+    # Revoke A while a separate grant to B remains usable.
+    second=commit_change({'kind':'Grant','change':{**create_grant,'principal_id':principal_b}})['effect']['effect']['grant']['grant_id']
+    commit_change({'kind':'Grant','change':{'action':'Revoke','grant_id':grant_id}})
+    check(data_as('boundary-agent-a',signing)['code']=='GRANT_INVALID','revoked grant refused')
+    check(data_as('boundary-agent-b',{**signing,'grant_id':second})['code']=='SIGNING_UNAVAILABLE','revoking A leaves B authorization valid')
+    source.write_text(json.dumps({'operation':'LIST_AUTHORIZED_KEYS'}));source.chmod(0o644)
+    check(command('boundary-agent-b','data','--file',str(source)).returncode==0,'v2 CLI authenticates fixed configured endpoint')
+    check(command('boundary-agent-b','data','--socket','/tmp/evil','--file',str(source)).returncode!=0,'v2 CLI has no socket override')
+    if command('boundary-agent-b','mcp','--help').returncode == 0:
+        child=subprocess.Popen([binary,'mcp','--config',str(config_path)],preexec_fn=identity('boundary-agent-b'),stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,bufsize=1)
+        def rpc(value):
+            child.stdin.write(json.dumps(value)+'\n');child.stdin.flush()
+            assert select.select([child.stdout],[],[],10)[0], 'MCP reply timed out'
+            return json.loads(child.stdout.readline())
+        try:
+            init=rpc({'jsonrpc':'2.0','id':1,'method':'initialize','params':{'protocolVersion':'2024-11-05','capabilities':{},'clientInfo':{'name':'boundary-test','version':'1'}}})
+            check('result' in init,'protected MCP initializes with clean JSON stdout')
+            child.stdin.write(json.dumps({'jsonrpc':'2.0','method':'notifications/initialized'})+'\n');child.stdin.flush()
+            tools=rpc({'jsonrpc':'2.0','id':2,'method':'tools/list','params':{}})['result']['tools']
+            check(len(tools)==5 and all(t['name'] not in ['unlock','lock_all','sign_raw','sign_challenge'] for t in tools),'protected MCP exposes only five authorized v2 tools')
+            listed=rpc({'jsonrpc':'2.0','id':3,'method':'tools/call','params':{'name':'list_my_keys','arguments':{}}})
+            result=json.loads(listed['result']['content'][0]['text'])
+            check(result['data']['keys'][0]['key_id']==hot_key['key_id'],'protected MCP lists only caller-authorized hot key')
+            signed=rpc({'jsonrpc':'2.0','id':4,'method':'tools/call','params':{'name':'sign_request','arguments':{'grant_id':second,'request_id':str(uuid.uuid4()),'http':http}}})
+            check('SIGNING_UNAVAILABLE' in json.dumps(signed),'protected MCP forwards structured request without legacy fallback')
+        finally:
+            child.terminate();child.wait(timeout=10)
     policy['unexpected'] = True
     source.write_text(json.dumps({'kind':'Catalog','change':{'action':'PublishPolicy','policy_id':policy_id,'version':2,'content':policy}}))
     check(command('boundary-admin','admin','prepare','--file',str(source)).returncode != 0, 'policy schema rejects unknown fields')
@@ -361,10 +422,10 @@ try:
 finally:
     saved.rename(state_path)
 with sqlite3.connect(state_path) as database:
-    database.execute('PRAGMA user_version=3')
+    database.execute('PRAGMA user_version=4')
 check(command('anp-keyd', 'serve-protected').returncode != 0, 'newer schema stops startup')
 with sqlite3.connect(state_path) as database:
-    database.execute('PRAGMA user_version=2')
+    database.execute('PRAGMA user_version=3')
     database.execute("UPDATE audit_events SET event_data=x'00' WHERE seq=1")
 check(command('anp-keyd', 'serve-protected').returncode != 0, 'corrupt audit stops startup')
 print(json.dumps({'passed': len(passed), 'protected_supported': False}), flush=True)

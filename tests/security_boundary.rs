@@ -36,6 +36,30 @@ fn disposable_linux_fixture() {
     let wrapped = store::load(&layout, &created.wrapped.id.thumbprint).unwrap();
     let key = unwrap::unlock(&wrapped, pass, &device::load(&layout).unwrap()).unwrap();
     let doc = document::publishable(&spec, &created.did, &key).unwrap();
+    let (_, extra) = create::create_extra(
+        &layout,
+        &created.did,
+        "http-hot",
+        vec![anp::authentication::DidVerificationRelationship::Authentication],
+        "disposable-hot",
+        pass,
+        Argon2Config {
+            m_cost: 1024,
+            t_cost: 1,
+            p_cost: 1,
+        },
+        HardwareChoice::None,
+    )
+    .unwrap();
+    let unsigned = anp_keyd::did::lifecycle::strip_proof(&doc).unwrap();
+    let unsigned = anp_keyd::did::lifecycle::with_extra_key(
+        &unsigned,
+        &created.did,
+        &key.verifying_key(),
+        extra,
+    )
+    .unwrap();
+    let doc = document::sign_document(&unsigned, &key, &wrapped.id.kid).unwrap();
     store::write_did_document(&layout, &created.did, &doc).unwrap();
     std::fs::write(
         "/tmp/keyd-boundary-fixture-info.json",

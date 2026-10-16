@@ -200,6 +200,21 @@ impl Database {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;
+        if tx.query_row("SELECT EXISTS(SELECT 1 FROM grants g LEFT JOIN grant_deadlines d USING(grant_id) WHERE g.state='active' AND g.boot_epoch=?1 AND d.grant_id IS NULL)",[self.boot_epoch],|r|r.get::<_,bool>(0)).map_err(db_error)? {
+            return Err(unavailable());
+        }
+        let exhausted = tx
+            .execute(
+                "UPDATE grants SET state='exhausted' WHERE state='active' AND used_uses>=max_uses",
+                [],
+            )
+            .map_err(db_error)?;
+        if exhausted > 0 {
+            append(
+                &tx,
+                &json!({"event":"GRANTS_EXHAUSTED","count":exhausted,"at":now.wall}),
+            )?;
+        }
         let changed=tx.execute("UPDATE grants SET state='expired' WHERE state='active' AND (expiry<=?1 OR grant_id IN (SELECT grant_id FROM grant_deadlines WHERE monotonic_deadline<=?2))",params![now.wall,now.monotonic_ms]).map_err(db_error)?;
         if changed > 0 {
             append(

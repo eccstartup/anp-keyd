@@ -25,8 +25,10 @@ jobs:
       matrix:
         include:
           - rust: '1.88'
+            test_mcp: '0'
             image: rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0
           - rust: '1.90'
+            test_mcp: '1'
             image: rust:1.90-bookworm@sha256:3914072ca0c3b8aad871db9169a651ccfce30cf58303e5d6f2db16d1d8a7e58f
     timeout-minutes: 15
     steps:
@@ -36,6 +38,7 @@ jobs:
       - name: Build and test disposable service/admin/Agent domains
         run: >-
           docker run --rm
+          -e ANP_KEYD_TEST_MCP=${{ matrix.test_mcp }}
           -v "$GITHUB_WORKSPACE:/src:ro" -w /src
           "${{ matrix.image }}"
           bash deploy/linux/test-container.sh

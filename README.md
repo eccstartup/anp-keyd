@@ -1,5 +1,5 @@
-> 日常签名仍使用开发模式，尚无有限 grant。同 UID 的 Agent 不隔离；
-> v1 解锁口令会经过 socket。Linux 边界预览已接入持久状态，但签名入口保持关闭，
+> 日常签名仍使用开发模式。同 UID 的 Agent 不隔离；
+> v1 解锁口令会经过 socket。Linux 边界预览已接入持久 grant 与 v2 请求策略，但签名入口保持关闭，
 > `protected_supported=false`。软件整套目录加口令仍可解封；硬件仅保护解封材料。
 
 # anp-keyd
@@ -40,6 +40,34 @@ Signature: sig1=:VwRcADsdxfIJ5rQAXCXX3ygFsAP3l1ho+gdpNxcHzlZCdx/mef9yKzHgy9P1QzV
 [硬件根](#硬件根)一节、[docs/DESIGN.md](docs/DESIGN.md) 第九节,以及还没做完
 的部分(第十节)。
 
+## Linux v2 授权预览（M3）
+
+管理员通过 `admin prepare --file change.json` / `admin commit` 创建或撤销 grant；
+创建对象为 `{"kind":"Grant","change":{"action":"Create","principal_id":"…","key_id":"…","policy_id":"…","policy_version":1,"expiry":1792125000,"max_uses":2}}`。
+`expiry` 是实际部署时选择的未来 Unix 秒数，期限和次数不能超过不可变策略的上限。
+管理员从 catalog 选择已确认的热密钥；根、恢复、challenge 和未分类密钥均不能进入普通 grant。
+撤销对象为 `{"kind":"Grant","change":{"action":"Revoke","grant_id":"…"}}`。
+
+Agent 使用 `anp-keyd data --file request.json`，默认读取 `/etc/anp-keyd/service.json`，
+认证 daemon 后只发送一条 v2 请求，不自动重试或降级。例如：
+
+```json
+{"operation":"SIGN_HTTP","grant_id":"管理员交付的引用","request_id":"客户端生成并保留的 UUID","http":{"method":"GET","url":"https://example.com/test","headers":{},"body":{"state":"absent"},"nonce":null}}
+```
+
+有请求体时必须使用 `{"state":"present","bytes":[…]}`，空数组表示明确的空请求体。
+当前上限为 16384 字节，且整帧不能超过 65536 字节。HTTPS DNS origin、方法、路径和 query
+按精确策略检查；百分号编码、点路径、重复斜线、重复 query 键及重复大小写头均拒绝。
+规范化统一 host 大小写和默认端口，调用端最终必须使用规范化 URL，禁用自动重定向。
+数据请求还包括 `LIST_AUTHORIZED_KEYS`、`GET_GRANT_STATUS`（grant_id）、
+`GET_DOCUMENT`（key_id）与 `GET_REQUEST_STATUS`（request_id）。
+
+启用 MCP feature 后使用 `anp-keyd mcp --config /etc/anp-keyd/service.json`，
+只提供 v2 授权工具，工具参数不能覆盖 socket、配置、DID 或 kid；未指定 `--config` 的旧 MCP
+仍是显式开发模式。M3 不执行签名或消耗次数：授权校验通过返回 `SIGNING_UNAVAILABLE`，
+请求查询返回 `REQUEST_NOT_FOUND`。事务预留、去重、签名及结果交付属于 M4；
+`protected_supported=false`。schema v1/v2 可审计升级到 v3；重启撤销旧 grant 并锁定密钥。
+
 ## 安装
 
 需要 Rust 1.88 或更新,目前只能从源码构建:
@@ -50,8 +78,7 @@ cargo install --path .
 
 (或者 `cargo build --release`,用 `target/release/anp-keyd`。)
 
-没有别的依赖:不需要数据库、不需要网络、不需要配置文件。平台是 macOS 和
-Linux。
+开发模式无需网络或配置文件。Linux 边界预览使用 bundled SQLite 和管理员保护的服务配置；macOS 继续支持开发模式。
 
 **一条纪律先说一下:** 凡是需要口令的命令,都要求一个**真的控制终端**。
 cron、CI、systemd 的 `ExecStartPre`、被 agent 拉起来的子进程都在这一条外面

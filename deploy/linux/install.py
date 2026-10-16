@@ -124,7 +124,7 @@ def install(args):
         os.setgid(service.pw_gid)
         os.setuid(service.pw_uid)
     subprocess.run([str(BINARY), 'init-protected-state', '--config', str(CONFIG)], preexec_fn=service_identity, check=True)
-    print("Installed boundary preview. No signing/grants or vault migration enabled.")
+    print("Installed boundary preview. Grant/policy preview available; signing and vault migration remain disabled.")
     print("Review config, then run: systemctl daemon-reload && systemctl enable --now anp-keyd")
     print("Agents/admins need fresh login sessions for group membership. Keep Agents away from sudo, Docker and admin IPC.")
 
