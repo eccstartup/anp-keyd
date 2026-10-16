@@ -37,6 +37,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=Path('/Library/ANPKeyd/service.json'))
     parser.add_argument('--binary', type=Path, default=Path('/Library/ANPKeyd/bin/anp-keyd'))
+    parser.add_argument('--ui-preflight-only', action='store_true', help='only reproduce native preflight on an empty temporary service; cancel the single window if shown')
     parser.add_argument('--candidate-binary', type=Path, help='test a digest-pinned candidate in the temporary instance, without updating the installation')
     parser.add_argument('--candidate-sha256')
     parser.add_argument('--signing-helper', type=Path, help='digest-pinned local-preview-fixture example; enables full temporary signing checks')
@@ -52,16 +53,18 @@ def main():
         raise ValueError('--candidate-sha256 requires --candidate-binary')
     if args.signing_helper:
         args.signing_helper = args.signing_helper.absolute()
-    elif args.interactive_ui or args.helper_sha256:
+    elif (args.interactive_ui and not args.ui_preflight_only) or args.helper_sha256:
         raise ValueError('UI/digest options require --signing-helper')
     portable = args.container_regression
     if os.geteuid() != 0:
         raise ValueError('requires root; run in the human terminal')
     if portable:
-        if sys.platform != 'linux' or not Path('/.dockerenv').exists() or args.interactive_ui:
+        if sys.platform != 'linux' or not Path('/.dockerenv').exists() or args.interactive_ui or args.ui_preflight_only:
             raise ValueError('container regression requires disposable root Linux Docker without UI')
     elif sys.platform != 'darwin':
         raise ValueError('requires macOS')
+    if args.ui_preflight_only and args.signing_helper:
+        raise ValueError('--ui-preflight-only requires an empty instance without --signing-helper')
     installed = json.loads(args.config.read_text())
     expected_mode = 'linux-boundary-preview' if portable else 'macos-boundary-preview'
     if installed['mode'] != expected_mode or not installed['principals']:
@@ -169,6 +172,17 @@ print(json.dumps({'uid':os.getuid(),'euid':os.geteuid(),'gid':os.getgid(),'kerne
             print('PASS administrator authenticated temporary daemon', flush=True)
             first = json.loads(result.stdout)
             assert first['instance_id'] == config['instance_id'] and not first['protected_supported']
+            if args.ui_preflight_only:
+                print('UI PREFLIGHT: if a window appears, click Cancel only; no password or existing key is used.', flush=True)
+                command = [str(args.binary), 'admin', '--config', str(path), 'unlock', '--native-ui',
+                           '--vault-id', str(uuid.uuid4()), '--did', 'did:wba:example.com:ui-preflight-probe', '--kid', 'ui-preflight-probe']
+                result = subprocess.run(command, **credentials(admin), env=env, cwd='/',
+                                        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=150)
+                if result.returncode != 0 and 'native unlock cancelled' in result.stderr:
+                    print('PASS native preflight reached a cancellation response; no key or password used', flush=True)
+                else:
+                    raise ValueError('native preflight result: ' + result.stderr)
+                return
             checks = None
             if fixture:
                 checks = acceptance_signing.Checks(base, config, path, args, fixture, admin, agent, credentials, env, cli)

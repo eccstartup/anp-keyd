@@ -283,3 +283,11 @@ button responses cannot masquerade as human cancellation. Only explicit Unlock
 releases input. The human separately confirmed one installed-binary window was
 visible and manually cancelled; the full temporary-key UI EINVAL remains pending
 until rerun, and this independent cancel check is not full UI acceptance.
+
+For a failure before the first native window, use `--ui-preflight-only` with the
+digest-pinned candidate, omitting `--signing-helper` and `--interactive-ui`.
+It creates only empty temporary state, checks administrator status, then runs
+native unlock for a nonexistent temporary key. Click Cancel if a window appears;
+never enter a password. It does not exercise key unlock/signing and is diagnostic
+only. Socket errors identify timeout option setup, read, write or flush without
+logging frame data, and whole-frame deadlines remain unchanged.

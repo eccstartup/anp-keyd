@@ -63,17 +63,39 @@ impl DeadlineStream {
 }
 impl Read for DeadlineStream {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        self.stream.set_read_timeout(Some(self.remaining()?))?;
-        self.stream.read(buffer)
+        let remaining = self.remaining()?;
+        self.stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("set socket read timeout ({remaining:?}) failed: {error}"),
+                )
+            })?;
+        self.stream.read(buffer).map_err(|error| {
+            std::io::Error::new(error.kind(), format!("socket read failed: {error}"))
+        })
     }
 }
 impl Write for DeadlineStream {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        self.stream.set_write_timeout(Some(self.remaining()?))?;
-        self.stream.write(buffer)
+        let remaining = self.remaining()?;
+        self.stream
+            .set_write_timeout(Some(remaining))
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("set socket write timeout ({remaining:?}) failed: {error}"),
+                )
+            })?;
+        self.stream.write(buffer).map_err(|error| {
+            std::io::Error::new(error.kind(), format!("socket write failed: {error}"))
+        })
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        self.stream.flush()
+        self.stream.flush().map_err(|error| {
+            std::io::Error::new(error.kind(), format!("socket flush failed: {error}"))
+        })
     }
 }
 
