@@ -210,7 +210,7 @@ fn snapshot(root: &Path, vault: &str, wrapped: &WrappedKey) -> Result<KeyRecord>
         generation: 0,
     })
 }
-fn get_key(db: &Connection, key: &str) -> Result<KeyRecord> {
+pub(super) fn get_key(db: &Connection, key: &str) -> Result<KeyRecord> {
     db.query_row("SELECT key_id,vault_id,did,kid,role,envelope_digest,document_digest,state,identity_epoch,generation FROM keys WHERE key_id=?1", [key], |r| {
         let role: String = r.get(4)?;
         let role = match role.as_str() { "root" => KeyRole::Root, "hot" => KeyRole::Hot, "recovery" => KeyRole::Recovery, "challenge" => KeyRole::Challenge, "unclassified" => KeyRole::Unclassified, _ => return Err(rusqlite::Error::InvalidQuery) };

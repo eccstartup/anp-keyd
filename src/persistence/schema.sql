@@ -1,5 +1,5 @@
 CREATE TABLE service_meta (
- singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=2),
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=3),
  instance_id TEXT NOT NULL, boot_epoch INTEGER NOT NULL CHECK(boot_epoch>=0),
  mutation_epoch INTEGER NOT NULL CHECK(mutation_epoch>=0)
 ) STRICT;
@@ -52,3 +52,5 @@ CREATE TABLE file_operations (
  before_digest TEXT NOT NULL, after_digest TEXT NOT NULL, document BLOB NOT NULL,
  state TEXT NOT NULL CHECK(state IN ('pending','complete'))
 ) STRICT;
+
+CREATE TABLE grant_deadlines (grant_id TEXT PRIMARY KEY REFERENCES grants(grant_id), monotonic_deadline INTEGER NOT NULL) STRICT;

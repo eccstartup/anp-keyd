@@ -19,6 +19,20 @@ pub struct Envelope<T> {
 pub enum DataRequest {
     #[serde(rename = "GET_CAPABILITIES")]
     Capabilities {},
+    #[serde(rename = "LIST_AUTHORIZED_KEYS")]
+    ListAuthorizedKeys {},
+    #[serde(rename = "GET_GRANT_STATUS")]
+    GrantStatus { grant_id: String },
+    #[serde(rename = "GET_DOCUMENT")]
+    Document { key_id: String },
+    #[serde(rename = "SIGN_HTTP")]
+    SignHttp {
+        grant_id: String,
+        request_id: String,
+        http: super::http::HttpRequest,
+    },
+    #[serde(rename = "GET_REQUEST_STATUS")]
+    RequestStatus { request_id: String },
 }
 
 // Deliberately no Debug implementation: even malformed admin inputs are secret.
@@ -91,6 +105,8 @@ pub struct Reply {
     pub principals: Option<Vec<crate::principal::Principal>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<crate::persistence::catalog::Catalog>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
 }
 impl Reply {
     pub fn code(code: &str) -> Self {
@@ -105,6 +121,7 @@ impl Reply {
             boot_epoch: None,
             principals: None,
             catalog: None,
+            data: None,
         }
     }
 }
@@ -167,5 +184,45 @@ mod tests {
             assert!(!error.to_string().contains("secret"));
         }
         assert!(read::<_, Envelope<DataRequest>>(&mut &[0, 0, 0, 1, 3][..]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod v2_tests {
+    use super::*;
+    #[test]
+    fn structured_data_requires_body_state_and_forbids_key_or_profile_override() {
+        let base = serde_json::json!({"version":2,"request":{"operation":"SIGN_HTTP","grant_id":"g","request_id":"r","http":{"method":"POST","url":"https://example.com/x","headers":{},"body":{"state":"present","bytes":[]},"nonce":null}}});
+        let decode = |v: &serde_json::Value| {
+            let payload = serde_json::to_vec(v).unwrap();
+            let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
+            frame.extend(payload);
+            read::<_, Envelope<DataRequest>>(&mut &frame[..])
+        };
+        assert!(decode(&base).is_ok());
+        for field in [
+            "did",
+            "kid",
+            "key_id",
+            "covered",
+            "passphrase",
+            "signature_profile",
+        ] {
+            let mut bad = base.clone();
+            bad["request"][field] = serde_json::json!("override");
+            assert!(decode(&bad).is_err(), "{field}");
+        }
+        let mut bad = base.clone();
+        bad["request"]["http"]
+            .as_object_mut()
+            .unwrap()
+            .remove("body");
+        assert!(decode(&bad).is_err());
+        let mut bad = base.clone();
+        bad["request"]["http"]["body"] = serde_json::json!({"state":"absent","bytes":[]});
+        assert!(decode(&bad).is_err());
+        let mut bad = base.clone();
+        bad["request"]["http"]["body"]["bytes"] = serde_json::json!([256]);
+        assert!(decode(&bad).is_err());
     }
 }

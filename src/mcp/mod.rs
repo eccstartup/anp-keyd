@@ -2,6 +2,8 @@
 //! 不接受密码，不提供解锁、raw/challenge 或生命周期操作。
 //! 当前仍使用开发模式 v1；同 UID 不构成 Agent 隔离。
 
+pub mod protected;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 

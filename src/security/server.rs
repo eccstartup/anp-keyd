@@ -139,7 +139,11 @@ impl Boundary {
                 Ok(request) if request.version != VERSION => {
                     Reply::code("PROTOCOL_VERSION_UNSUPPORTED")
                 }
-                Ok(_) => self.capabilities(principal),
+                Ok(request) => self.data(
+                    peer.uid,
+                    principal.as_deref().expect("authenticated principal"),
+                    request.request,
+                ),
                 Err(_) => Reply::code("PROTOCOL_INVALID"),
             }
         };
@@ -150,6 +154,93 @@ impl Boundary {
         io.reset(Duration::from_secs(5));
         protocol::write(&mut io, &reply)
         // Exactly one request; dropping the stream rejects inherited old sessions.
+    }
+
+    fn data(&self, uid: u32, principal: &str, request: DataRequest) -> Reply {
+        // Recheck the live principal after reading the frame. A stalled connection
+        // must not retain access after DisablePrincipal commits.
+        let result = (|| -> Result<Reply> {
+            let _gate = self
+                .admin_gate
+                .lock()
+                .map_err(|_| KeydError::Protocol("PERSISTENCE_UNAVAILABLE".into()))?;
+            if self.stopped.load(Ordering::SeqCst) {
+                return Err(KeydError::Protocol("PERSISTENCE_UNAVAILABLE".into()));
+            }
+            let mut db = self
+                .database
+                .lock()
+                .map_err(|_| KeydError::Protocol("PERSISTENCE_UNAVAILABLE".into()))?;
+            if db.principal(uid)?.as_ref().map(|p| p.principal_id.as_str()) != Some(principal) {
+                return Err(KeydError::Misuse("PRINCIPAL_DISABLED".into()));
+            }
+            let now = SystemClock.now()?;
+            let mut reply = Reply::code("OK");
+            reply.principal_id = Some(principal.into());
+            match request {
+                DataRequest::Capabilities {} => {
+                    reply.boot_epoch = Some(db.boot_epoch);
+                    reply.data = Some(
+                        json!({"protocol_version":2,"profile":"anp-http-v2","max_body_bytes":16384,"transaction_executor_available":false}),
+                    );
+                }
+                DataRequest::ListAuthorizedKeys {} => {
+                    let keys = db.authorized_keys(principal, now)?;
+                    reply.data = Some(
+                        json!({"keys":keys.iter().map(|k|json!({"key_id":k.key_id,"did":k.did,"kid":k.kid})).collect::<Vec<_>>()}),
+                    );
+                }
+                DataRequest::GrantStatus { grant_id } => {
+                    reply.data = Some(serde_json::to_value(
+                        db.grant_status(principal, &grant_id, now)?,
+                    )?);
+                }
+                DataRequest::Document { key_id } => {
+                    let key = db
+                        .authorized_keys(principal, now)?
+                        .into_iter()
+                        .find(|k| k.key_id == key_id)
+                        .ok_or_else(|| KeydError::Misuse("GRANT_INVALID".into()))?;
+                    let state = self
+                        .vaults
+                        .get(&key.vault_id)
+                        .ok_or_else(|| KeydError::Misuse("GRANT_INVALID".into()))?;
+                    let (bytes, _) = state.get_document(self.config.service_uid, &key.did)?;
+                    reply.data = Some(
+                        json!({"key_id":key_id,"document":serde_json::from_slice::<serde_json::Value>(&bytes)?}),
+                    );
+                }
+                DataRequest::SignHttp {
+                    grant_id,
+                    request_id,
+                    http,
+                } => {
+                    if !crate::principal::validate_uuid(&request_id) {
+                        return Err(KeydError::Misuse("REQUEST_ID_INVALID".into()));
+                    }
+                    let canonical = super::http::CanonicalHttpRequest::new(http)?;
+                    let _ = db.authorize_http(principal, &grant_id, &canonical, now)?;
+                    // M4 owns quota reservation, signing, durable result and delivery.
+                    // Never invoke legacy sign_structured from this preview path.
+                    reply = Reply::code("SIGNING_UNAVAILABLE");
+                }
+                DataRequest::RequestStatus { request_id } => {
+                    if !crate::principal::validate_uuid(&request_id) {
+                        return Err(KeydError::Misuse("REQUEST_ID_INVALID".into()));
+                    }
+                    reply = Reply::code("REQUEST_NOT_FOUND");
+                }
+            }
+            Ok(reply)
+        })();
+        match result {
+            Ok(reply) => reply,
+            Err(KeydError::Misuse(code)) => Reply::code(&code),
+            Err(_) => {
+                self.emergency();
+                Reply::code("AUDIT_UNAVAILABLE")
+            }
+        }
     }
 
     fn emergency(&self) {

@@ -67,6 +67,21 @@ impl Client {
         self.reply()
     }
 
+    /// Exactly one v2 request to the configured endpoint; never retries or downgrades.
+    pub fn data(mut self, request: DataRequest) -> Result<Reply> {
+        if self.admin {
+            return Err(KeydError::Misuse("DATA_ENDPOINT_REQUIRED".into()));
+        }
+        protocol::write(
+            &mut self.stream,
+            &Envelope {
+                version: VERSION,
+                request,
+            },
+        )?;
+        self.reply()
+    }
+
     pub fn principals(mut self) -> Result<Reply> {
         self.management()?;
         protocol::write(

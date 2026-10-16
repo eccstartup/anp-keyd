@@ -513,7 +513,7 @@ fn legacy_commands_reject_managed_vault_even_through_symlink() {
 #[test]
 fn v1_migration_is_transactional_and_bound_to_instance_and_audit() {
     let mut f = Fixture::new();
-    f.db.connection.execute_batch("DROP TABLE file_operations; ALTER TABLE keys DROP COLUMN document_digest; ALTER TABLE service_meta RENAME TO meta_old; CREATE TABLE service_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),schema_version INTEGER NOT NULL CHECK(schema_version=1),instance_id TEXT NOT NULL,boot_epoch INTEGER NOT NULL,mutation_epoch INTEGER NOT NULL) STRICT; INSERT INTO service_meta SELECT singleton,1,instance_id,boot_epoch,mutation_epoch FROM meta_old; DROP TABLE meta_old; PRAGMA user_version=1;").unwrap();
+    f.db.connection.execute_batch("DROP TABLE grant_deadlines; DROP TABLE file_operations; ALTER TABLE keys DROP COLUMN document_digest; ALTER TABLE service_meta RENAME TO meta_old; CREATE TABLE service_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),schema_version INTEGER NOT NULL CHECK(schema_version=1),instance_id TEXT NOT NULL,boot_epoch INTEGER NOT NULL,mutation_epoch INTEGER NOT NULL) STRICT; INSERT INTO service_meta SELECT singleton,1,instance_id,boot_epoch,mutation_epoch FROM meta_old; DROP TABLE meta_old; PRAGMA user_version=1;").unwrap();
     let mut foreign = f.config.clone();
     foreign.instance_id = uuid();
     assert!(f.db.recovery(&foreign, now()).is_err());
@@ -537,7 +537,7 @@ fn v1_migration_is_transactional_and_bound_to_instance_and_audit() {
         f.db.connection
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     verify_audit(&f.db.connection).unwrap();
 }
 
@@ -773,4 +773,512 @@ fn unknown_persisted_role_is_refused_even_if_constraints_were_bypassed() {
         .unwrap();
     assert!(f.db.check_key(&vault, &did, &record.kid).is_err());
     assert!(f.db.catalog().is_err());
+}
+
+fn grant_fixture() -> (Fixture, String, String) {
+    use catalog::*;
+    let mut f = Fixture::new();
+    let (vault, did, doc) = vault_fixture(&mut f);
+    let layout = crate::keystore::layout::KeydLayout::at(f.dir.join("vaults").join(&vault));
+    let (_, extra) = crate::keystore::create::create_extra(
+        &layout,
+        &did,
+        "http-hot",
+        vec![anp::authentication::DidVerificationRelationship::Authentication],
+        "test",
+        b"test-pass",
+        crate::crypto::kdf::Argon2Config {
+            m_cost: 1024,
+            t_cost: 1,
+            p_cost: 1,
+        },
+        crate::keystore::hardware::HardwareChoice::None,
+    )
+    .unwrap();
+    let root = crate::keystore::store::resolve(&layout, &did, None).unwrap();
+    let secret = crate::keystore::device::load(&layout).unwrap();
+    let key = crate::keystore::unwrap::unlock(&root, b"test-pass", &secret).unwrap();
+    let unsigned = crate::did::lifecycle::strip_proof(&doc).unwrap();
+    let unsigned =
+        crate::did::lifecycle::with_extra_key(&unsigned, &did, &key.verifying_key(), extra)
+            .unwrap();
+    let signed = crate::did::document::sign_document(&unsigned, &key, &root.id.kid).unwrap();
+    crate::keystore::store::write_did_document(&layout, &did, &signed).unwrap();
+    apply_change(&mut f, CatalogChange::EnrollVault { vault_id: vault });
+    let hot =
+        f.db.catalog()
+            .unwrap()
+            .keys
+            .into_iter()
+            .find(|k| k.kid.ends_with("#http-hot"))
+            .unwrap()
+            .key_id;
+    apply_change(
+        &mut f,
+        CatalogChange::ConfirmRole {
+            key_id: hot.clone(),
+            role: KeyRole::Hot,
+        },
+    );
+    let policy = uuid();
+    apply_change(
+        &mut f,
+        CatalogChange::PublishPolicy {
+            policy_id: policy.clone(),
+            version: 1,
+            content: policy_value(),
+        },
+    );
+    (f, hot, policy)
+}
+fn new_grant(f: &mut Fixture, key: &str, policy: &str) -> grants::Grant {
+    let p =
+        f.db.prepare(
+            1002,
+            Change::Grant {
+                change: grants::GrantChange::Create {
+                    principal_id: f.config.principals[0].principal_id.clone(),
+                    key_id: key.into(),
+                    policy_id: policy.into(),
+                    policy_version: 1,
+                    expiry: 1050,
+                    max_uses: 2,
+                },
+            },
+            now(),
+        )
+        .unwrap();
+    let id = p.effect["effect"]["grant"]["grant_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.db.commit(1002, &p.operation_id, &p.digest, now())
+        .unwrap();
+    f.db.grant_status(&f.config.principals[0].principal_id, &id, now())
+        .unwrap()
+}
+fn canonical() -> crate::security::http::CanonicalHttpRequest {
+    crate::security::http::CanonicalHttpRequest::new(crate::security::http::HttpRequest {
+        method: "GET".into(),
+        url: "https://service.example.com/v1/orders".into(),
+        headers: Default::default(),
+        body: crate::security::http::Body::Absent {},
+        nonce: None,
+    })
+    .unwrap()
+}
+#[test]
+fn grants_bind_principal_key_policy_and_revoke_without_consuming_quota() {
+    let (mut f, key, policy) = grant_fixture();
+    let g = new_grant(&mut f, &key, &policy);
+    assert_eq!(g.grant_id.len(), 64);
+    assert_eq!(
+        f.db.authorized_keys(&g.principal_id, now()).unwrap().len(),
+        1
+    );
+    let (_, selected) =
+        f.db.authorize_http(&g.principal_id, &g.grant_id, &canonical(), now())
+            .unwrap();
+    assert_eq!(selected.key_id, key);
+    let other =
+        f.db.prepare(1002, Change::RegisterPrincipal { uid: 1006 }, now())
+            .unwrap();
+    f.db.commit(1002, &other.operation_id, &other.digest, now())
+        .unwrap();
+    let other = f.db.principal(1006).unwrap().unwrap().principal_id;
+    assert!(f.db.grant_status(&other, &g.grant_id, now()).is_err());
+    assert!(f
+        .db
+        .authorize_http(&other, &g.grant_id, &canonical(), now())
+        .is_err());
+    assert!(f.db.authorized_keys(&other, now()).unwrap().is_empty());
+    assert_eq!(
+        f.db.grant_status(&g.principal_id, &g.grant_id, now())
+            .unwrap()
+            .used_uses,
+        0
+    );
+    let p =
+        f.db.prepare(
+            1002,
+            Change::Grant {
+                change: grants::GrantChange::Revoke {
+                    grant_id: g.grant_id.clone(),
+                },
+            },
+            now(),
+        )
+        .unwrap();
+    f.db.commit(1002, &p.operation_id, &p.digest, now())
+        .unwrap();
+    assert!(f
+        .db
+        .authorize_http(&g.principal_id, &g.grant_id, &canonical(), now())
+        .is_err());
+    assert!(f
+        .db
+        .authorized_keys(&g.principal_id, now())
+        .unwrap()
+        .is_empty());
+    verify_audit(&f.db.connection).unwrap();
+}
+#[test]
+fn grant_deadlines_survive_wall_rollback_and_never_revive() {
+    let (mut f, key, policy) = grant_fixture();
+    let g = new_grant(&mut f, &key, &policy);
+    let late = Time {
+        wall: 900,
+        monotonic_ms: 60_000,
+    };
+    assert_eq!(
+        f.db.grant_status(&g.principal_id, &g.grant_id, late)
+            .unwrap()
+            .state,
+        "expired"
+    );
+    assert!(f
+        .db
+        .authorize_http(&g.principal_id, &g.grant_id, &canonical(), now())
+        .is_err());
+    let g = new_grant(&mut f, &key, &policy);
+    assert_eq!(
+        f.db.grant_status(
+            &g.principal_id,
+            &g.grant_id,
+            Time {
+                wall: 1050,
+                monotonic_ms: 10001
+            }
+        )
+        .unwrap()
+        .state,
+        "expired"
+    );
+    let g = new_grant(&mut f, &key, &policy);
+    f.db.recovery(&f.config, now()).unwrap();
+    assert_eq!(
+        f.db.grant_status(&g.principal_id, &g.grant_id, now())
+            .unwrap()
+            .state,
+        "revoked_restart"
+    );
+    assert!(f
+        .db
+        .authorize_http(&g.principal_id, &g.grant_id, &canonical(), now())
+        .is_err());
+}
+#[test]
+fn grants_reject_nonhot_keys_limits_stale_role_and_policy_mismatch() {
+    let (mut f, key, policy) = grant_fixture();
+    let g = new_grant(&mut f, &key, &policy);
+    for record in f.db.catalog().unwrap().keys {
+        if record.key_id == key {
+            continue;
+        }
+        assert!(f
+            .db
+            .prepare(
+                1002,
+                Change::Grant {
+                    change: grants::GrantChange::Create {
+                        principal_id: g.principal_id.clone(),
+                        key_id: record.key_id,
+                        policy_id: policy.clone(),
+                        policy_version: 1,
+                        expiry: 1050,
+                        max_uses: 1
+                    }
+                },
+                now()
+            )
+            .is_err());
+    }
+    for (expiry, uses) in [(1000, 1), (999999, 1), (1050, 0), (1050, u32::MAX)] {
+        assert!(f
+            .db
+            .prepare(
+                1002,
+                Change::Grant {
+                    change: grants::GrantChange::Create {
+                        principal_id: g.principal_id.clone(),
+                        key_id: key.clone(),
+                        policy_id: policy.clone(),
+                        policy_version: 1,
+                        expiry,
+                        max_uses: uses
+                    }
+                },
+                now()
+            )
+            .is_err());
+    }
+    for (method, url, body) in [
+        (
+            "POST",
+            "https://service.example.com/v1/orders",
+            crate::security::http::Body::Absent {},
+        ),
+        (
+            "GET",
+            "https://evil.com/test",
+            crate::security::http::Body::Absent {},
+        ),
+        (
+            "GET",
+            "https://service.example.com/other",
+            crate::security::http::Body::Absent {},
+        ),
+        (
+            "GET",
+            "https://service.example.com/v1/orders?a=1",
+            crate::security::http::Body::Absent {},
+        ),
+        (
+            "GET",
+            "https://service.example.com/v1/orders",
+            crate::security::http::Body::Present { bytes: vec![1] },
+        ),
+    ] {
+        let req =
+            crate::security::http::CanonicalHttpRequest::new(crate::security::http::HttpRequest {
+                method: method.into(),
+                url: url.into(),
+                headers: Default::default(),
+                body,
+                nonce: None,
+            })
+            .unwrap();
+        assert!(f
+            .db
+            .authorize_http(&g.principal_id, &g.grant_id, &req, now())
+            .is_err());
+    }
+    f.db.connection
+        .execute("UPDATE keys SET role='root' WHERE key_id=?1", [key])
+        .unwrap();
+    assert!(f
+        .db
+        .authorize_http(&g.principal_id, &g.grant_id, &canonical(), now())
+        .is_err());
+}
+#[test]
+fn grant_creation_audit_failure_is_atomic() {
+    let (mut f, key, policy) = grant_fixture();
+    let p =
+        f.db.prepare(
+            1002,
+            Change::Grant {
+                change: grants::GrantChange::Create {
+                    principal_id: f.config.principals[0].principal_id.clone(),
+                    key_id: key,
+                    policy_id: policy,
+                    policy_version: 1,
+                    expiry: 1050,
+                    max_uses: 1,
+                },
+            },
+            now(),
+        )
+        .unwrap();
+    f.db.connection.execute_batch("CREATE TRIGGER fail_grant BEFORE INSERT ON audit_events BEGIN SELECT RAISE(ABORT,'fail'); END;").unwrap();
+    assert!(f
+        .db
+        .commit(1002, &p.operation_id, &p.digest, now())
+        .is_err());
+    assert_eq!(
+        f.db.connection
+            .query_row("SELECT COUNT(*) FROM grants", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn bounded_body_and_exact_query_cannot_be_omitted_or_reinterpreted() {
+    let (mut f, key, policy) = grant_fixture();
+    let mut content = policy_value();
+    content["methods"] = json!(["POST"]);
+    content["body"] = json!({"mode":"bounded","max_bytes":3});
+    content["query"] = json!({"mode":"exact","value":"a=1&b=2"});
+    apply_change(
+        &mut f,
+        catalog::CatalogChange::PublishPolicy {
+            policy_id: policy.clone(),
+            version: 2,
+            content,
+        },
+    );
+    let p =
+        f.db.prepare(
+            1002,
+            Change::Grant {
+                change: grants::GrantChange::Create {
+                    principal_id: f.config.principals[0].principal_id.clone(),
+                    key_id: key,
+                    policy_id: policy,
+                    policy_version: 2,
+                    expiry: 1050,
+                    max_uses: 2,
+                },
+            },
+            now(),
+        )
+        .unwrap();
+    let id = p.effect["effect"]["grant"]["grant_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.db.commit(1002, &p.operation_id, &p.digest, now())
+        .unwrap();
+    let principal = f.config.principals[0].principal_id.clone();
+    for (body, query, allowed) in [
+        (crate::security::http::Body::Absent {}, "a=1&b=2", false),
+        (
+            crate::security::http::Body::Present { bytes: vec![] },
+            "a=1&b=2",
+            true,
+        ),
+        (
+            crate::security::http::Body::Present {
+                bytes: vec![1, 2, 3],
+            },
+            "a=1&b=2",
+            true,
+        ),
+        (
+            crate::security::http::Body::Present {
+                bytes: vec![1, 2, 3, 4],
+            },
+            "a=1&b=2",
+            false,
+        ),
+        (
+            crate::security::http::Body::Present { bytes: vec![1] },
+            "b=2&a=1",
+            false,
+        ),
+    ] {
+        let req =
+            crate::security::http::CanonicalHttpRequest::new(crate::security::http::HttpRequest {
+                method: "POST".into(),
+                url: format!("https://service.example.com/v1/orders?{query}"),
+                headers: Default::default(),
+                body,
+                nonce: None,
+            })
+            .unwrap();
+        assert_eq!(
+            f.db.authorize_http(&principal, &id, &req, now()).is_ok(),
+            allowed
+        );
+        if allowed {
+            assert!(
+                crate::sign::rfc9421::required_components(req.signing_request())
+                    .contains(&"content-digest".to_owned())
+            );
+        }
+    }
+}
+#[test]
+fn live_principal_and_envelope_checks_cannot_be_cached_by_grant() {
+    let (mut f, key, policy) = grant_fixture();
+    let g = new_grant(&mut f, &key, &policy);
+    let k =
+        f.db.catalog()
+            .unwrap()
+            .keys
+            .into_iter()
+            .find(|k| k.key_id == key)
+            .unwrap();
+    let layout = crate::keystore::layout::KeydLayout::at(f.dir.join("vaults").join(&k.vault_id));
+    let mut w = crate::keystore::store::resolve(&layout, &k.did, Some("http-hot")).unwrap();
+    w.label = "replaced".into();
+    crate::keystore::store::write(&layout, &w).unwrap();
+    assert!(f
+        .db
+        .authorize_http(&g.principal_id, &g.grant_id, &canonical(), now())
+        .is_err());
+    let p = f.disable();
+    f.db.commit(1002, &p.operation_id, &p.digest, now())
+        .unwrap();
+    assert!(f.db.authorized_keys(&g.principal_id, now()).is_err());
+    assert!(f
+        .db
+        .grant_status(&g.principal_id, &g.grant_id, now())
+        .is_err());
+}
+#[test]
+fn prepared_grant_cannot_extend_deadline_at_commit_or_bypass_exhaustion() {
+    let (mut f, key, policy) = grant_fixture();
+    let p =
+        f.db.prepare(
+            1002,
+            Change::Grant {
+                change: grants::GrantChange::Create {
+                    principal_id: f.config.principals[0].principal_id.clone(),
+                    key_id: key.clone(),
+                    policy_id: policy.clone(),
+                    policy_version: 1,
+                    expiry: 1050,
+                    max_uses: 1,
+                },
+            },
+            now(),
+        )
+        .unwrap();
+    assert!(f
+        .db
+        .commit(
+            1002,
+            &p.operation_id,
+            &p.digest,
+            Time {
+                wall: 1001,
+                monotonic_ms: 60000
+            }
+        )
+        .is_err());
+    let g = new_grant(&mut f, &key, &policy);
+    f.db.connection
+        .execute(
+            "UPDATE grants SET used_uses=max_uses WHERE grant_id=?1",
+            [&g.grant_id],
+        )
+        .unwrap();
+    assert!(f
+        .db
+        .authorize_http(&g.principal_id, &g.grant_id, &canonical(), now())
+        .unwrap_err()
+        .to_string()
+        .contains("GRANT_EXHAUSTED"));
+    assert!(f
+        .db
+        .authorized_keys(&g.principal_id, now())
+        .unwrap()
+        .is_empty());
+}
+#[test]
+fn v2_to_v3_migration_is_atomic_and_invalidates_old_grants() {
+    let (mut f, key, policy) = grant_fixture();
+    let g = new_grant(&mut f, &key, &policy);
+    f.db.connection.execute_batch("DROP TABLE grant_deadlines; ALTER TABLE service_meta RENAME TO meta_old; CREATE TABLE service_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),schema_version INTEGER NOT NULL CHECK(schema_version=2),instance_id TEXT NOT NULL,boot_epoch INTEGER NOT NULL,mutation_epoch INTEGER NOT NULL) STRICT; INSERT INTO service_meta SELECT singleton,2,instance_id,boot_epoch,mutation_epoch FROM meta_old; DROP TABLE meta_old; PRAGMA user_version=2;").unwrap();
+    f.db.connection.execute_batch("CREATE TRIGGER fail_migration BEFORE INSERT ON audit_events WHEN CAST(NEW.event_data AS TEXT) LIKE '%SCHEMA_MIGRATED%' BEGIN SELECT RAISE(ABORT,'fail'); END;").unwrap();
+    assert!(f.db.recovery(&f.config, now()).is_err());
+    assert_eq!(
+        f.db.connection
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    f.db.connection
+        .execute_batch("DROP TRIGGER fail_migration")
+        .unwrap();
+    f.db.recovery(&f.config, now()).unwrap();
+    assert_eq!(
+        f.db.grant_status(&g.principal_id, &g.grant_id, now())
+            .unwrap()
+            .state,
+        "revoked_restart"
+    );
+    verify_audit(&f.db.connection).unwrap();
 }

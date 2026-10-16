@@ -79,6 +79,7 @@ fn help_template() -> String {
          \n\
          \x20 serve               Run the daemon: answer signing requests over a Unix socket.\n\
          \x20 serve-protected     Linux boundary preview (signing unavailable).\n\
+         \x20 data                Send a protected v2 request from --file through trusted config.\n\
          \x20 admin               Use the independent Linux management channel.\n\
          \x20 init-protected-state  Initialize a NEW service database explicitly.\n\
          \x20 stop                Stop the daemon `serve` left running in the background.\n\
@@ -149,6 +150,8 @@ pub enum Command {
     InitProtectedState(ProtectedArgs),
     /// Authenticate to the independent Linux management socket.
     Admin(AdminArgs),
+    /// Send one typed v2 data request through the authenticated configured endpoint.
+    Data(DataArgs),
     /// Stop the daemon that `serve` left running in the background.
     Stop,
 
@@ -233,6 +236,9 @@ pub enum Command {
 #[cfg(feature = "mcp")]
 #[derive(Args, Debug)]
 pub struct McpArgs {
+    /// Use only protected v2 tools with this administrator-owned service configuration.
+    #[arg(long, conflicts_with = "socket")]
+    pub config: Option<PathBuf>,
     /// Socket path (derived from the directory layout by default).
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
@@ -242,6 +248,15 @@ pub struct McpArgs {
 pub struct ProtectedArgs {
     #[arg(long, default_value = crate::security::config::DEFAULT_CONFIG)]
     pub config: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub struct DataArgs {
+    #[arg(long, default_value = crate::security::config::DEFAULT_CONFIG)]
+    pub config: PathBuf,
+    /// A v2 DataRequest JSON file; body state must be explicit. No automatic retries.
+    #[arg(long)]
+    pub file: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -852,6 +867,17 @@ pub fn run(cli: Cli) -> Result<()> {
                 result
             })
         }
+        Command::Data(args) => {
+            if root.is_some() {return Err(KeydError::Misuse("data endpoints cannot use --root".into()));}
+            use std::io::Read;
+            let mut bytes=Vec::new();
+            std::fs::File::open(args.file)?.take((crate::security::protocol::MAX_FRAME+1) as u64).read_to_end(&mut bytes)?;
+            if bytes.len()>crate::security::protocol::MAX_FRAME {return Err(KeydError::Misuse("data input too large".into()));}
+            let request=crate::security::json::decode(&bytes)?;
+            let reply=crate::security::client::Client::connect(&args.config,false)?.data(request)?;
+            println!("{}",serde_json::to_string(&reply)?);
+            Ok(())
+        }
         Command::Admin(args) => {
             if root.is_some() {
                 return Err(KeydError::Misuse(
@@ -968,7 +994,12 @@ pub fn run(cli: Cli) -> Result<()> {
             },
         ),
         #[cfg(feature = "mcp")]
-        Command::Mcp(args) => crate::mcp::serve(args.socket),
+        Command::Mcp(args) => {
+            if let Some(config)=args.config {
+                if root.is_some() {return Err(KeydError::Misuse("protected MCP cannot use --root".into()));}
+                crate::mcp::protected::serve(config)
+            } else {crate::mcp::serve(args.socket)}
+        },
     }
 }
 

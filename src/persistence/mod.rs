@@ -1,6 +1,7 @@
 //! Single-writer state and transactional audit. Never stores private material.
 pub mod catalog;
 pub mod clock;
+pub mod grants;
 mod policy;
 
 use std::fs::OpenOptions;
@@ -21,7 +22,7 @@ use crate::principal::Principal;
 use crate::security::config::ServiceConfig;
 use clock::Time;
 
-const SCHEMA: i64 = 2;
+const SCHEMA: i64 = 3;
 const APPLICATION: i64 = 0x414e504b;
 const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -31,10 +32,14 @@ pub enum Change {
     RegisterPrincipal { uid: u32 },
     DisablePrincipal { principal_id: String },
     Catalog { change: catalog::CatalogChange },
+    Grant { change: grants::GrantChange },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 enum Resolved {
+    Grant {
+        effect: grants::Effect,
+    },
     RegisterPrincipal {
         uid: u32,
         principal_id: String,
@@ -213,7 +218,7 @@ impl Database {
             .connection
             .query_row("PRAGMA application_id", [], |r| r.get(0))
             .map_err(db_error)?;
-        if !(version == 1 || version == SCHEMA) || app != APPLICATION {
+        if !(1..=SCHEMA).contains(&version) || app != APPLICATION {
             return Err(unavailable());
         }
         let integrity: String = self
@@ -252,6 +257,19 @@ impl Database {
             append(
                 &tx,
                 &json!({"event":"SCHEMA_MIGRATED","from":1,"to":2,"at":now.wall}),
+            )?;
+            tx.commit().map_err(db_error)?;
+        }
+        if version < 3 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(db_error)?;
+            tx.execute_batch(include_str!("migration-v3.sql"))
+                .map_err(db_error)?;
+            append(
+                &tx,
+                &json!({"event":"SCHEMA_MIGRATED","from":2,"to":3,"at":now.wall}),
             )?;
             tx.commit().map_err(db_error)?;
         }
@@ -367,6 +385,9 @@ impl Database {
             .map_err(db_error)?;
         let root = self.root.clone();
         let resolved = match change {
+            Change::Grant { change } => Resolved::Grant {
+                effect: grants::resolve(&tx, &root, change, self.boot_epoch, now)?,
+            },
             Change::Catalog { change } => Resolved::Catalog {
                 effect: Box::new(catalog::resolve(&tx, &root, change)?),
             },
@@ -466,6 +487,9 @@ impl Database {
             return Err(invalid());
         }
         match resolved {
+            Resolved::Grant { effect } => {
+                grants::apply(&tx, &self.root, effect, self.boot_epoch, now)?
+            }
             Resolved::Catalog { effect } => catalog::apply(&tx, &self.root, operation_id, *effect)?,
             Resolved::RegisterPrincipal {
                 uid,
@@ -576,7 +600,7 @@ fn open(path: &Path) -> Result<Connection> {
     let app: i64 = connection
         .query_row("PRAGMA application_id", [], |r| r.get(0))
         .map_err(db_error)?;
-    if !(version == 1 || version == SCHEMA) || app != APPLICATION {
+    if !(1..=SCHEMA).contains(&version) || app != APPLICATION {
         return Err(unavailable());
     }
     settings(&connection)?;

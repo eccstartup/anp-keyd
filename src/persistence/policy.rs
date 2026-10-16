@@ -1,9 +1,9 @@
-//! Fixed policy storage schema. Request evaluation is the M3 executor's job.
+//! Fixed policy schema and evaluation against one canonical request.
 use super::*;
 use std::collections::BTreeSet;
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Policy {
+pub(super) struct Policy {
     schema_version: u32,
     name: String,
     purpose: String,
@@ -13,12 +13,12 @@ struct Policy {
     query: Query,
     body: Body,
     signature_profile: String,
-    grant_limits: Limits,
+    pub(super) grant_limits: Limits,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 enum Query {
-    None,
+    None {},
     Exact { value: String },
 }
 #[derive(Serialize, Deserialize)]
@@ -29,9 +29,9 @@ struct Body {
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Limits {
-    max_duration_seconds: u32,
-    max_uses: u32,
+pub(super) struct Limits {
+    pub(super) max_duration_seconds: u32,
+    pub(super) max_uses: u32,
 }
 
 pub(super) fn normalize(content: Value) -> Result<Value> {
@@ -49,6 +49,10 @@ pub(super) fn normalize(content: Value) -> Result<Value> {
         || host.is_empty()
         || host.len() > 253
         || host.ends_with('.')
+        || !host
+            .rsplit('.')
+            .next()
+            .is_some_and(|s| s.bytes().all(|b| b.is_ascii_alphabetic()))
         || host.split('.').any(|s| {
             s.is_empty()
                 || s.len() > 63
@@ -80,7 +84,7 @@ pub(super) fn normalize(content: Value) -> Result<Value> {
                 || s.contains("//")
                 || s.split('/').any(|p| p == "." || p == "..")
                 || s.bytes()
-                    .any(|b| !b.is_ascii_graphic() || [b'%', b'\\', b'?', b'#'].contains(&b))
+                    .any(|b| !crate::security::http::safe_target_byte(b))
         })
         || !["empty", "bounded"].contains(&p.body.mode.as_str())
         || (p.body.mode == "empty" && p.body.max_bytes != 0)
@@ -96,7 +100,7 @@ pub(super) fn normalize(content: Value) -> Result<Value> {
             || value.len() > 2048
             || value
                 .bytes()
-                .any(|b| !b.is_ascii_graphic() || [b'%', b'#', b'+', b'?', b'\\'].contains(&b))
+                .any(|b| !crate::security::http::safe_target_byte(b) || b == b'+' || b == b'\'')
             || value.split('&').any(|pair| {
                 let (k, _) = pair.split_once('=').unwrap_or((pair, ""));
                 k.is_empty() || !keys.insert(k)
@@ -106,4 +110,29 @@ pub(super) fn normalize(content: Value) -> Result<Value> {
         }
     }
     serde_json::to_value(p).map_err(|_| invalid())
+}
+
+pub(super) fn parse(content: Value) -> Result<Policy> {
+    serde_json::from_value(normalize(content)?).map_err(|_| invalid())
+}
+pub(super) fn evaluate(
+    content: Value,
+    request: &crate::security::http::CanonicalHttpRequest,
+) -> Result<()> {
+    let p = parse(content)?;
+    let query = match &p.query {
+        Query::None {} => None,
+        Query::Exact { value } => Some(value.as_str()),
+    };
+    if p.origin != request.origin()
+        || !p.methods.contains(&request.method().to_owned())
+        || !p.paths.contains(&request.path().to_owned())
+        || query != request.query()
+        || request.body_len() > p.body.max_bytes as usize
+        || (p.body.mode == "empty" && request.body_len() != 0)
+        || (p.body.mode == "bounded" && !request.has_body())
+    {
+        return Err(KeydError::Misuse("POLICY_DENIED".into()));
+    }
+    Ok(())
 }
