@@ -254,9 +254,11 @@ class Checks:
         cancelled, _ = window('UI 1/3: check exact instance/vault/DID/key in the window; click Cancel. Do not enter a real password.')
         assert cancelled.returncode != 0 and 'native unlock cancelled' in cancelled.stderr, cancelled.stderr
         self.expect_locked()
+        self.grant_id = self.grant()  # fresh bounded grant for each human step
         expired, elapsed = window('UI 2/3: leave the window untouched for its full 120-second timeout.')
         assert expired.returncode != 0 and 'native unlock cancelled' in expired.stderr and elapsed >= 115, expired.stderr
         self.expect_locked()
+        self.grant_id = self.grant()
         opened, _ = window('UI 3/3: enter ONLY the public temporary test password: ' + PASSWORD + '\nCheck that input is masked, then click Unlock (Cancel is the default).')
         assert opened.returncode == 0, opened.stderr
         if input('Did all windows show the correct exact key, and was password input masked? Type yes: ').strip() != 'yes':
