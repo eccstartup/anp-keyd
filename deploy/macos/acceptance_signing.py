@@ -206,7 +206,7 @@ class Checks:
         changed = {**self.request, 'http': {**self.request['http'], 'nonce': 'changed'}}
         assert self.request_as(self.agent, changed)['code'] == 'REQUEST_ID_CONFLICT'
         forbidden = {**self.signing(), 'http': {**self.request['http'], 'url': 'https://evil.example/test'}}
-        assert self.request_as(self.agent, forbidden)['code'] == 'POLICY_DENIED' 
+        assert self.request_as(self.agent, forbidden)['code'] == 'POLICY_DENIED'
         print('PASS actual temporary hot-key signature independently verified; stable-ID retry is identical', flush=True)
         for operation in [self.request, {'operation': 'GET_GRANT_STATUS', 'grant_id': self.grant_id},
                           {'operation': 'GET_DOCUMENT', 'key_id': self.key['key_id']}]:
