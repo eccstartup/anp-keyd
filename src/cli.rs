@@ -333,6 +333,9 @@ pub enum AdminCommand {
     Status,
     LockAll,
     Unlock {
+        /// Use a native secure macOS dialog, after service authentication.
+        #[arg(long)]
+        native_ui: bool,
         #[arg(long)]
         vault_id: String,
         #[arg(long)]
@@ -913,7 +916,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     "state initialization cannot use --root".into(),
                 ));
             }
-            crate::security::require_linux()?;
+            crate::security::require_boundary_platform()?;
             let config = crate::security::config::ServiceConfig::load(&args.config)?;
             use crate::persistence::clock::{Clock, SystemClock};
             crate::persistence::Database::initialize(&config, SystemClock.now()?)
@@ -924,7 +927,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     "protected endpoints cannot use --root".into(),
                 ));
             }
-            crate::security::require_linux()?;
+            crate::security::require_boundary_platform()?;
             let config = crate::security::config::ServiceConfig::load(&args.config)?;
             crate::daemon::service::install_logging()?;
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -933,15 +936,12 @@ pub fn run(cli: Cli) -> Result<()> {
             runtime.block_on(async move {
                 let (stop, receiver) = tokio::sync::watch::channel(false);
                 let signals = tokio::spawn(async move {
-                    #[cfg(target_os = "linux")]
                     {
                         let mut term = tokio::signal::unix::signal(
                             tokio::signal::unix::SignalKind::terminate(),
                         )?;
                         tokio::select! { _ = term.recv() => {}, _ = tokio::signal::ctrl_c() => {} }
                     }
-                    #[cfg(not(target_os = "linux"))]
-                    tokio::signal::ctrl_c().await?;
                     let _ = stop.send(true);
                     Ok::<_, std::io::Error>(())
                 });
@@ -1008,11 +1008,15 @@ pub fn run(cli: Cli) -> Result<()> {
                     AdminClient::connect(&args.config, true)?.complete_secret_operation(operation_id, digest, secret)?
                 }
                 AdminCommand::LockAll => client.lock_all()?,
-                AdminCommand::Unlock { vault_id, did, kid } => {
+                AdminCommand::Unlock { vault_id, did, kid, native_ui } => {
                     // Preflight before prompting; reconnect and authenticate again before sending.
                     client.capabilities()?;
-                    let terminal = tty::open()?;
-                    let secret = tty::read_secret(&terminal, "Passphrase: ")?;
+                    let secret = if native_ui {
+                        crate::security::management_ui::unlock_secret(&args.config, &vault_id, &did, &kid)?
+                    } else {
+                        let terminal = tty::open()?;
+                        tty::read_secret(&terminal, "Passphrase: ")?
+                    };
                     AdminClient::connect(&args.config, true)?.unlock(vault_id, did, kid, secret)?
                 }
             };

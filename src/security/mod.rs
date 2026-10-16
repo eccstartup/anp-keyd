@@ -1,4 +1,4 @@
-//! Linux signing boundary.
+//! UID-separated signing boundary.
 pub mod client;
 pub mod config;
 mod coordinator;
@@ -6,6 +6,7 @@ pub(crate) mod executor;
 pub mod http;
 pub mod json;
 pub mod limits;
+pub mod management_ui;
 pub mod migration;
 pub mod paths;
 pub mod protocol;
@@ -25,11 +26,14 @@ pub const fn protected_build_supported() -> bool {
         && !cfg!(feature = "seed-export")
 }
 
-pub fn require_linux() -> Result<()> {
-    if cfg!(target_os = "linux") {
+pub fn require_boundary_platform() -> Result<()> {
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
         Ok(())
     } else {
-        Err(KeydError::Misuse("Linux boundary preview is unsupported on this platform; development mode remains available".into()))
+        Err(KeydError::Misuse(
+            "UID boundary is unsupported on this platform; development mode remains available"
+                .into(),
+        ))
     }
 }
 
@@ -75,7 +79,7 @@ impl Write for DeadlineStream {
 
 pub fn probe(path: &Path) -> Result<()> {
     println!("anp-keyd security boundary probe");
-    require_linux()?;
+    require_boundary_platform()?;
     let config = config::ServiceConfig::load(path)?;
     println!("config: root-owned, symlink-free, immutable to service and Agents");
     println!("service_uid: {}", config.service_uid);

@@ -19,7 +19,7 @@ pub struct Client {
 
 impl Client {
     pub fn connect(path: &Path, admin: bool) -> Result<Self> {
-        super::require_linux()?;
+        super::require_boundary_platform()?;
         let config = ServiceConfig::load(path)?;
         if admin && !config.admin_uids.contains(&self_uid()) {
             return Err(KeydError::Permission("ADMIN_REQUIRED".into()));

@@ -703,7 +703,7 @@ async fn listen(
 }
 
 #[cfg(target_os = "linux")]
-fn harden_process() -> Result<()> {
+pub(crate) fn harden_process() -> Result<()> {
     let limit = nix::libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -719,13 +719,30 @@ fn harden_process() -> Result<()> {
     }
     Ok(())
 }
-#[cfg(not(target_os = "linux"))]
-fn harden_process() -> Result<()> {
-    super::require_linux()
+#[cfg(target_os = "macos")]
+pub(crate) fn harden_process() -> Result<()> {
+    let limit = nix::libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // No process dumps. PT_DENY_ATTACH blocks future debugger attachments;
+    // separate UIDs remain the authorization boundary, not this defense alone.
+    if unsafe { nix::libc::setrlimit(nix::libc::RLIMIT_CORE, &limit) } != 0
+        || unsafe { nix::libc::ptrace(nix::libc::PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0) } != 0
+    {
+        return Err(KeydError::Misuse(
+            "cannot disable process debugging/dumps".into(),
+        ));
+    }
+    Ok(())
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn harden_process() -> Result<()> {
+    super::require_boundary_platform()
 }
 
 pub async fn serve(config: ServiceConfig, mut stop: watch::Receiver<bool>) -> Result<()> {
-    super::require_linux()?;
+    super::require_boundary_platform()?;
     config.validate()?;
     if self_uid() != config.service_uid {
         return Err(KeydError::Permission(
@@ -749,7 +766,7 @@ pub async fn serve(config: ServiceConfig, mut stop: watch::Receiver<bool>) -> Re
     let (sign, _sign_guard) = bind(&config.sign_socket, config.service_uid, config.agent_gid)?;
     let (admin, _admin_guard) = bind(&config.admin_socket, config.service_uid, config.admin_gid)?;
     let boundary = Arc::new(Boundary::new(config, database)?);
-    tracing::info!("Linux transaction signer listening");
+    tracing::info!("UID-separated transaction signer listening");
     let (shutdown, shutdown_rx) = watch::channel(false);
     let sweeper = {
         let boundary = boundary.clone();

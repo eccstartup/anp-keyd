@@ -43,10 +43,15 @@ impl ServiceConfig {
         if self.schema_version != 1
             || !matches!(
                 self.mode.as_str(),
-                "linux-boundary-preview" | "linux-protected-v1"
+                "linux-boundary-preview" | "linux-protected-v1" | "macos-boundary-preview"
             )
         {
             return Err(invalid("unsupported config version or mode"));
+        }
+        if (self.mode.starts_with("linux-") && !cfg!(target_os = "linux"))
+            || (self.mode.starts_with("macos-") && !cfg!(target_os = "macos"))
+        {
+            return Err(invalid("deployment mode does not match this platform"));
         }
         if !validate_uuid(&self.instance_id)
             || self.service_uid == 0
@@ -143,7 +148,12 @@ mod tests {
     pub fn fixture() -> ServiceConfig {
         ServiceConfig {
             schema_version: 1,
-            mode: "linux-boundary-preview".into(),
+            mode: if cfg!(target_os = "macos") {
+                "macos-boundary-preview"
+            } else {
+                "linux-boundary-preview"
+            }
+            .into(),
             instance_id: "12345678-1234-4234-8234-123456789abc".into(),
             service_uid: 1001,
             admin_uids: vec![0, 1002],
@@ -168,12 +178,22 @@ mod tests {
         let mut config = fixture();
         assert!(!config.protected_supported());
         config.mode = "linux-protected-v1".into();
-        config.validate().unwrap();
+        assert_eq!(config.validate().is_ok(), cfg!(target_os = "linux"));
         assert_eq!(
             config.protected_supported(),
             super::super::protected_build_supported()
         );
         config.mode = "unknown-mode".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn macos_preview_never_claims_protected_support() {
+        let mut config = fixture();
+        config.mode = "macos-boundary-preview".into();
+        assert_eq!(config.validate().is_ok(), cfg!(target_os = "macos"));
+        assert!(!config.protected_supported());
+        config.mode = "macos-protected-v1".into();
         assert!(config.validate().is_err());
     }
 

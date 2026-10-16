@@ -43,10 +43,12 @@ pub fn validate_chain(path: &Path, owners: &[u32], directory: bool) -> Result<()
     validate_absolute(path)?;
     let mut current = PathBuf::from("/");
     validate_file_metadata(&std::fs::symlink_metadata(&current)?, owners, true)?;
+    reject_extended_acl(&current)?;
     for component in path.components().skip(1) {
         current.push(component);
         let meta = std::fs::symlink_metadata(&current)?;
         validate_file_metadata(&meta, owners, current != path || directory)?;
+        reject_extended_acl(&current)?;
     }
     Ok(())
 }
@@ -73,6 +75,7 @@ pub fn socket_parent(path: &Path, uid: u32, gid: u32) -> Result<()> {
 pub fn socket(path: &Path, uid: u32, gid: u32) -> Result<Metadata> {
     socket_parent(path, uid, gid)?;
     let meta = std::fs::symlink_metadata(path)?;
+    reject_extended_acl(path)?;
     if !meta.file_type().is_socket()
         || meta.uid() != uid
         || meta.gid() != gid
@@ -153,4 +156,82 @@ pub fn deny_managed_directory(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// POSIX mode bits do not describe macOS extended ACL grants. Preview deployments
+/// conservatively reject every extended entry, including inherited/deny entries.
+#[cfg(target_os = "macos")]
+fn reject_extended_acl(path: &Path) -> Result<()> {
+    use std::ffi::{c_void, CString};
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn acl_get_file(path: *const i8, kind: i32) -> *mut c_void;
+        fn acl_get_entry(acl: *mut c_void, entry_id: i32, entry: *mut *mut c_void) -> i32;
+        fn acl_free(object: *mut c_void) -> i32;
+    }
+    let name = CString::new(path.as_os_str().as_bytes()).map_err(|_| denied(path))?;
+    // Darwin ACL_TYPE_EXTENDED=0x100, ACL_FIRST_ENTRY=0. A valid empty ACL
+    // returns -1 with EINVAL when requesting its first entry (Darwin acl_get_entry).
+    let acl = unsafe { acl_get_file(name.as_ptr(), 0x100) };
+    if acl.is_null() {
+        // Darwin returns ENOENT for an existing vnode with no extended ACL.
+        // Recheck existence so a missing path is never accepted as ACL-free.
+        if std::io::Error::last_os_error().raw_os_error() == Some(nix::libc::ENOENT) {
+            std::fs::symlink_metadata(path)?;
+            return Ok(());
+        }
+        return Err(denied(path));
+    }
+    let mut entry = std::ptr::null_mut();
+    let status = unsafe { acl_get_entry(acl, 0, &mut entry) };
+    let error = std::io::Error::last_os_error();
+    unsafe {
+        acl_free(acl);
+    }
+    if status == -1 && error.raw_os_error() == Some(nix::libc::EINVAL) {
+        Ok(())
+    } else {
+        Err(denied(path))
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn reject_extended_acl(_: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+    #[test]
+    fn extended_acl_cannot_override_trusted_mode_bits() {
+        let path = std::env::temp_dir().join(format!(
+            "keyd-acl-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        {
+            reject_extended_acl(&path).unwrap();
+            let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective()).unwrap().unwrap().name;
+            let acl = format!("user:{user} allow read,write");
+            assert!(std::process::Command::new("/bin/chmod")
+                .args(["+a", &acl])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success());
+            assert!(reject_extended_acl(&path).is_err());
+            assert!(std::process::Command::new("/bin/chmod")
+                .arg("-N")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success());
+            reject_extended_acl(&path).unwrap();
+        }
+        std::fs::remove_dir(path).unwrap();
+    }
 }

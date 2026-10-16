@@ -22,7 +22,7 @@ impl Fixture {
             .open(&path)
             .unwrap();
         let config:ServiceConfig=serde_json::from_value(json!({
-            "schema_version":1,"mode":"linux-boundary-preview","instance_id":uuid(),
+            "schema_version":1,"mode":if cfg!(target_os = "macos") { "macos-boundary-preview" } else { "linux-boundary-preview" },"instance_id":uuid(),
             "service_uid":1001,"admin_uids":[1002],"agent_gid":1003,"admin_gid":1004,
             "state_dir":"/var/lib/anp-keyd","sign_socket":"/run/anp-keyd/sign/sign.sock","admin_socket":"/run/anp-keyd/admin/admin.sock",
             "principals":[{"principal_id":uuid(),"uid":1005,"generation":1,"enabled":true}],"vault_ids":[]

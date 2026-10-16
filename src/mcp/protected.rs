@@ -113,7 +113,7 @@ impl ServerHandler for Keyd {
     }
 }
 pub fn serve(config: PathBuf) -> crate::error::Result<()> {
-    crate::security::require_linux()?;
+    crate::security::require_boundary_platform()?;
     crate::security::config::ServiceConfig::load(&config)?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

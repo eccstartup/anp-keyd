@@ -954,9 +954,25 @@ fn local_filesystem(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn local_filesystem(path: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| unavailable())?;
+    let mut stat = std::mem::MaybeUninit::<nix::libc::statfs>::uninit();
+    // A successful statfs initializes the structure. Only local APFS is accepted.
+    if unsafe { nix::libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(unavailable());
+    }
+    let stat = unsafe { stat.assume_init() };
+    let kind = unsafe { std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr()) };
+    if kind.to_bytes() != b"apfs" || stat.f_flags & nix::libc::MNT_LOCAL as u32 == 0 {
+        return Err(unavailable());
+    }
+    Ok(())
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn local_filesystem(_: &Path) -> Result<()> {
-    crate::security::require_linux()
+    crate::security::require_boundary_platform()
 }
 
 #[cfg(test)]

@@ -612,3 +612,13 @@ cargo clippy --all-targets --all-features
 ## 许可
 
 Apache-2.0。见 [LICENSE](LICENSE)。
+
+
+### macOS 本机独立 UID 预览（U2）
+
+新增 `macos-boundary-preview`：沿用 v2 双 socket、内核 UID 认证、持久授权和事务签名，
+支持独立服务/Agent 账号、launchd 及管理端 `admin unlock --native-ui` 原生口令窗口。
+本机编译和测试无需付费开发者会员；`protected_supported` 仍为 `false`。
+账号与安装工具默认只打印计划，显式 `--apply` 才修改系统；空状态安装不迁移真实密钥。
+现有同 UID Agent 不会因安装而自动获得隔离。
+见 [本机部署、信任边界和待验收项目](deploy/macos/README.md)。
