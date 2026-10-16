@@ -1,11 +1,12 @@
 # TODO
 
-当前受保护改造的进度以本地 `docs/plan-security-v2.md` 为准；此处列未完成的发行工作。
+当前受保护改造的进度以本地 `docs/plan-security-v3.md` 为准；此处列未完成的发行工作。
 
-- [ ] Linux systemd 真实主机验收：验证安装路径、服务沙箱、升级、独立 UID 与故障恢复。完成前保持 `protected_supported=false`。
+- [x] Linux systemd 真实主机验收已完成；仅正式 Linux release 且显式受保护模式声明支持。
 - [ ] macOS 受保护运行环境、可信管理 UI、SE 正式签名分发和持久化。
 - [ ] 实体 TPM 的权限、故障与恢复专项验收；软件替身不等于硬件结果。
-- [ ] 远端审计检查点、回滚检测、受限无人值守恢复。
+- [ ] 独立审计采集器部署与远端检查点保管验收；已提供离线 `audit-checkpoint` 前缀验证，不能替代在线锚定或非审计状态保护。
+- [ ] 受限无人值守恢复（须先指定 workload 与可信解封机制）。
 - [ ] 按实际需求扩展注册 challenge 格式；当前仅支持管理端精确批准的 awiki 32 位小写 hex 格式。
 - [ ] 外部 awiki-cli-rs2 专用适配仍需解决其固定 path 依赖；本仓库交付 Node v2 客户端及 anp-sdk connector。
 

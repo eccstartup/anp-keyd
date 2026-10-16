@@ -442,6 +442,20 @@ anp-keyd keygen --spec mybot.spec.json --hardware secure-enclave
 一半的熵是这台机器的 `device.secret`,绑了硬件根的话还多一路。要在别的机器
 上用同一把身份,走下面那条路。
 
+## 独立审计检查点（离线）
+
+受保护模式的 SQLite 审计可用 `audit-checkpoint` 核查。首次登记须由操作员验证快照来源及实例 ID，并显式使用 `--enroll`；后续采集使用独立保管的 `--previous`，检查完整链及已保存前缀：
+
+```bash
+anp-keyd audit-checkpoint --database /trusted-snapshot/state.sqlite \
+  --instance-id 12345678-1234-4234-8234-123456789abc \
+  --previous /independent-evidence/previous.json
+```
+
+成功输出候选检查点 JSON；采集器检查退出码后，在独立信任域原子保存，才算建立新证据。不要将 stdout 直接重定向覆盖 `--previous` 文件，否则 shell 会先截断旧证据。读取失败保留旧检查点，不自动重新登记。活动数据库须通过 SQLite 一致备份取得快照，或停写后复制。
+
+该工具只锚定审计历史，不参与在线签名准入，也不验证其他状态表。独立保管的检查点可检测已观测历史的整库回滚和分叉；未观测尾部、同目录证据整体替换、首次登记之前的回滚不在保证内。远端采集认证、传输和独立保管仍由部署方完成。
+
 ## 出事的时候
 
 ### 换机器 / 重装系统
