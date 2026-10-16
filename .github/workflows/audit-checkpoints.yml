@@ -1,0 +1,30 @@
+name: Independent audit checkpoints
+on:
+  push:
+    paths:
+      - 'src/persistence/**'
+      - 'src/cli.rs'
+      - 'deploy/checkpoints/**'
+      - 'Cargo.*'
+      - '.github/workflows/audit-checkpoints.yml'
+  pull_request:
+    paths:
+      - 'src/persistence/**'
+      - 'src/cli.rs'
+      - 'deploy/checkpoints/**'
+      - 'Cargo.*'
+      - '.github/workflows/audit-checkpoints.yml'
+permissions:
+  contents: read
+jobs:
+  independent-keeper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Keeper persistence, concurrency and process crashes
+        run: python3 -m unittest discover -s deploy/checkpoints -p test_collector.py -v
+      - name: Real SSH, separate namespaces, rollback and outages
+        run: python3 deploy/checkpoints/acceptance.py

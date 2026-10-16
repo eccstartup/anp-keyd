@@ -1,0 +1,27 @@
+[Unit]
+Description=Retain independent ANP keyd audit checkpoint
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=keyd-checkpoint
+Group=keyd-checkpoint
+UMask=0077
+StateDirectory=keyd-checkpoint-collector
+StateDirectoryMode=0700
+ExecStart=/usr/bin/python3 /usr/local/libexec/keyd-checkpoint-collector.py collect --config /etc/keyd-checkpoint-collector/config.json --store /var/lib/keyd-checkpoint-collector
+TimeoutStartSec=150
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=

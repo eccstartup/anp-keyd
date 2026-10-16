@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "instance_id": "12345678-1234-4234-8234-123456789abc",
+  "host": "keyd.example.com",
+  "port": 22,
+  "user": "keyd-observer",
+  "identity_file": "/var/lib/keyd-checkpoint-collector/id_ed25519",
+  "known_hosts_file": "/etc/keyd-checkpoint-collector/known_hosts",
+  "timeout_seconds": 15,
+  "max_age_seconds": 300
+}

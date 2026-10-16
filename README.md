@@ -442,9 +442,15 @@ anp-keyd keygen --spec mybot.spec.json --hardware secure-enclave
 一半的熵是这台机器的 `device.secret`,绑了硬件根的话还多一路。要在别的机器
 上用同一把身份,走下面那条路。
 
-## 独立审计检查点（离线）
+## 独立审计检查点
 
-受保护模式的 SQLite 审计可用 `audit-checkpoint` 核查。首次登记须由操作员验证快照来源及实例 ID，并显式使用 `--enroll`；后续采集使用独立保管的 `--previous`，检查完整链及已保存前缀：
+U4 提供 `audit-checkpoint` 离线检查、固定 `audit-source` 源端，以及独立的 Python keeper。keeper 通过固定 SSH 主机密钥认证源端，在自己的 SQLite 中串行、原子保存检查点和不可变历史，拒绝旧结果覆盖、错误实例、已观测历史回滚及分叉。崩溃后按实际提交结果恢复，不自动重建或重新登记。
+
+部署模板、SSH/sudo 边界、配置及故障策略见 [独立采集器说明](deploy/checkpoints/README.md)。将 keeper 放在服务 UID/Agent 无法修改的独立主机或执行及存储域，初次明确登记后再启用采集 timer。两容器真实 SSH 验收脚本和 CI 位于同目录。
+
+采集器对连接、输出和观测期限设限；断网或持久化失败保留原证据并返回失败。观测超期会报警式报告，签名核心继续原有本地持久审计策略，不联网、不因检查点失联自动停签。未观测尾部仍明确为未知。检查点只锚定审计历史，不验证其他状态表，也不能抵御源端与独立 keeper 一起回滚或可信管理员失陷。
+
+原离线检查仍可独立使用：
 
 ```bash
 anp-keyd audit-checkpoint --database /trusted-snapshot/state.sqlite \
@@ -452,9 +458,7 @@ anp-keyd audit-checkpoint --database /trusted-snapshot/state.sqlite \
   --previous /independent-evidence/previous.json
 ```
 
-成功输出候选检查点 JSON；采集器检查退出码后，在独立信任域原子保存，才算建立新证据。不要将 stdout 直接重定向覆盖 `--previous` 文件，否则 shell 会先截断旧证据。读取失败保留旧检查点，不自动重新登记。活动数据库须通过 SQLite 一致备份取得快照，或停写后复制。
-
-该工具只锚定审计历史，不参与在线签名准入，也不验证其他状态表。独立保管的检查点可检测已观测历史的整库回滚和分叉；未观测尾部、同目录证据整体替换、首次登记之前的回滚不在保证内。远端采集认证、传输和独立保管仍由部署方完成。
+该命令只输出候选 JSON；首次人工登记用 `--enroll`。不要将 stdout 重定向覆盖 `--previous` 文件。需要自动保管时使用 keeper，而非自行覆盖检查点。
 
 ## 出事的时候
 

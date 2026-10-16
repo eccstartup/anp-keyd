@@ -1,0 +1,11 @@
+[Unit]
+Description=Observe ANP keyd audit history every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=60s
+AccuracySec=5s
+Unit=keyd-checkpoint-collector.service
+
+[Install]
+WantedBy=timers.target

@@ -106,6 +106,30 @@ class KeeperTests(unittest.TestCase):
         with self.assertRaises(keeper.Rejected):
             self.enroll()
         self.assertEqual(before, path.read_bytes())
+        path.write_bytes(b'corrupt database')
+        with self.assertRaises(sqlite3.Error):
+            self.enroll()
+        self.assertEqual(path.read_bytes(), b'corrupt database')
+
+    def test_commit_error_after_durability_retries_from_committed_tip(self):
+        self.enroll()
+        connect = sqlite3.connect
+        class AmbiguousCommit(sqlite3.Connection):
+            def commit(self):
+                super().commit()
+                raise sqlite3.OperationalError('injected error after durable commit')
+        def ambiguous(*args, **kwargs):
+            return connect(*args, factory=AmbiguousCommit, **kwargs)
+        with patch.object(keeper.sqlite3, 'connect', ambiguous):
+            with self.assertRaises(sqlite3.OperationalError):
+                keeper.collect(self.store, self.config, transport=lambda *_: cp(2), clock=lambda: 101)
+        self.assertEqual(keeper.status(self.store, self.config, clock=lambda: 102)['checkpoint'], cp(2))
+        def retry(config, previous):
+            self.assertEqual(previous, cp(2))
+            return cp(2)
+        keeper.collect(self.store, self.config, transport=retry, clock=lambda: 102)
+        with sqlite3.connect(self.store/'checkpoints.sqlite') as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM checkpoints').fetchone()[0], 2)
 
     def test_actual_process_crashes_recover_atomic_old_or_new_state(self):
         self.enroll()

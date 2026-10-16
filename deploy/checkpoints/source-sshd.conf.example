@@ -1,0 +1,13 @@
+# Include in the source host's root-controlled sshd config. Verify with sshd -t.
+# keyd-observer is a dedicated login UID, not an Agent or the daemon UID.
+Match User keyd-observer
+    AuthenticationMethods publickey
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    AuthorizedKeysFile /etc/anp-keyd/audit-authorized-keys/%u
+    ForceCommand /usr/bin/sudo -n -u anp-keyd -- /usr/local/libexec/anp-keyd-audit-source
+    DisableForwarding yes
+    PermitTTY no
+    PermitUserEnvironment no
+    PermitUserRC no
+Match all
