@@ -291,3 +291,9 @@ native unlock for a nonexistent temporary key. Click Cancel if a window appears;
 never enter a password. It does not exercise key unlock/signing and is diagnostic
 only. Socket errors identify timeout option setup, read, write or flush without
 logging frame data, and whole-frame deadlines remain unchanged.
+
+Operator follow-up at `f2be478`: the short empty-instance UI preflight passed
+administrator authentication and returned a cancellation response on macOS.
+The earlier EINVAL after the full signing sequence was not reproduced in that
+short context. This does not establish a fix or full temporary-key UI acceptance;
+the three-stage interactive command remains required with the same candidate.
