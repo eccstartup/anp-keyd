@@ -250,3 +250,12 @@ false EACCES in the harness. Primary-first role-group policy has a dedicated
 regression check; preflight reports libc kernel groups rather than the macOS
 Python account-group lookup. This correction does not widen filesystem modes or
 change any account membership.
+
+On 2026-10-16 the operator ran the full non-UI command at `9085cf3` on
+macOS and reported all checks passing, including actual upstream-verified hot-key
+signing, cross-UID grant/document/result denial, revocation, task-port denial,
+active grant/result invalidation and locked keys after both graceful restart and
+SIGKILL, and forged-socket rejection before any request/secret. Kernel service
+groups were `[600,602,603]`, confirming the primary-first credential correction.
+The installed launchd instance was not modified. Native window interaction,
+whole-machine reboot and formal protected release remain unaccepted.
