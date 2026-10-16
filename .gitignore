@@ -1,12 +1,38 @@
-/target
+# Local documentation is deliberately excluded from code commits.
+/docs/
+
+# Rust build and coverage output.
+/target/
+/coverage/
+*.profraw
+*.profdata
+
+# OS/editor and interpreter caches.
 .DS_Store
-# 崩溃留下的 core dump。容器里的 cwd 就是挂进来的仓库根,所以守护进程一崩,
-# 它就落在仓库根上 —— 而一份 `anp-keyd` 的 core 里可能有信封的半边秘密。
-core
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
 node_modules/
 
-# 文档站的产物。`design/index.md` 是从 `docs/DESIGN.md` 引出来的,
-# 不进版本库 —— 进了就等于那两份说法又变成两份了。
-site/.vitepress/dist
-site/.vitepress/cache
+# VitePress build/cache and the page generated from docs/DESIGN.md.
+site/.vitepress/dist/
+site/.vitepress/cache/
 site/design/index.md
+
+# Local credentials and runtime artifacts. Test fixtures remain trackable.
+.env
+.env.*
+!.env.example
+*.sock
+*.pid
+core
+core.[0-9]*
+*.core
+.anp-keyd/
+*.anpkeyd.json
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.log
