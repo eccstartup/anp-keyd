@@ -24,6 +24,8 @@ def main():
     parser.add_argument('--config', type=Path, default=Path('/Library/ANPKeyd/service.json'))
     parser.add_argument('--binary', type=Path, default=Path('/Library/ANPKeyd/bin/anp-keyd'))
     args = parser.parse_args()
+    args.config = args.config.absolute()
+    args.binary = args.binary.absolute()
     if sys.platform != 'darwin' or os.geteuid() != 0:
         raise ValueError('requires macOS root; run in the human terminal')
     installed = json.loads(args.config.read_text())
@@ -41,7 +43,7 @@ def main():
         return drop
     def run(user, *command):
         return subprocess.run(list(map(str, command)), preexec_fn=identity(user),
-                              env=env, capture_output=True, text=True, timeout=15)
+                              env=env, capture_output=True, text=True, timeout=15, cwd="/")
     with tempfile.TemporaryDirectory(prefix='ANPKeydChecks-', dir='/Library') as directory:
         base = Path(directory)
         base.chmod(0o755)
@@ -65,7 +67,7 @@ def main():
         process = None
         def start():
             proc = subprocess.Popen([str(args.binary), 'serve-protected', '--config', str(path)],
-                                    preexec_fn=identity(service), env=env,
+                                    preexec_fn=identity(service), env=env, cwd="/",
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             for _ in range(100):
                 if proc.poll() is not None:
@@ -104,7 +106,7 @@ if status == 0:
  sys.exit('Agent obtained daemon task port')
 print('task_for_pid denied')
 '''
-            result = run(agent, '/usr/bin/python3', '-c', script, process.pid)
+            result = run(agent, '/usr/bin/python3', '-I', '-c', script, process.pid)
             assert result.returncode == 0 and 'task_for_pid denied' in result.stdout, result.stderr
             print('PASS independent Agent UID cannot obtain daemon task port', flush=True)
             stop(process)

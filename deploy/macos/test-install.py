@@ -20,6 +20,8 @@ def main():
     parser.add_argument('--config', type=Path, default=Path('/Library/ANPKeyd/service.json'))
     parser.add_argument('--binary', type=Path, default=Path('/Library/ANPKeyd/bin/anp-keyd'))
     args = parser.parse_args()
+    args.config = args.config.absolute()
+    args.binary = args.binary.absolute()
     if sys.platform != 'darwin' or os.geteuid() != 0:
         raise ValueError('requires macOS root; no automatic privilege elevation')
     config = json.loads(args.config.read_text())
@@ -28,7 +30,7 @@ def main():
     admin = pwd.getpwuid(config['admin_uids'][0]).pw_name
     def run(user, *command):
         return subprocess.run(['/usr/bin/sudo', '-n', '-u', user, '--', *map(str, command)],
-                              capture_output=True, text=True, timeout=15,
+                              capture_output=True, text=True, timeout=15, cwd="/",
                               env={'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'})
     def cli(user, *command):
         return run(user, args.binary, 'admin', '--config', args.config, *command)
@@ -44,6 +46,7 @@ def main():
         pid, terminal = pty.fork()
         if pid == 0:
             account = pwd.getpwnam(user)
+            os.chdir("/")
             os.initgroups(user, account.pw_gid)
             os.setgid(account.pw_gid)
             os.setuid(account.pw_uid)
@@ -80,7 +83,7 @@ except PermissionError as error:
 else:
  sys.exit('Agent reached admin socket')
 """
-        direct = run(user, '/usr/bin/python3', '-c', script, config['admin_socket'])
+        direct = run(user, '/usr/bin/python3', '-I', '-c', script, config['admin_socket'])
         assert direct.returncode == 0 and direct.stdout.strip() == 'ADMIN_SOCKET_ACCESS_DENIED', direct.stdout + direct.stderr
         print(f'PASS uid={principal["uid"]}: PTY admin denied, state unreadable, admin socket denied')
     print('PASS limited live installation checks. Outstanding gates are listed in README.md.')
