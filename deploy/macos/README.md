@@ -297,3 +297,34 @@ administrator authentication and returned a cancellation response on macOS.
 The earlier EINVAL after the full signing sequence was not reproduced in that
 short context. This does not establish a fix or full temporary-key UI acceptance;
 the three-stage interactive command remains required with the same candidate.
+
+
+## Latest full host result and installing the accepted candidate
+
+The operator completed the **full interactive** command using candidate SHA-256
+`453f5aa6bf6c8f6e74cd0f8e2199ef0e775864fdbec8e924b564da4a2a12b7ee`.
+Every non-UI check passed again. Cancel and the 120-second timeout left the real
+temporary key locked; the operator confirmed exact target details and masked
+input, entered the public test password, and Agent signing succeeded. Subsequent
+SIGKILL/restart and fake-socket checks also passed. These results supersede older
+pending-UI notes above. Formal release and whole-machine reboot remain untested.
+The earlier initial-capabilities EINVAL did not recur; its root cause remains
+unknown and is not claimed fixed. No retry/downgrade bypass was added.
+
+The temporary candidate does not automatically replace the installed executable.
+Review a local update plan, then apply explicitly:
+
+```sh
+/usr/bin/python3 deploy/macos/update-local.py --binary target/release/anp-keyd \
+  --sha256 453f5aa6bf6c8f6e74cd0f8e2199ef0e775864fdbec8e924b564da4a2a12b7ee
+# Same arguments with sudo and --apply to install the accepted build.
+```
+
+The updater verifies root-owned paths and the digest-checked release, stops the
+known launchd job, requires clean socket removal and the exclusive state lock,
+retains `bin/anp-keyd.previous`, atomically replaces the executable and restarts
+with unchanged configuration/state/accounts. It verifies the installed digest,
+instance identity and status. Restart revokes grants and locks keys. Existing
+backup files are refused rather than overwritten. Errors leave artifacts/state
+for inspection; there is no automatic rollback, schema downgrade, or state reset.
+The default plan changes no system files or service state.

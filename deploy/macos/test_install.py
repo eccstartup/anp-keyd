@@ -79,5 +79,30 @@ class ChildCredentials(unittest.TestCase):
         self.assertIn(603, elevated_transport['extra_groups'][1:])
 
 
+class UpdateWrites(unittest.TestCase):
+    def test_backup_and_stage_are_exclusive_and_ignore_restrictive_umask(self):
+        import os
+        import tempfile
+        spec = importlib.util.spec_from_file_location('local_update', Path(__file__).with_name('update-local.py'))
+        update = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(update)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'binary'
+            mask = os.umask(0o077)
+            try:
+                update.write_new(path, b'reviewed-binary')
+            finally:
+                os.umask(mask)
+            self.assertEqual(path.read_bytes(), b'reviewed-binary')
+            self.assertEqual(path.stat().st_mode & 0o777, 0o755)
+            with self.assertRaises(FileExistsError):
+                update.write_new(path, b'overwrite')
+            alias = Path(directory) / 'alias'
+            alias.symlink_to(path)
+            with self.assertRaises(FileExistsError):
+                update.write_new(alias, b'follow-link')
+            self.assertEqual(path.read_bytes(), b'reviewed-binary')
+
+
 if __name__ == '__main__':
     unittest.main()
