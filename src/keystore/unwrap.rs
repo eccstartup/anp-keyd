@@ -39,6 +39,10 @@ pub fn unlock(
     device_secret: &LockedBytes,
 ) -> Result<LockedSigningKey> {
     let seed = seed_of(wrapped, passphrase, device_secret)?;
+    key_from_seed(wrapped, seed)
+}
+
+fn key_from_seed(wrapped: &WrappedKey, seed: LockedBytes) -> Result<LockedSigningKey> {
     let key = LockedSigningKey::from_seed(wrapped.id.clone(), seed)?;
 
     // ⑤ 信封上写的公钥必须就是这把 seed 的公钥。
@@ -85,6 +89,50 @@ fn seed_of(wrapped: &WrappedKey, passphrase: &[u8], device_secret: &LockedBytes)
         }
     };
 
+    decrypt_seed(wrapped, passphrase, device_secret, hs.as_ref(), &aad)
+}
+
+#[cfg(all(test, target_os = "macos", feature = "hardware-se"))]
+pub(crate) fn rewrap_test_se(wrapped: &WrappedKey, passphrase: &[u8], device_secret: &LockedBytes) -> WrappedKey {
+    let seed = seed_of(wrapped, passphrase, device_secret).unwrap();
+    crate::keystore::wrap::seal(crate::keystore::wrap::SealRequest {
+        id: wrapped.id.clone(), algorithm: wrapped.algorithm,
+        public_multibase: wrapped.public_multibase.clone(), label: wrapped.label.clone(),
+        passphrase, device_secret, seed: &seed,
+        argon: crate::crypto::kdf::Argon2Config { m_cost: 1024, t_cost: 1, p_cost: 1 },
+        hardware: Some(crate::keystore::hardware::SealedHardware {
+            root: record::HardwareRoot::SecureEnclave { tag: "anp-keyd/synthetic-bridge-fixture".into() },
+            ciphertext: vec![4; 65], hs: LockedBytes::fill(|bytes| *bytes = [29; 32]).unwrap(),
+        }),
+    }).unwrap()
+}
+
+/// Trusted management bridge only: the caller pins the exact envelope snapshot
+/// and keeps the loaded key under a live login-session lease. No public export API.
+pub(crate) fn unlock_with_se_hs(
+    wrapped: &WrappedKey,
+    passphrase: &[u8],
+    device_secret: &LockedBytes,
+    hs: &LockedBytes,
+) -> Result<LockedSigningKey> {
+    wrapped.validate()?;
+    let aad = wrapped.verify_aad()?;
+    if !matches!(wrapped.hardware, Some(record::HardwareRoot::SecureEnclave { .. }))
+        || wrapped.version != RECORD_VERSION_HARDWARE
+    {
+        return Err(KeydError::Locked);
+    }
+    key_from_seed(wrapped, decrypt_seed(wrapped, passphrase, device_secret, Some(hs), &aad)?)
+}
+
+fn decrypt_seed(
+    wrapped: &WrappedKey,
+    passphrase: &[u8],
+    device_secret: &LockedBytes,
+    hs: Option<&LockedBytes>,
+    aad: &[u8],
+) -> Result<LockedBytes> {
+
     // ③ 口令 + device.secret (+ HS)→ KEK。
     let salt = wrapped.kdf.salt_bytes()?;
     let mut pass_key = kdf::argon2id(
@@ -94,7 +142,7 @@ fn seed_of(wrapped: &WrappedKey, passphrase: &[u8], device_secret: &LockedBytes)
         wrapped.kdf.t_cost,
         wrapped.kdf.p_cost,
     )?;
-    let kek = Zeroizing::new(match &hs {
+    let kek = Zeroizing::new(match hs {
         Some(hs) => kdf::derive_kek_bound(&pass_key, device_secret, &salt, hs),
         None => kdf::derive_kek(&pass_key, device_secret, &salt),
     });
@@ -104,11 +152,11 @@ fn seed_of(wrapped: &WrappedKey, passphrase: &[u8], device_secret: &LockedBytes)
 
     // ④ KEK 解出 DEK。
     let dek_ciphertext = record::decode_b64(&wrapped.dek_ciphertext)?;
-    let dek = exact32(aead::open(&kek, &nonce, &aad, &dek_ciphertext)?)?;
+    let dek = exact32(aead::open(&kek, &nonce, aad, &dek_ciphertext)?)?;
 
     // ⑤ DEK 解出 seed。
     let sk_ciphertext = record::decode_b64(&wrapped.sk_ciphertext)?;
-    exact32(dek.expose(|d| aead::open(d, &nonce, &aad, &sk_ciphertext))?)
+    exact32(dek.expose(|d| aead::open(d, &nonce, aad, &sk_ciphertext))?)
 }
 
 /// 把 seed 解出来给导出用 —— **默认构建里没有这个函数。**
@@ -142,6 +190,33 @@ mod tests {
     use crate::sign::Signer;
 
     const PASS: &[u8] = b"correct horse battery staple";
+
+    #[test]
+    fn se_management_bridge_requires_exact_hardware_secret_and_passphrase() {
+        // Synthetic wrapping material tests the bridge, not physical hardware.
+        let (old, _, seed) = fixture("se-bridge");
+        let hs = device(42);
+        let wrapped = seal(SealRequest {
+            id: old.id.clone(), algorithm: KeyAlgorithm::Ed25519,
+            public_multibase: old.public_multibase.clone(), label: old.label.clone(),
+            passphrase: PASS, device_secret: &device(7), seed: &seed, argon: fast(),
+            hardware: Some(crate::keystore::hardware::SealedHardware {
+                root: record::HardwareRoot::SecureEnclave { tag: "anp-keyd/se-bridge".into() },
+                ciphertext: vec![4; 65], hs: device(42),
+            }),
+        }).unwrap();
+        let key = unlock_with_se_hs(&wrapped, PASS, &device(7), &hs).unwrap();
+        assert_eq!(key.public_multibase(), old.public_multibase);
+        assert!(unlock_with_se_hs(&wrapped, PASS, &device(7), &device(43)).is_err());
+        assert!(unlock_with_se_hs(&wrapped, b"wrong", &device(7), &hs).is_err());
+        assert!(unlock_with_se_hs(&wrapped, PASS, &device(8), &hs).is_err());
+        assert!(unlock_with_se_hs(&old, PASS, &device(7), &hs).is_err());
+        let mut tampered = wrapped.clone();
+        tampered.hs_ciphertext = Some(record::encode_b64(&[5; 65]));
+        assert!(unlock_with_se_hs(&tampered, PASS, &device(7), &hs).is_err());
+        tampered.aead.aad_digest = record::encode_b64(&tampered.aad_digest().unwrap());
+        assert!(unlock_with_se_hs(&tampered, PASS, &device(7), &hs).is_err());
+    }
 
     fn fast() -> Argon2Config {
         Argon2Config {

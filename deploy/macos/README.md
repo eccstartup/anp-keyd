@@ -27,12 +27,11 @@ Even exit 0 covers only the checked signature prerequisites; provisioning
 authorization, distribution assessment, persistent hardware operations, isolation,
 reboot and upgrade remain pending. All reports retain `protected_supported=false`.
 
-Before implementing a login-session helper, define its authenticated IPC, exact
-wrapping-key ownership and allowed operations, handling of logout/locked sessions,
-and separation from untrusted Agent UIDs. It must not expose a general decryption
-oracle or persist an unwrapped secret to bridge logout/reboot. No automatic
-restoration of grants is authorized by a hardware probe. Until that design and
-acceptance exist, U3 SE service acceptance and dependent SE recovery stay open.
+The foreground login-session bridge is implemented as `admin se-session`.
+Its [protocol, lifetime, deployment prerequisites and acceptance checklist](SE-SESSION.md)
+remain preview-only. No automatic restoration of grants is authorized by a
+hardware probe. U3 formal SE service acceptance and dependent SE recovery stay
+open until signed persistent-key and complete host lifecycle checks pass.
 
 This is a local-use implementation, not an accepted protected macOS release.
 `macos-boundary-preview` always reports `protected_supported=false`, including

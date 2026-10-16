@@ -11,6 +11,7 @@ pub mod migration;
 pub mod paths;
 pub mod protocol;
 pub mod server;
+pub(crate) mod se_session;
 
 use crate::error::{KeydError, Result};
 use std::io::{Read, Write};
@@ -43,6 +44,9 @@ pub struct DeadlineStream {
     deadline: Instant,
 }
 impl DeadlineStream {
+    pub(crate) fn clone_socket(&self) -> Result<UnixStream> {
+        Ok(self.stream.try_clone()?)
+    }
     pub fn new(stream: UnixStream, budget: Duration) -> Self {
         Self {
             stream,

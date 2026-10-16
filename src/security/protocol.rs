@@ -39,6 +39,8 @@ pub enum DataRequest {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "operation", deny_unknown_fields)]
 pub enum AdminRequest {
+    #[serde(rename = "START_SE_SESSION")]
+    StartSeSession { vault_id: String, did: String, kid: String },
     #[serde(rename = "COMPLETE_SECRET_OPERATION")]
     CompleteSecretOperation {
         operation_id: String,
@@ -65,6 +67,25 @@ pub enum AdminRequest {
         did: String,
         kid: String,
     },
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SeHeartbeat {
+    pub session_id: String,
+    pub sequence: u64,
+}
+
+pub(crate) fn read_hs(reader: &mut impl Read) -> Result<crate::crypto::hygiene::LockedBytes> {
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    reader.read_exact(&mut *bytes)?;
+    crate::crypto::hygiene::LockedBytes::new(&mut bytes)
+}
+
+pub(crate) fn write_hs(writer: &mut impl Write, hs: &crate::crypto::hygiene::LockedBytes) -> Result<()> {
+    hs.expose(|bytes| writer.write_all(bytes))?;
+    writer.flush()?;
+    Ok(())
 }
 
 // Passwords occupy a separate bounded binary frame, only after an authenticated
@@ -180,6 +201,7 @@ mod tests {
     #[test]
     fn data_rejects_password_operations_duplicates_unknown_fields_and_v1() {
         for request in [
+            r#"{"version":2,"request":{"operation":"START_SE_SESSION","vault_id":"v","did":"d","kid":"k"}}"#,
             r#"{"version":2,"request":{"operation":"UNLOCK_KEY","passphrase":"secret"}}"#,
             r#"{"version":2,"version":2,"request":{"operation":"GET_CAPABILITIES"}}"#,
             r#"{"version":2,"request":{"operation":"GET_CAPABILITIES","passphrase":"secret"}}"#,
@@ -189,6 +211,17 @@ mod tests {
             assert!(!error.to_string().contains("secret"));
         }
         assert!(read::<_, Envelope<DataRequest>>(&mut &[0, 0, 0, 1, 3][..]).is_err());
+    }
+
+    #[test]
+    fn se_secret_frame_is_fixed_size_and_not_a_json_credential() {
+        let hs = crate::crypto::hygiene::LockedBytes::fill(|bytes| *bytes = [29; 32]).unwrap();
+        let mut frame = Zeroizing::new(Vec::new());
+        write_hs(&mut *frame, &hs).unwrap();
+        assert_eq!(frame.len(), 32);
+        read_hs(&mut &frame[..]).unwrap().expose(|bytes| assert_eq!(*bytes, [29; 32]));
+        assert!(read_hs(&mut &frame[..31]).is_err());
+        assert!(parse::<Envelope<AdminRequest>>(r#"{"version":2,"request":{"operation":"START_SE_SESSION","vault_id":"v","did":"d","kid":"k","hs":"secret"}}"#).is_err());
     }
 }
 

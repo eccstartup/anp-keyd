@@ -10,6 +10,14 @@ pub fn unlock_secret(
     did: &str,
     kid: &str,
 ) -> Result<Zeroizing<String>> {
+    prompt_secret(config, vault, did, kid, false)
+}
+
+pub(crate) fn se_session_secret(config: &Path, vault: &str, did: &str, kid: &str) -> Result<Zeroizing<String>> {
+    prompt_secret(config, vault, did, kid, true)
+}
+
+fn prompt_secret(config: &Path, vault: &str, did: &str, kid: &str, se_session: bool) -> Result<Zeroizing<String>> {
     #[cfg(target_os = "macos")]
     {
         let settings = super::config::ServiceConfig::load(config)
@@ -29,7 +37,12 @@ pub fn unlock_secret(
             .capabilities()
             .map_err(|error| stage_error("service capabilities", error))?;
         super::server::harden_process().map_err(|error| stage_error("process hardening", error))?;
-        let details = format!("Local preview — protected support is not declared.\nInstance: {}\nService UID: {}\nVault: {vault}\nDID: {did}\nKey: {kid}\n\nUnlock only; no grant is issued. Expires after 120 seconds.", settings.instance_id, settings.service_uid);
+        let purpose = if se_session {
+            "SE login session for this exact hot key, at most 900 seconds. No grant is issued. Keep the helper running. Closing it, logout detection or heartbeat expiry locks ALL keys and revokes ALL grants. This prompt expires after 120 seconds."
+        } else {
+            "Unlock only; no grant is issued. Expires after 120 seconds."
+        };
+        let details = format!("Local preview — protected support is not declared.\nInstance: {}\nService UID: {}\nVault: {vault}\nDID: {did}\nKey: {kid}\n\n{purpose}", settings.instance_id, settings.service_uid);
         if details.len() > 4096
             || [vault, did, kid]
                 .iter()
@@ -43,7 +56,7 @@ pub fn unlock_secret(
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (config, vault, did, kid);
+        let _ = (config, vault, did, kid, se_session);
         Err(KeydError::Misuse(
             "native management UI is available only on macOS".into(),
         ))

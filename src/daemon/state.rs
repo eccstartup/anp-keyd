@@ -371,13 +371,50 @@ impl DaemonState {
         passphrase: Zeroizing<String>,
         before_install: impl FnOnce() -> Result<G>,
     ) -> Result<()> {
+        self.unlock_using(uid, did, kid, passphrase, None, before_install)
+    }
+
+    pub(crate) fn se_envelope(&self, uid: u32, did: &str, kid: &str) -> Result<(u64, crate::keystore::record::WrappedKey)> {
+        self.with_vault(uid, |vault| Ok((vault.generation, store::resolve(&vault.layout, did, Some(kid))?)))
+    }
+
+    pub(crate) fn unlock_se_guarded<G>(
+        &self,
+        uid: u32,
+        wrapped: &crate::keystore::record::WrappedKey,
+        passphrase: Zeroizing<String>,
+        hs: &crate::crypto::hygiene::LockedBytes,
+        expected_generation: u64,
+        before_install: impl FnOnce() -> Result<G>,
+    ) -> Result<()> {
+        let fragment = wrapped.id.kid.strip_prefix(&format!("{}#", wrapped.id.did))
+            .filter(|s| !s.is_empty() && !s.contains('#')).ok_or(KeydError::Locked)?;
+        self.unlock_using(uid, &wrapped.id.did, Some(fragment), passphrase, Some((wrapped, hs, expected_generation)), before_install)
+    }
+
+    fn unlock_using<G>(
+        &self,
+        uid: u32,
+        did: &str,
+        kid: Option<&str>,
+        passphrase: Zeroizing<String>,
+        se: Option<(&crate::keystore::record::WrappedKey, &crate::crypto::hygiene::LockedBytes, u64)>,
+        before_install: impl FnOnce() -> Result<G>,
+    ) -> Result<()> {
         let (generation, wrapped, device_secret) = self.with_vault(uid, |vault| {
             let wrapped = store::resolve(&vault.layout, did, kid)?;
             let secret = device::load(&vault.layout)?;
             Ok((vault.generation, wrapped, secret))
         })?;
         // Expensive derivation must not hold the vault mutex: LOCK can cancel it.
-        let key = crate::keystore::unwrap::unlock(&wrapped, passphrase.as_bytes(), &device_secret)?;
+        let key = if let Some((expected, hs, expected_generation)) = se {
+            if generation != expected_generation || serde_json::to_vec(expected)? != serde_json::to_vec(&wrapped)? {
+                return Err(KeydError::Locked);
+            }
+            crate::keystore::unwrap::unlock_with_se_hs(&wrapped, passphrase.as_bytes(), &device_secret, hs)?
+        } else {
+            crate::keystore::unwrap::unlock(&wrapped, passphrase.as_bytes(), &device_secret)?
+        };
         let _install_guard = before_install()?;
         self.with_vault(uid, |vault| {
             if vault.generation != generation {
@@ -685,6 +722,40 @@ mod tests {
                 nonce: None,
             }
         }
+    }
+
+    #[test]
+    fn se_unlock_pins_snapshot_and_lock_cancels_inflight_install() {
+        use crate::keystore::{hardware::SealedHardware, record::HardwareRoot, wrap::{seal, SealRequest, seed_to_public}};
+        use crate::crypto::hygiene::LockedBytes;
+        let f = Fixture::new(SigningGates::new(false, false));
+        let layout = KeydLayout::at(f._dir.path().to_path_buf());
+        let old = store::resolve(&layout, &f.did, Some("key-1")).unwrap();
+        let seed = LockedBytes::fill(|bytes| *bytes = [17; 32]).unwrap();
+        let hs = LockedBytes::fill(|bytes| *bytes = [29; 32]).unwrap();
+        let hardware_hs = LockedBytes::fill(|bytes| *bytes = [29; 32]).unwrap();
+        let wrapped = seal(SealRequest {
+            id: old.id.clone(), algorithm: old.algorithm, public_multibase: seed_to_public(&seed).1,
+            label: old.label, passphrase: PASSPHRASE.as_bytes(),
+            device_secret: &device::load(&layout).unwrap(), seed: &seed, argon: fast(),
+            hardware: Some(SealedHardware { root: HardwareRoot::SecureEnclave { tag: "anp-keyd/synthetic-session-test".into() },
+                ciphertext: vec![4; 65], hs: hardware_hs }),
+        }).unwrap();
+        store::write(&layout, &wrapped).unwrap();
+        let pass = || Zeroizing::new(PASSPHRASE.to_string());
+        let (generation, _) = f.state.se_envelope(501, &f.did, "key-1").unwrap();
+        f.state.unlock_se_guarded(501, &wrapped, pass(), &hs, generation, || Ok(())).unwrap();
+        f.state.lock_everything();
+        assert!(f.state.unlock_se_guarded(501, &wrapped, pass(), &hs, generation, || Ok(())).is_err(), "a pre-password lock must cancel the challenge");
+        let (generation, _) = f.state.se_envelope(501, &f.did, "key-1").unwrap();
+        assert!(f.state.unlock_se_guarded(501, &wrapped, pass(), &hs, generation, || {
+            f.state.lock_everything(); Ok(())
+        }).is_err());
+        let mut changed = wrapped.clone();
+        changed.label = "different snapshot".into();
+        let (generation, _) = f.state.se_envelope(501, &f.did, "key-1").unwrap();
+        assert!(f.state.unlock_se_guarded(501, &changed, pass(), &hs, generation, || Ok(())).is_err());
+        assert!(f.state.with_vault(501, |vault| Ok(vault.unlocked.is_empty())).unwrap());
     }
 
     #[test]

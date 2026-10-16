@@ -18,6 +18,53 @@ pub struct Client {
 }
 
 impl Client {
+    /// Foreground login helper: one exact key, no listener, no reconnection.
+    pub fn se_session(mut self, vault_id: String, did: String, kid: String, passphrase: Zeroizing<String>) -> Result<Reply> {
+        self.management()?;
+        super::se_session::require_local_login()?;
+        if !cfg!(all(target_os = "macos", feature = "hardware-se"))
+            || self.config.mode != "macos-boundary-preview" {
+            return Err(KeydError::Misuse("SE_LOGIN_SESSION_REQUIRED".into()));
+        }
+        paths::validate_chain(&std::env::current_exe()?, &[0], false)?;
+        super::server::harden_process()?;
+        self.stream.reset(Duration::from_secs(5));
+        protocol::write(&mut self.stream, &Envelope { version: VERSION,
+            request: AdminRequest::StartSeSession { vault_id, did: did.clone(), kid: kid.clone() } })?;
+        let challenge = self.reply()?;
+        if challenge.code != "OK" { return Ok(challenge); }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Challenge { session_id: String, envelope: crate::keystore::record::WrappedKey, max_seconds: i64 }
+        let challenge: Challenge = serde_json::from_value(challenge.data.ok_or(KeydError::Locked)?)?;
+        if challenge.envelope.id.did != did || challenge.envelope.id.kid != kid
+            || challenge.max_seconds != super::se_session::MAX_SECONDS
+            || challenge.session_id.len() != 64
+            || !matches!(challenge.envelope.hardware, Some(crate::keystore::record::HardwareRoot::SecureEnclave { .. })) {
+            return Err(KeydError::Locked);
+        }
+        challenge.envelope.validate()?;
+        challenge.envelope.verify_aad()?;
+        let hs = crate::keystore::hardware::open_hs(&challenge.envelope)?;
+        self.stream.reset(Duration::from_secs(5));
+        protocol::write_hs(&mut self.stream, &hs)?;
+        protocol::write_secret(&mut self.stream, &passphrase)?;
+        drop(hs);
+        drop(passphrase);
+        self.stream.reset(Duration::from_secs(30));
+        let reply = self.reply()?;
+        if reply.code != "OK" { return Ok(reply); }
+        eprintln!("SE session active for exact key {kid}; no grant issued. Keep this helper running; closing it locks all keys and revokes grants. Maximum 900 seconds; no automatic reconnect.");
+        for sequence in 1u64.. {
+            std::thread::sleep(Duration::from_secs(1));
+            self.stream.reset(Duration::from_secs(5));
+            protocol::write(&mut self.stream, &protocol::SeHeartbeat { session_id: challenge.session_id.clone(), sequence })?;
+            let reply = self.reply()?;
+            if reply.code != "OK" { return Ok(reply); }
+        }
+        Err(KeydError::Locked)
+    }
+
     pub fn connect(path: &Path, admin: bool) -> Result<Self> {
         super::require_boundary_platform()?;
         let config = ServiceConfig::load(path)?;

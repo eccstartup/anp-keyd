@@ -332,6 +332,15 @@ pub enum AdminCommand {
     },
     Status,
     LockAll,
+    /// Foreground macOS SE login helper. Closing it locks keys and revokes grants.
+    SeSession {
+        #[arg(long)]
+        vault_id: String,
+        #[arg(long)]
+        did: String,
+        #[arg(long)]
+        kid: String,
+    },
     Unlock {
         /// Use a native secure macOS dialog, after service authentication.
         #[arg(long)]
@@ -1012,6 +1021,18 @@ pub fn run(cli: Cli) -> Result<()> {
                     AdminClient::connect(&args.config, true)?.complete_secret_operation(operation_id, digest, secret)?
                 }
                 AdminCommand::LockAll => client.lock_all()?,
+                AdminCommand::SeSession { vault_id, did, kid } => {
+                    if !cfg!(all(target_os = "macos", feature = "hardware-se")) {
+                        return Err(KeydError::Misuse("SE login helper requires macOS and hardware-se".into()));
+                    }
+                    crate::security::se_session::require_local_login()?;
+                    let status = client.capabilities()?;
+                    if status.data.as_ref().and_then(|data| data.get("se_login_sessions")).and_then(|value| value.as_bool()) != Some(true) {
+                        return Err(KeydError::Misuse("daemon does not support SE login sessions; update the reviewed daemon before prompting".into()));
+                    }
+                    let secret = crate::security::management_ui::se_session_secret(&args.config, &vault_id, &did, &kid)?;
+                    AdminClient::connect(&args.config, true)?.se_session(vault_id, did, kid, secret)?
+                }
                 AdminCommand::Unlock { vault_id, did, kid, native_ui } => {
                     // Preflight before prompting; reconnect and authenticate again before sending.
                     if native_ui {

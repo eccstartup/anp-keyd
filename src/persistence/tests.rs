@@ -63,6 +63,72 @@ fn now() -> Time {
 }
 
 #[test]
+fn se_session_loss_revokes_exhausted_cached_results_and_old_approvals() {
+    let (mut f, key, policy) = grant_fixture();
+    let grant = new_grant(&mut f, &key, &policy);
+    let id = uuid();
+    f.db.reserve_http(&grant.principal_id, &grant.grant_id, &id, &canonical(), now()).unwrap();
+    f.db.complete_http(&grant.principal_id, &id, &json!({"signature":"cached"}), (1040, 45000), "digest", now()).unwrap();
+    f.db.connection.execute("UPDATE grants SET state='exhausted',used_uses=max_uses WHERE grant_id=?1", [&grant.grant_id]).unwrap();
+    assert!(f.db.request_status(&grant.principal_id, &id, now()).unwrap().result.is_some());
+    let approval = f.disable();
+    let epoch = f.db.mutation_epoch().unwrap();
+    f.db.end_se_session(1002, "old-session").unwrap();
+    assert!(f.db.request_status(&grant.principal_id, &id, now()).unwrap().result.is_none());
+    let after = grants::get(&f.db.connection, &grant.grant_id).unwrap().unwrap();
+    assert_eq!(after.state, "revoked");
+    assert_eq!(after.used_uses, grant.max_uses);
+    assert!(f.db.commit(1002, &approval.operation_id, &approval.digest, now()).is_err());
+    assert!(f.db.mutation_epoch().unwrap() > epoch);
+}
+
+#[test]
+fn se_session_end_audit_failure_rolls_back_all_authority_mutations() {
+    let (mut f, key, policy) = grant_fixture();
+    let grant = new_grant(&mut f, &key, &policy);
+    let approval = f.disable();
+    let epoch = f.db.mutation_epoch().unwrap();
+    f.db.connection.execute_batch("CREATE TRIGGER fail_session_audit BEFORE INSERT ON audit_events BEGIN SELECT RAISE(ABORT,'fail'); END;").unwrap();
+    assert!(f.db.end_se_session(1002, "old-session").is_err());
+    assert_eq!(f.db.mutation_epoch().unwrap(), epoch);
+    assert_eq!(grants::get(&f.db.connection, &grant.grant_id).unwrap().unwrap().state, "active");
+    f.db.connection.execute_batch("DROP TRIGGER fail_session_audit").unwrap();
+    f.db.commit(1002, &approval.operation_id, &approval.digest, now()).unwrap();
+}
+
+#[cfg(all(target_os = "macos", feature = "hardware-se"))]
+#[test]
+#[ignore = "explicit local-console bridge test with synthetic HS; no real keychain keys"]
+fn local_console_se_bridge_signs_and_disconnect_revokes_without_hardware_mock_claims() {
+    use crate::persistence::clock::{Clock, SystemClock};
+    for ending in ["disconnect", "replay", "silence", "bad-pass", "bad-hs"] {
+    let (mut f, key_id, policy) = grant_fixture();
+    let key = f.db.catalog().unwrap().keys.into_iter().find(|key| key.key_id == key_id).unwrap();
+    let layout = crate::keystore::layout::KeydLayout::at(f.dir.join("vaults").join(&key.vault_id));
+    let old = crate::keystore::store::resolve(&layout, &key.did, Some("http-hot")).unwrap();
+    let wrapped = crate::keystore::unwrap::rewrap_test_se(&old, b"test-pass", &crate::keystore::device::load(&layout).unwrap());
+    crate::keystore::store::write(&layout, &wrapped).unwrap();
+    apply_change(&mut f, catalog::CatalogChange::EnrollVault { vault_id: key.vault_id.clone() });
+    apply_change(&mut f, catalog::CatalogChange::ConfirmRole { key_id: key_id.clone(), role: catalog::KeyRole::Hot });
+    let grant = new_grant(&mut f, &key_id, &policy);
+    let current = SystemClock.now().unwrap();
+    f.db.connection.execute("UPDATE grants SET expiry=?1 WHERE grant_id=?2", params![current.wall + 120, grant.grant_id]).unwrap();
+    f.db.connection.execute("UPDATE grant_deadlines SET monotonic_deadline=?1 WHERE grant_id=?2", params![current.monotonic_ms + 120_000, grant.grant_id]).unwrap();
+    let mut config = f.config.clone();
+    config.admin_uids = vec![crate::daemon::peer::self_uid()];
+    config.state_dir = f.dir.clone();
+    config.vault_ids = vec![key.vault_id];
+    let placeholder = Database { connection: Connection::open_in_memory().unwrap(), boot_epoch: 0, root: f.dir.clone() };
+    let database = std::mem::replace(&mut f.db, placeholder);
+    f.db = crate::security::server::exercise_local_se_bridge(config, database, grant, ending);
+    if ending == "bad-pass" || ending == "bad-hs" {
+        let count: i64 = f.db.connection.query_row("SELECT count(*) FROM audit_events WHERE json_extract(CAST(event_data AS TEXT),'$.event')='SE_SESSION_REFUSED'", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 1, "failed bridge unlock must be audited without plaintext secrets");
+    }
+    }
+}
+
+#[test]
 fn prepared_operations_bind_actor_digest_epoch_and_single_use() {
     let mut f = Fixture::new();
     let p = f.disable();

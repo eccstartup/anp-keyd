@@ -826,6 +826,19 @@ impl Database {
         append(&tx, &event)?;
         tx.commit().map_err(db_error)
     }
+
+    /// Session loss never refunds quotas, restores grants, or deletes results.
+    /// Invalidate prepared approvals as well, so an old approval cannot recreate
+    /// authority after a fresh login/unlock.
+    pub(crate) fn end_se_session(&mut self, actor: u32, session_id: &str) -> Result<()> {
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_error)?;
+        tx.execute("UPDATE grants SET state='revoked' WHERE state IN ('active','exhausted')", []).map_err(db_error)?;
+        // Every prepared approval is pinned to this epoch. Advancing it expires
+        // those approvals without changing the existing on-disk schema/states.
+        tx.execute("UPDATE service_meta SET mutation_epoch=mutation_epoch+1 WHERE singleton=1", []).map_err(db_error)?;
+        append(&tx, &json!({"event":"SE_SESSION_ENDED","actor":actor,"session_id":session_id}))?;
+        tx.commit().map_err(db_error)
+    }
 }
 
 fn managed_marker(root: &Path, instance: &str) -> Result<()> {

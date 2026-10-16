@@ -35,6 +35,89 @@ pub struct Boundary {
     rates: Mutex<super::limits::RateLimit>,
     projection_healthy: AtomicBool,
     connections: super::limits::Connections,
+    se_session: Mutex<Option<super::se_session::Lease>>,
+}
+
+#[cfg(all(test, target_os = "macos", feature = "hardware-se"))]
+pub(crate) fn exercise_local_se_bridge(config: ServiceConfig, database: Database, grant: crate::persistence::grants::Grant, ending: &str) -> Database {
+    use std::io::Write;
+    use crate::crypto::hygiene::LockedBytes;
+    let catalog = database.catalog().unwrap();
+    let key = catalog.keys.iter().find(|key| key.key_id == grant.key_id).unwrap();
+    let boundary = Arc::new(Boundary::new(config.clone(), database).unwrap());
+    let (server, mut helper) = UnixStream::pair().unwrap();
+    helper.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    helper.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+    let worker = boundary.clone();
+    let thread = std::thread::spawn(move || worker.connection(server, true));
+    protocol::write(&mut helper, &Envelope { version: VERSION, request: AdminRequest::StartSeSession {
+        vault_id: key.vault_id.clone(), did: key.did.clone(), kid: key.kid.clone() } }).unwrap();
+    let challenge: Reply = protocol::read(&mut helper).unwrap();
+    assert_eq!(challenge.code, "OK");
+    assert_eq!(challenge.instance_id.as_deref(), Some(config.instance_id.as_str()));
+    let session_id = challenge.data.as_ref().unwrap()["session_id"].as_str().unwrap().to_string();
+    let wrapped: crate::keystore::record::WrappedKey = serde_json::from_value(challenge.data.unwrap()["envelope"].clone()).unwrap();
+    assert_eq!(wrapped.id.kid, key.kid);
+    // Fixture-only HS stands in for the signed helper's SE call. The actual
+    // management stream, kernel audit session, console observer, KDF, signing,
+    // transactions, and disconnect cleanup are exercised without OS mocks.
+    protocol::write_hs(&mut helper, &LockedBytes::fill(|bytes| *bytes = [if ending == "bad-hs" { 30 } else { 29 }; 32]).unwrap()).unwrap();
+    protocol::write_secret(&mut helper, if ending == "bad-pass" { "wrong-pass" } else { "test-pass" }).unwrap();
+    let ready: Reply = protocol::read(&mut helper).unwrap();
+    if ending == "bad-pass" || ending == "bad-hs" {
+        assert_eq!(ready.code, "SE_SESSION_REFUSED");
+        drop(helper);
+        thread.join().unwrap().unwrap();
+        assert!(boundary.se_session.lock().unwrap().is_none());
+        assert!(!boundary.stopped.load(Ordering::SeqCst));
+        assert_eq!(boundary.vaults[&key.vault_id].lock(config.service_uid, None, None).unwrap(), 0);
+        return Arc::try_unwrap(boundary).ok().unwrap().database.into_inner().unwrap();
+    }
+    assert_eq!(ready.code, "OK");
+    assert_eq!(ready.instance_id.as_deref(), Some(config.instance_id.as_str()));
+    protocol::write(&mut helper, &protocol::SeHeartbeat { session_id, sequence: 1 }).unwrap();
+    let beat: Reply = protocol::read(&mut helper).unwrap();
+    assert_eq!(beat.code, "OK");
+    assert_eq!(beat.instance_id.as_deref(), Some(config.instance_id.as_str()));
+    let request_id = "12345678-1234-4234-8234-123456789012".to_string();
+    let http = super::http::HttpRequest { method: "GET".into(), url: "https://service.example.com/v1/orders".into(),
+        headers: Default::default(), body: super::http::Body::Absent {}, nonce: None };
+    let signed = boundary.data(1005, &grant.principal_id, DataRequest::SignHttp {
+        grant_id: grant.grant_id.clone(), request_id: request_id.clone(), http });
+    assert_eq!(signed.code, "OK");
+    let signed = signed.data.unwrap();
+    let headers: BTreeMap<String, String> = serde_json::from_value(signed["result"]["headers"].clone()).unwrap();
+    assert!(headers.keys().any(|name| name.eq_ignore_ascii_case("signature")));
+    let (document, _) = boundary.vaults[&key.vault_id].get_document(config.service_uid, &key.did).unwrap();
+    let document = serde_json::from_slice(&document).unwrap();
+    anp::authentication::verify_http_message_signature(&document, "GET", "https://service.example.com/v1/orders", &headers, None).unwrap();
+    assert!(anp::authentication::verify_http_message_signature(&document, "GET", "https://service.example.com/other", &headers, None).is_err());
+    // Disconnect must lock the real loaded key, revoke the grant, and hide the
+    // previously committed result before the next successful data response.
+    if ending == "replay" {
+        let challenge = protocol::SeHeartbeat { session_id: "wrong-session".into(), sequence: 1 };
+        protocol::write(&mut helper, &challenge).unwrap();
+        assert!(protocol::read::<_, Reply>(&mut helper).is_err());
+    } else if ending == "silence" {
+        // Deliberately withhold heartbeats. Server-side whole-frame expiry must
+        // revoke authority even while the helper process/socket remain alive.
+        assert!(protocol::read::<_, Reply>(&mut helper).is_err());
+    } else {
+        assert_eq!(ending, "disconnect");
+    }
+    helper.flush().unwrap();
+    drop(helper);
+    thread.join().unwrap().unwrap();
+    assert!(boundary.se_session.lock().unwrap().is_none());
+    assert!(!boundary.stopped.load(Ordering::SeqCst));
+    assert_eq!(boundary.database.lock().unwrap().grant_status(&grant.principal_id, &grant.grant_id, SystemClock.now().unwrap()).unwrap().state, "revoked");
+    let status = boundary.data(1005, &grant.principal_id, DataRequest::RequestStatus { request_id });
+    assert_eq!(status.code, "OK");
+    assert!(status.data.unwrap().get("result").is_none());
+    let state = &boundary.vaults[&key.vault_id];
+    assert_eq!(state.lock(config.service_uid, None, None).unwrap(), 0, "disconnect already removed the loaded key");
+    let boundary = Arc::try_unwrap(boundary).ok().unwrap();
+    boundary.database.into_inner().unwrap()
 }
 
 impl Boundary {
@@ -66,6 +149,7 @@ impl Boundary {
             rates: Mutex::new(Default::default()),
             projection_healthy: AtomicBool::new(false),
             connections: Default::default(),
+            se_session: Mutex::new(None),
         })
     }
 
@@ -76,7 +160,8 @@ impl Boundary {
         reply.instance_id = Some(self.config.instance_id.clone());
         reply.principal_id = principal_id;
         reply.data = Some(
-            json!({"audit_projection_healthy":self.projection_healthy.load(Ordering::SeqCst),"transaction_executor_available":true}),
+            json!({"audit_projection_healthy":self.projection_healthy.load(Ordering::SeqCst),"transaction_executor_available":true,
+                "se_login_sessions":cfg!(all(target_os="macos",feature="hardware-se")) && self.config.mode == "macos-boundary-preview" && self.config.limits.admin_connections >= 2}),
         );
         match self.database.lock() {
             Ok(db) => reply.boot_epoch = Some(db.boot_epoch),
@@ -92,6 +177,137 @@ impl Boundary {
         for state in self.vaults.values() {
             state.lock_everything();
         }
+    }
+
+    // Caller holds the coordinator and DB lock, including before result delivery.
+    fn check_se_session(&self, db: &mut Database) -> Result<()> {
+        let mut session = self.se_session.lock().map_err(|_| KeydError::Locked)?;
+        if session.as_ref().is_some_and(|lease| !lease.live()) {
+            let lease = session.take().expect("present lease");
+            self.lock_all();
+            if let Err(error) = db.end_se_session(lease.actor, &lease.id) {
+                self.emergency();
+                return Err(error);
+            }
+            return Err(KeydError::Misuse("SE_SESSION_ENDED".into()));
+        }
+        Ok(())
+    }
+
+    fn finish_se_session(&self, id: &str) -> Result<()> {
+        let _guard = self.admin_gate.enter(true)?;
+        let mut session = self.se_session.lock().map_err(|_| KeydError::Locked)?;
+        if session.as_ref().is_some_and(|lease| lease.id == id) {
+            let lease = session.take().expect("present lease");
+            self.lock_all();
+            self.database.lock().map_err(|_| KeydError::Locked)?.end_se_session(lease.actor, id)?;
+        }
+        Ok(())
+    }
+
+    fn se_connection(&self, actor: u32, io: &mut DeadlineStream, vault: &str, did: &str, kid: &str) -> Result<()> {
+        use crate::keystore::record::HardwareRoot;
+        use super::se_session;
+        if self.config.limits.admin_connections < 2 {
+            return protocol::write(io, &Reply::code("RESOURCE_BUSY"));
+        }
+        let socket = io.clone_socket()?;
+        let audit_session = match se_session::peer_session(&socket, actor) {
+            Ok(session) if self.config.mode == "macos-boundary-preview" => session,
+            _ => return protocol::write(io, &Reply::code("SE_LOGIN_SESSION_REQUIRED")),
+        };
+        let console_epoch = se_session::console_epoch();
+        let _kdf = match self.kdf_gate.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => return protocol::write(io, &Reply::code("RESOURCE_BUSY")),
+        };
+        let mut random = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut random);
+        let id: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let setup = (|| -> Result<()> {
+            let state = self.vaults.get(vault).ok_or(KeydError::Locked)?;
+            let fragment = kid.strip_prefix(&format!("{did}#"))
+                .filter(|s| !s.is_empty() && !s.contains('#')).ok_or(KeydError::Locked)?;
+            let (wrapped, epoch, generation) = {
+                let _guard = self.admin_gate.enter(true)?;
+                if self.stopped.load(Ordering::SeqCst) { return Err(KeydError::Locked); }
+                if self.se_session.lock().map_err(|_| KeydError::Locked)?.is_some() {
+                    return Err(KeydError::Locked);
+                }
+                let db = self.database.lock().map_err(|_| KeydError::Locked)?;
+                db.check_key(vault, did, kid)?;
+                if !db.catalog()?.keys.iter().any(|key| key.vault_id == vault && key.did == did && key.kid == kid
+                    && key.role == crate::persistence::catalog::KeyRole::Hot && key.state == "active") {
+                    return Err(KeydError::Locked);
+                }
+                let (generation, wrapped) = state.se_envelope(self.config.service_uid, did, fragment)?;
+                wrapped.validate()?;
+                wrapped.verify_aad()?;
+                if !matches!(wrapped.hardware, Some(HardwareRoot::SecureEnclave { .. })) {
+                    return Err(KeydError::Locked);
+                }
+                (wrapped, db.mutation_epoch()?, generation)
+            };
+            let mut challenge = Reply::code("OK");
+            challenge.instance_id = Some(self.config.instance_id.clone());
+            challenge.data = Some(json!({"session_id":id,"envelope":wrapped,"max_seconds":se_session::MAX_SECONDS}));
+            io.reset(Duration::from_secs(30));
+            protocol::write(io, &challenge)?;
+            let hs = protocol::read_hs(io)?;
+            let passphrase = protocol::read_secret(io)?;
+            state.unlock_se_guarded(self.config.service_uid, &wrapped, passphrase, &hs, generation, || {
+                let guard = self.admin_gate.enter(true)?;
+                if self.stopped.load(Ordering::SeqCst) || !se_session::login_active(actor, audit_session)
+                    || se_session::console_epoch() != console_epoch {
+                    return Err(KeydError::Locked);
+                }
+                let mut db = self.database.lock().map_err(|_| KeydError::Locked)?;
+                if db.mutation_epoch()? != epoch { return Err(KeydError::Locked); }
+                db.check_key(vault, did, kid)?;
+                let mut current = self.se_session.lock().map_err(|_| KeydError::Locked)?;
+                if current.is_some() { return Err(KeydError::Locked); }
+                let mut lease = se_session::Lease::new(id.clone(), actor, audit_session, socket, se_session::now()?)?;
+                lease.console_epoch = console_epoch;
+                if let Err(error) = db.record(json!({"event":"SE_SESSION_STARTED","actor":actor,"session_id":id,"vault_id":vault,"kid":kid})) {
+                    self.emergency();
+                    return Err(error);
+                }
+                *current = Some(lease);
+                Ok(guard)
+            })?;
+            io.reset(Duration::from_secs(5));
+            protocol::write(io, &self.capabilities(None))?;
+            Ok(())
+        })();
+        drop(_kdf);
+        if setup.is_err() {
+            if self.finish_se_session(&id).is_err() { self.emergency(); }
+            let audited = self.record(json!({"event":"SE_SESSION_REFUSED","actor":actor,
+                "session_id":id,"vault_id":vault,"kid":kid}));
+            io.reset(Duration::from_secs(5));
+            return protocol::write(io, &Reply::code(if !audited || self.stopped.load(Ordering::SeqCst) {
+                "AUDIT_UNAVAILABLE"
+            } else { "SE_SESSION_REFUSED" }));
+        }
+        loop {
+            io.reset(Duration::from_secs(se_session::HEARTBEAT_SECONDS));
+            let heartbeat: super::protocol::SeHeartbeat = match protocol::read(io) {
+                Ok(value) => value,
+                Err(_) => break,
+            };
+            let outcome = (|| -> Result<()> {
+                let _guard = self.admin_gate.enter(true)?;
+                if self.stopped.load(Ordering::SeqCst) { return Err(KeydError::Locked); }
+                let mut session = self.se_session.lock().map_err(|_| KeydError::Locked)?;
+                let lease = session.as_mut().filter(|lease| lease.id == id).ok_or(KeydError::Locked)?;
+                if !lease.live() { return Err(KeydError::Locked); }
+                lease.heartbeat(&heartbeat.session_id, heartbeat.sequence, se_session::now()?)?;
+                Ok(())
+            })();
+            if outcome.is_err() || protocol::write(io, &self.capabilities(None)).is_err() { break; }
+        }
+        if self.finish_se_session(&id).is_err() { self.emergency(); }
+        Ok(())
     }
 
     fn connection(&self, stream: UnixStream, admin: bool) -> Result<()> {
@@ -143,12 +359,19 @@ impl Boundary {
         } else {
             None
         };
+        // Keep coordinated data execution through the bounded wire delivery:
+        // session teardown/revocation cannot acknowledge while a previously
+        // authorized signature frame is still waiting to be sent.
+        let mut delivery_guard = None;
         let mut reply = if admin {
             match protocol::read::<_, Envelope<AdminRequest>>(&mut io) {
                 Ok(request) if request.version != VERSION => {
                     Reply::code("PROTOCOL_VERSION_UNSUPPORTED")
                 }
                 Ok(request) => {
+                    if let AdminRequest::StartSeSession { vault_id, did, kid } = request.request {
+                        return self.se_connection(peer.uid, &mut io, &vault_id, &did, &kid);
+                    }
                     let secret = if matches!(
                         request.request,
                         AdminRequest::Unlock { .. } | AdminRequest::CompleteSecretOperation { .. }
@@ -171,14 +394,24 @@ impl Boundary {
                 Ok(request) if request.version != VERSION => {
                     Reply::code("PROTOCOL_VERSION_UNSUPPORTED")
                 }
-                Ok(request) => self.data(
-                    peer.uid,
-                    principal.as_deref().expect("authenticated principal"),
-                    request.request,
-                ),
+                Ok(request) => match self.admin_gate.enter(false) {
+                    Ok(guard) => {
+                        delivery_guard = Some(guard);
+                        self.data_locked(peer.uid, principal.as_deref().expect("authenticated principal"), request.request)
+                    }
+                    Err(_) => Reply::code("RESOURCE_BUSY"),
+                },
                 Err(_) => Reply::code("PROTOCOL_INVALID"),
             }
         };
+        if delivery_guard.is_some() {
+            let check = self.database.lock().map_err(|_| KeydError::Locked)
+                .and_then(|mut db| self.check_se_session(&mut db));
+            if let Err(error) = check {
+                reply = if matches!(error, KeydError::Misuse(_)) { Reply::code("SE_SESSION_ENDED") }
+                    else { self.emergency(); Reply::code("AUDIT_UNAVAILABLE") };
+            }
+        }
         if reply.code == "OK" {
             reply.signing_available = !self.stopped.load(Ordering::SeqCst);
             reply.protected_supported = self.config.protected_supported();
@@ -187,10 +420,17 @@ impl Boundary {
         // New deadline for delivery; no secret payload is reflected in errors.
         io.reset(Duration::from_secs(self.config.limits.response_seconds));
         protocol::write(&mut io, &reply)
-        // Exactly one request; dropping the stream rejects inherited old sessions.
+        // Ordinary connections are one-shot. START_SE_SESSION is the explicit,
+        // authenticated heartbeat exception with a non-renewable 900s deadline.
     }
 
+    #[cfg(all(test, target_os = "macos", feature = "hardware-se"))]
     fn data(&self, uid: u32, principal: &str, request: DataRequest) -> Reply {
+        let Ok(_guard) = self.admin_gate.enter(false) else { return Reply::code("RESOURCE_BUSY"); };
+        self.data_locked(uid, principal, request)
+    }
+
+    fn data_locked(&self, uid: u32, principal: &str, request: DataRequest) -> Reply {
         // Recheck the live principal after reading the frame. A stalled connection
         // must not retain access after DisablePrincipal commits.
         let rate_now = match SystemClock.now() {
@@ -206,7 +446,6 @@ impl Boundary {
             return Reply::code("RESOURCE_BUSY");
         }
         let result = (|| -> Result<Reply> {
-            let _gate = self.admin_gate.enter(false)?;
             if self.stopped.load(Ordering::SeqCst) {
                 return Err(KeydError::Protocol("PERSISTENCE_UNAVAILABLE".into()));
             }
@@ -214,6 +453,7 @@ impl Boundary {
                 .database
                 .lock()
                 .map_err(|_| KeydError::Protocol("PERSISTENCE_UNAVAILABLE".into()))?;
+            self.check_se_session(&mut db)?;
             if db.principal(uid)?.as_ref().map(|p| p.principal_id.as_str()) != Some(principal) {
                 return Err(KeydError::Misuse("PRINCIPAL_DISABLED".into()));
             }
@@ -270,6 +510,10 @@ impl Boundary {
                         &canonical,
                         &SystemClock,
                         |key, expiry, deadline| {
+                            if self.se_session.lock().map_err(|_| KeydError::Locked)?
+                                .as_ref().is_some_and(|lease| !lease.live()) {
+                                return Err(KeydError::Locked);
+                            }
                             let state = self.vaults.get(&key.vault_id).ok_or_else(|| {
                                 KeydError::Protocol("missing managed vault".into())
                             })?;
@@ -295,6 +539,9 @@ impl Boundary {
                     )?)?);
                 }
             }
+            // Recheck before releasing signatures or cached results. Logout,
+            // disconnect or a stale heartbeat during signing suppresses delivery.
+            self.check_se_session(&mut db)?;
             Ok(reply)
         })();
         match result {
@@ -314,6 +561,12 @@ impl Boundary {
         let Ok(_permit) = self.admin_gate.enter(false) else {
             return;
         };
+        let session_check = self.database.lock().map_err(|_| KeydError::Locked)
+            .and_then(|mut db| self.check_se_session(&mut db));
+        if let Err(error) = session_check {
+            if !matches!(error, KeydError::Misuse(_)) { self.emergency(); }
+            if self.stopped.load(Ordering::SeqCst) { return; }
+        }
         let count: usize = self
             .vaults
             .values()
@@ -392,7 +645,17 @@ impl Boundary {
         if self.stopped.load(Ordering::SeqCst) {
             return Reply::code("AUDIT_UNAVAILABLE");
         }
+        if !unlocking {
+            let result = self.database.lock().map_err(|_| KeydError::Locked)
+                .and_then(|mut db| self.check_se_session(&mut db));
+            if let Err(error) = result {
+                if matches!(error, KeydError::Misuse(_)) { return Reply::code("SE_SESSION_ENDED"); }
+                self.emergency();
+                return Reply::code("AUDIT_UNAVAILABLE");
+            }
+        }
         match request {
+            AdminRequest::StartSeSession { .. } => Reply::code("SE_LOGIN_SESSION_REQUIRED"),
             AdminRequest::CompleteSecretOperation {
                 operation_id,
                 digest,
@@ -803,16 +1066,19 @@ pub async fn serve(config: ServiceConfig, mut stop: watch::Receiver<bool>) -> Re
     tokio::pin!(sign_task, admin_task);
     let outcome = tokio::select! {
         result = &mut sign_task => {
+            boundary.emergency();
             let _ = shutdown.send(true);
             let other = admin_task.await;
             result.and(other)
         }
         result = &mut admin_task => {
+            boundary.emergency();
             let _ = shutdown.send(true);
             let other = sign_task.await;
             result.and(other)
         }
         _ = stop.changed() => {
+            boundary.emergency();
             let _ = shutdown.send(true);
             let (sign_result, admin_result) = tokio::join!(sign_task, admin_task);
             sign_result.and(admin_result)
