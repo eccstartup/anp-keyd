@@ -12,16 +12,23 @@ pub fn unlock_secret(
 ) -> Result<Zeroizing<String>> {
     #[cfg(target_os = "macos")]
     {
-        let settings = super::config::ServiceConfig::load(config)?;
+        let settings = super::config::ServiceConfig::load(config)
+            .map_err(|error| stage_error("config validation", error))?;
         if settings.mode != "macos-boundary-preview" {
             return Err(KeydError::Misuse(
                 "native management UI requires macOS boundary mode".into(),
             ));
         }
         // No Agent-controlled executable may collect the management password.
-        super::paths::validate_chain(&std::env::current_exe()?, &[0], false)?;
-        super::client::Client::connect(config, true)?.capabilities()?;
-        super::server::harden_process()?;
+        let executable =
+            std::env::current_exe().map_err(|error| stage_error("executable lookup", error))?;
+        super::paths::validate_chain(&executable, &[0], false)
+            .map_err(|error| stage_error("installation validation", error))?;
+        super::client::Client::connect(config, true)
+            .map_err(|error| stage_error("service connection", error))?
+            .capabilities()
+            .map_err(|error| stage_error("service capabilities", error))?;
+        super::server::harden_process().map_err(|error| stage_error("process hardening", error))?;
         let details = format!("Local preview — protected support is not declared.\nInstance: {}\nService UID: {}\nVault: {vault}\nDID: {did}\nKey: {kid}\n\nUnlock only; no grant is issued. Expires after 120 seconds.", settings.instance_id, settings.service_uid);
         if details.len() > 4096
             || [vault, did, kid]
@@ -41,6 +48,11 @@ pub fn unlock_secret(
             "native management UI is available only on macOS".into(),
         ))
     }
+}
+
+#[cfg(target_os = "macos")]
+fn stage_error(stage: &str, error: impl std::fmt::Display) -> KeydError {
+    KeydError::Misuse(format!("native UI {stage} failed: {error}"))
 }
 
 #[cfg(target_os = "macos")]
@@ -64,7 +76,7 @@ mod native {
         }
     }
     fn failed() -> KeydError {
-        KeydError::Misuse("native unlock cancelled, unavailable or invalid".into())
+        KeydError::Misuse("native UI unavailable or invalid response".into())
     }
     fn string(value: &str) -> Result<Owned> {
         // CF copies the valid UTF-8 bytes; this contains public labels only.
@@ -81,6 +93,24 @@ mod native {
             .cast(),
         )
     }
+    fn validate_response(status: i32, flags: CFOptionFlags) -> Result<()> {
+        if status != 0 {
+            return Err(stage_error("notification response", status));
+        }
+        let response = flags & 3;
+        if response == kCFUserNotificationAlternateResponse {
+            Ok(())
+        } else if response == kCFUserNotificationDefaultResponse
+            || response == kCFUserNotificationCancelResponse
+        {
+            Err(KeydError::Misuse(
+                "native unlock cancelled or timed out".into(),
+            ))
+        } else {
+            Err(stage_error("unexpected notification response", response))
+        }
+    }
+
     pub(super) fn prompt(details: &str) -> Result<Zeroizing<String>> {
         let labels = [
             string("anp-keyd — Unlock exact key")?,
@@ -127,7 +157,7 @@ mod native {
                 .cast(),
             )?;
             if error != 0 {
-                return Err(failed());
+                return Err(stage_error("notification creation", error));
             }
             let mut flags = 0;
             let status = CFUserNotificationReceiveResponse(
@@ -135,9 +165,9 @@ mod native {
                 120.0,
                 &mut flags,
             );
-            if status != 0 || flags & 3 != kCFUserNotificationAlternateResponse {
+            if let Err(error) = validate_response(status, flags) {
                 CFUserNotificationCancel(notification.0 as CFUserNotificationRef);
-                return Err(failed());
+                return Err(error);
             }
             let value = CFUserNotificationGetResponseValue(
                 notification.0 as CFUserNotificationRef,
@@ -173,6 +203,31 @@ mod native {
             // owns only this zeroizing copy, never argv/env/stdout or a script pipe.
             let text = std::str::from_utf8(&bytes[..used as usize]).map_err(|_| failed())?;
             Ok(Zeroizing::new(text.to_owned()))
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn only_explicit_unlock_releases_input_and_errors_are_not_cancellations() {
+            assert!(validate_response(0, kCFUserNotificationAlternateResponse).is_ok());
+            for flag in [
+                kCFUserNotificationDefaultResponse,
+                kCFUserNotificationCancelResponse,
+            ] {
+                assert!(validate_response(0, flag)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("native unlock cancelled"));
+            }
+            for (status, flag) in [
+                (22, kCFUserNotificationAlternateResponse),
+                (0, kCFUserNotificationOtherResponse),
+            ] {
+                let error = validate_response(status, flag).unwrap_err().to_string();
+                assert!(!error.contains("native unlock cancelled"));
+                assert!(error.contains("notification response"));
+            }
         }
     }
 }

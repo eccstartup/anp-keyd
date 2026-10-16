@@ -975,7 +975,11 @@ pub fn run(cli: Cli) -> Result<()> {
                 ));
             }
             use crate::security::client::Client as AdminClient;
-            let client = AdminClient::connect(&args.config, true)?;
+            let native_unlock = matches!(&args.operation, AdminCommand::Unlock { native_ui: true, .. });
+            let client = AdminClient::connect(&args.config, true).map_err(|error| {
+                if native_unlock { KeydError::Misuse(format!("native UI initial connection failed: {error}")) }
+                else { error }
+            })?;
             let reply = match args.operation {
                 AdminCommand::ListPrincipals => client.principals()?,
                 AdminCommand::Catalog => client.catalog()?,
@@ -1010,14 +1014,26 @@ pub fn run(cli: Cli) -> Result<()> {
                 AdminCommand::LockAll => client.lock_all()?,
                 AdminCommand::Unlock { vault_id, did, kid, native_ui } => {
                     // Preflight before prompting; reconnect and authenticate again before sending.
-                    client.capabilities()?;
+                    if native_ui {
+                        client.capabilities().map_err(|error| KeydError::Misuse(
+                            format!("native UI initial capabilities failed: {error}")))?;
+                    } else {
+                        client.capabilities()?;
+                    }
                     let secret = if native_ui {
                         crate::security::management_ui::unlock_secret(&args.config, &vault_id, &did, &kid)?
                     } else {
                         let terminal = tty::open()?;
                         tty::read_secret(&terminal, "Passphrase: ")?
                     };
-                    AdminClient::connect(&args.config, true)?.unlock(vault_id, did, kid, secret)?
+                    let authenticated = AdminClient::connect(&args.config, true).map_err(|error| {
+                        if native_ui { KeydError::Misuse(format!("native UI post-prompt connection failed: {error}")) }
+                        else { error }
+                    })?;
+                    authenticated.unlock(vault_id, did, kid, secret).map_err(|error| {
+                        if native_ui { KeydError::Misuse(format!("native UI unlock request failed: {error}")) }
+                        else { error }
+                    })?
                 }
             };
             println!("{}", serde_json::to_string(&reply)?);

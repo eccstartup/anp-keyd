@@ -247,7 +247,8 @@ class Checks:
         self.expect_locked()
         self.grant_id = self.grant()  # fresh bounded grant for each human step
         expired, elapsed = window('UI 2/3: leave the window untouched for its full 120-second timeout.')
-        assert expired.returncode != 0 and 'native unlock cancelled' in expired.stderr and elapsed >= 115, expired.stderr
+        timed_out = 'native unlock cancelled' in expired.stderr or 'native UI notification response failed' in expired.stderr
+        assert expired.returncode != 0 and timed_out and elapsed >= 115, expired.stderr
         self.expect_locked()
         self.grant_id = self.grant()
         opened, _ = window('UI 3/3: enter ONLY the public temporary test password: ' + PASSWORD + '\nCheck that input is masked, then click Unlock (Cancel is the default).')

@@ -259,3 +259,27 @@ SIGKILL, and forged-socket rejection before any request/secret. Kernel service
 groups were `[600,602,603]`, confirming the primary-first credential correction.
 The installed launchd instance was not modified. Native window interaction,
 whole-machine reboot and formal protected release remain unaccepted.
+
+
+For native-window diagnostics, the driver can use a SHA-256-pinned candidate
+without updating the installed daemon or executable:
+
+```sh
+cargo build --locked --release --features mcp
+shasum -a 256 target/release/anp-keyd
+sudo /usr/bin/python3 deploy/macos/test-runtime.py \
+  --candidate-binary "$PWD/target/release/anp-keyd" --candidate-sha256 VERIFIED_APP_SHA256 \
+  --signing-helper "$PWD/target/release/examples/local-preview-fixture" \
+  --helper-sha256 VERIFIED_HELPER_SHA256 --interactive-ui
+```
+
+The candidate is copied into a root-owned mode-0755 `bin/` in the new temporary
+instance; the installed launchd job continues using its existing executable.
+Candidate permissions are set explicitly even under umask 0077. Native UI errors
+identify initial connection/capabilities, config, executable lookup, installation
+validation, service preflight, process hardening, notification creation/response,
+and post-prompt connection/unlock stages. Actual framework errors and unexpected
+button responses cannot masquerade as human cancellation. Only explicit Unlock
+releases input. The human separately confirmed one installed-binary window was
+visible and manually cancelled; the full temporary-key UI EINVAL remains pending
+until rerun, and this independent cancel check is not full UI acceptance.

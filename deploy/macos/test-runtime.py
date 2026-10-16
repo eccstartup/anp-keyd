@@ -4,6 +4,7 @@ Requires the explicitly provisioned accounts and root. Never touches the running
 installation's state, keys, configuration or launchd job. No new accounts created.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -36,6 +37,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=Path('/Library/ANPKeyd/service.json'))
     parser.add_argument('--binary', type=Path, default=Path('/Library/ANPKeyd/bin/anp-keyd'))
+    parser.add_argument('--candidate-binary', type=Path, help='test a digest-pinned candidate in the temporary instance, without updating the installation')
+    parser.add_argument('--candidate-sha256')
     parser.add_argument('--signing-helper', type=Path, help='digest-pinned local-preview-fixture example; enables full temporary signing checks')
     parser.add_argument('--helper-sha256')
     parser.add_argument('--interactive-ui', action='store_true', help='human window checks: cancel, 120-second timeout, masked temporary-password unlock')
@@ -43,6 +46,10 @@ def main():
     args = parser.parse_args()
     args.config = args.config.absolute()
     args.binary = args.binary.absolute()
+    if args.candidate_binary:
+        args.candidate_binary = args.candidate_binary.absolute()
+    elif args.candidate_sha256:
+        raise ValueError('--candidate-sha256 requires --candidate-binary')
     if args.signing_helper:
         args.signing_helper = args.signing_helper.absolute()
     elif args.interactive_ui or args.helper_sha256:
@@ -77,6 +84,19 @@ def main():
     with tempfile.TemporaryDirectory(prefix='ANPKeydChecks-', dir=parent) as directory:
         base = Path(directory)
         base.chmod(0o755)
+        if args.candidate_binary:
+            with args.candidate_binary.open('rb') as source:
+                content = source.read(128 * 1024 * 1024 + 1)
+            if len(content) > 128 * 1024 * 1024 or hashlib.sha256(content).hexdigest() != args.candidate_sha256:
+                raise ValueError('candidate binary digest mismatch')
+            (base / 'bin').mkdir(mode=0o755)
+            (base / 'bin').chmod(0o755)
+            candidate = base / 'bin/anp-keyd'
+            with candidate.open('xb') as target:
+                target.write(content)
+            candidate.chmod(0o755)
+            args.binary = candidate
+            print('CHECK testing root-owned candidate; installed binary remains unchanged', flush=True)
         config = {**installed, 'instance_id': str(uuid.uuid4()), 'vault_ids': [],
                   'state_dir': str(base / 'state'), 'sign_socket': str(base / 'sign/sign.sock'),
                   'admin_socket': str(base / 'admin/admin.sock')}
@@ -98,14 +118,13 @@ def main():
             return run(user, args.binary, 'admin', '--config', path, *command)
         # Check the effective child credentials and exact config/state access
         # before asking the Rust initializer to operate on this new test state.
-        probe = r'''import json,os,sys
+        probe = r'''import ctypes,json,os,sys
 config,state=sys.argv[1:]
 with open(config) as handle: json.load(handle)
 fd=os.open(state,os.O_RDONLY);os.close(fd)
 name=os.path.join(state,'.acceptance-access-probe')
 fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
 os.write(fd,b'temporary access probe');os.fsync(fd);os.close(fd);os.unlink(name)
-import ctypes
 lib=ctypes.CDLL(None,use_errno=True)
 count=lib.getgroups(0,None)
 if count<0: raise OSError(ctypes.get_errno(),'getgroups')
