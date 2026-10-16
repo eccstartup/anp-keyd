@@ -70,6 +70,8 @@ pub enum CatalogEffect {
     EnrollVault {
         vault_id: String,
         keys: Vec<KeyRecord>,
+        #[serde(default)]
+        legacy_audit: Option<Value>,
     },
     ConfirmRole {
         before: Box<KeyRecord>,
@@ -267,7 +269,14 @@ pub(super) fn resolve(
             if keys.is_empty() || keys.len() > 64 {
                 return Err(invalid());
             }
-            CatalogEffect::EnrollVault { vault_id, keys }
+            let legacy_audit = Some(
+                crate::audit::log::legacy_summary(&layout.audit_dir()).map_err(|_| invalid())?,
+            );
+            CatalogEffect::EnrollVault {
+                vault_id,
+                keys,
+                legacy_audit,
+            }
         }
         CatalogChange::ConfirmRole { key_id, role } => {
             let before = get_key(tx, &key_id)?;
@@ -372,7 +381,20 @@ pub(super) fn apply(
     effect: CatalogEffect,
 ) -> Result<()> {
     match effect {
-        CatalogEffect::EnrollVault { vault_id, keys } => {
+        CatalogEffect::EnrollVault {
+            vault_id,
+            keys,
+            legacy_audit,
+        } => {
+            let current = crate::audit::log::legacy_summary(&layout(root, &vault_id)?.audit_dir())
+                .map_err(|_| invalid())?;
+            if legacy_audit.as_ref() != Some(&current) {
+                return Err(invalid());
+            }
+            append(
+                tx,
+                &json!({"event":"LEGACY_AUDIT_LINKED","vault_id":vault_id,"history":current}),
+            )?;
             active_vault(tx, &vault_id)?;
             // Bind the complete inventory, including additions since PREPARE.
             let current = store::load_all(&layout(root, &vault_id)?)?;

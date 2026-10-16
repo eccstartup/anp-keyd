@@ -1,0 +1,81 @@
+//! Single coordinated signing operation, with injectable clock and backend.
+use super::http::CanonicalHttpRequest;
+use crate::error::{KeydError, Result};
+use crate::persistence::{
+    clock::Clock,
+    requests::{RequestStatus, Reservation},
+    Database,
+};
+use serde_json::json;
+
+/// Caller holds the coordinator through both transactions and the backend call.
+/// Backend errors may follow signing, so only KEY_LOCKED is a definite non-sign.
+pub(crate) fn execute(
+    db: &mut Database,
+    principal: &str,
+    grant_id: &str,
+    request_id: &str,
+    canonical: &CanonicalHttpRequest,
+    clock: &dyn Clock,
+    backend: impl FnOnce(
+        &crate::persistence::catalog::KeyRecord,
+        i64,
+        i64,
+    ) -> Result<crate::sign::rfc9421::Signed>,
+) -> Result<RequestStatus> {
+    let start = clock.now()?;
+    let (grant, key, deadline) =
+        match db.reserve_http(principal, grant_id, request_id, canonical, start)? {
+            Reservation::Existing(status) => return Ok(status),
+            Reservation::New {
+                grant,
+                key,
+                deadline,
+            } => (grant, key, deadline),
+        };
+    let before = clock.now()?;
+    if before.wall >= grant.expiry || before.monotonic_ms >= deadline {
+        db.fail_reserved(principal, request_id, false, before)?;
+        return Err(KeydError::Misuse("GRANT_EXPIRED".into()));
+    }
+    let signed = backend(&key, grant.expiry, deadline);
+    let after = clock.now()?;
+    let signed = match signed {
+        Ok(signed) => signed,
+        Err(error) => {
+            let known = matches!(error, KeydError::Locked);
+            db.fail_reserved(principal, request_id, !known, after)?;
+            return Err(KeydError::Misuse(
+                if known {
+                    "KEY_LOCKED"
+                } else {
+                    "OUTCOME_UNKNOWN"
+                }
+                .into(),
+            ));
+        }
+    };
+    let expiry = signed
+        .expires_at
+        .ok_or_else(|| KeydError::Protocol("missing profile expiry".into()))?;
+    let result = json!({"request_id":request_id,"url":canonical.signing_request().url,"headers":signed.headers,"covered":signed.covered,"expires_at":expiry});
+    let digest: String = signed
+        .signature_base_digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    db.complete_http(
+        principal,
+        request_id,
+        &result,
+        (
+            expiry,
+            deadline.min(before.monotonic_ms.saturating_add(300_000)),
+        ),
+        &digest,
+        after,
+    )?;
+    // A result-commit failure never releases the in-memory signature. The caller
+    // latches emergency stop; restart converts any unresolved reserve to unknown.
+    db.request_status(principal, request_id, clock.now()?)
+}

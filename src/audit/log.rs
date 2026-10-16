@@ -749,6 +749,62 @@ pub fn digest_hex(bytes: &[u8]) -> String {
     hex(&sha256(bytes))
 }
 
+/// Read-only evidence for importing a stopped legacy writer into SQLite audit.
+/// Does not create lock files, rotate history, update anchors or append events.
+pub(crate) fn legacy_summary(dir: &Path) -> Result<serde_json::Value> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let metadata = fs::symlink_metadata(dir)?;
+    if !metadata.is_dir() || metadata.mode() & 0o022 != 0 {
+        return Err(KeydError::Protocol("unsafe legacy audit directory".into()));
+    }
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"anp-keyd/legacy-files/v1\0");
+    let mut total = 0u64;
+    let mut paths = history_files(dir, "9999-99")?;
+    let anchor = dir.join(".anchor");
+    if fs::symlink_metadata(&anchor).is_ok() {
+        paths.push(anchor);
+    }
+    for path in paths {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(&path)?;
+        let m = file.metadata()?;
+        total = total.saturating_add(m.len());
+        if !m.is_file()
+            || m.nlink() != 1
+            || m.uid() != metadata.uid()
+            || m.mode() & 0o022 != 0
+            || total > 64 * 1024 * 1024
+        {
+            return Err(KeydError::Protocol(
+                "unsafe or oversized legacy audit".into(),
+            ));
+        }
+        let name = path.file_name().unwrap().as_encoded_bytes();
+        hash.update((name.len() as u64).to_be_bytes());
+        hash.update(name);
+        hash.update(m.len().to_be_bytes());
+        let mut reader = file;
+        let mut buffer = [0; 8192];
+        loop {
+            let n = reader.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&buffer[..n]);
+        }
+    }
+    let (records, tail) = verify_history(dir, "9999-99")?;
+    check_anchor(dir, records, &tail)?;
+    Ok(
+        serde_json::json!({"records":records,"tail":hex(&tail),"files_digest":hex(&hash.finalize()),"scope":"local_history_not_rollback_proof"}),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

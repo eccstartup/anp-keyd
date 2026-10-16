@@ -212,7 +212,8 @@ mod tests {
         // 磁盘上的 JSON 里不能出现 seed 的十六进制、base64 或十进制形式。
         assert!(!json.contains("abababab"), "hex seed leaked: {json}");
         assert!(!json.contains(&record::encode_b64(&[0xAB; 32])));
-        assert!(!json.contains("171"));
+        let decimal_seed = serde_json::to_string(&[0xABu8; 32].as_slice()).unwrap();
+        assert!(!json.contains(&decimal_seed), "decimal seed leaked");
     }
 
     #[test]

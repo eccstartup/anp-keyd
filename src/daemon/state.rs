@@ -491,6 +491,24 @@ impl DaemonState {
         })
     }
 
+    /// Exact-key v2 profile. Called only by the protected transaction executor.
+    pub(crate) fn sign_protected(
+        &self,
+        uid: u32,
+        key_record: &crate::persistence::catalog::KeyRecord,
+        request: &crate::security::http::CanonicalHttpRequest,
+        expiry: i64,
+        deadline: i64,
+    ) -> Result<rfc9421::Signed> {
+        let document = store::read_did_document(&self.layout_for(uid)?, &key_record.did)?;
+        self.with_vault(uid, |vault| {
+            vault.with_key(&key_record.kid, self.autolock, Instant::now(), |key| {
+                use crate::persistence::clock::Clock;
+                request.sign_profile(&document, key, crate::persistence::clock::SystemClock.now()?, expiry, deadline)
+            })
+        })
+    }
+
     /// 借出钥匙做一次原始签名(`--allow-raw-signing` 那条路)。
     ///
     /// 开关的检查**在这里**,不在 handlers —— 让"能不能走这条路"和

@@ -234,10 +234,10 @@ pub fn backend_for(root: &HardwareRoot) -> Result<&'static dyn HardwareBackend> 
             }
             #[cfg(not(feature = "hardware-software"))]
             {
-                Err(KeydError::HardwareMissing(format!(
+                Err(KeydError::HardwareMissing(
                     "this envelope is bound to the software stand-in root, which only exists in \
-                     builds made with `--features hardware-software`"
-                )))
+                     builds made with `--features hardware-software`".into()
+                ))
             }
         }
     }

@@ -133,7 +133,7 @@ print(exact(struct.unpack('!I',exact(4))[0]).decode())'''
         return json.loads(result.stdout)
     a, b = as_agent('boundary-agent-a'), as_agent('boundary-agent-b')
     check(a['code'] == b['code'] == 'OK' and a['principal_id'] != b['principal_id'], 'same client maps A/B to distinct kernel principals')
-    check(not a['signing_available'] and not a['protected_supported'], 'preview never reports protected signing support')
+    check(a['signing_available'] and not a['protected_supported'], 'transaction executor available while protected release remains pending')
     check(command('boundary-admin', 'admin', 'status').returncode == 0, 'independent administrator authenticated')
     check(command('boundary-admin', 'probe', '--security').returncode != 0, 'probe refuses protected release claim')
     check(command('boundary-agent-a', 'admin', 'status').returncode != 0, 'Agent cannot invoke admin CLI')
@@ -242,10 +242,20 @@ assert s.recv(1)==b''
     check(data_as('boundary-agent-a',{'operation':'GET_DOCUMENT','key_id':hot_key['key_id']})['data']['document']['id']==fixture['did'], 'authorized public document returned')
     http={'method':'GET','url':'https://EXAMPLE.com:443/test','headers':{},'body':{'state':'absent'},'nonce':None}
     signing={'operation':'SIGN_HTTP','grant_id':grant_id,'request_id':str(uuid.uuid4()),'http':http}
-    check(data_as('boundary-agent-a',signing)['code']=='SIGNING_UNAVAILABLE', 'valid M3 request stops before unavailable M4 signing executor')
+    def unlock_hot():
+        op={'version':2,'request':{'operation':'UNLOCK_KEY','vault_id':vault_id,'did':fixture['did'],'kid':hot_key['kid']}}
+        result=subprocess.run([sys.executable,'-c',admin_call,config['admin_socket'],json.dumps(op)],preexec_fn=identity('boundary-admin'),capture_output=True,text=True,timeout=12)
+        assert result.returncode==0 and json.loads(result.stdout)['code']=='OK', result.stdout+result.stderr
+    unlock_hot()
+    first=data_as('boundary-agent-a',signing)
+    check(first['code']=='OK' and first['data']['state']=='completed' and first['data']['result']['url']=='https://example.com/test', 'M4 signs canonical target after durable reservation and result commit')
+    check(data_as('boundary-agent-a',signing)['data']==first['data'], 'same ID returns identical cached signature without a second use')
+    check(data_as('boundary-agent-a',{'operation':'GET_REQUEST_STATUS','request_id':signing['request_id']})['data']==first['data'], 'lost response can be recovered by request status')
+    check(data_as('boundary-agent-b',{'operation':'GET_REQUEST_STATUS','request_id':signing['request_id']})['code']=='REQUEST_NOT_FOUND', 'request results remain scoped to principal')
+    check(data_as('boundary-agent-a',{**signing,'http':{**http,'nonce':'different'}})['code']=='REQUEST_ID_CONFLICT', 'request ID cannot be rebound to another payload')
     check(data_as('boundary-agent-b',signing)['code']=='GRANT_INVALID', 'cross-principal signing refused')
     for target in ['https://evil.com/test','https://example.com/other','https://example.com/%74est','https://example.com/a/../test','https://example.com//test','https://example.com/test?a=1&a=2']:
-        denied={**signing,'http':{**http,'url':target}}
+        denied={**signing,'request_id':str(uuid.uuid4()),'http':{**http,'url':target}}
         check(data_as('boundary-agent-a',denied)['code']=='POLICY_DENIED', 'policy and canonical target reject '+target)
     check(data_as('boundary-agent-a',{**signing,'did':fixture['did']})['code']=='PROTOCOL_INVALID', 'data caller cannot override exact grant key')
     for operation in ['SIGN_RAW','SIGN_CHALLENGE','LOCK_ALL']:
@@ -253,12 +263,12 @@ assert s.recv(1)==b''
     root_grant={**create_grant,'key_id':root_key['key_id']}
     source.write_text(json.dumps({'kind':'Grant','change':root_grant}));source.chmod(0o644)
     check(command('boundary-admin','admin','prepare','--file',str(source)).returncode!=0, 'root role cannot enter an Agent grant')
-    check(data_as('boundary-agent-a',{'operation':'GET_GRANT_STATUS','grant_id':grant_id})['data']['used_uses']==0,'M3 validation does not consume quota or sign')
+    check(data_as('boundary-agent-a',{'operation':'GET_GRANT_STATUS','grant_id':grant_id})['data']['used_uses']==1,'retries and policy denials do not consume extra quota')
     # Revoke A while a separate grant to B remains usable.
     second=commit_change({'kind':'Grant','change':{**create_grant,'principal_id':principal_b}})['effect']['effect']['grant']['grant_id']
     commit_change({'kind':'Grant','change':{'action':'Revoke','grant_id':grant_id}})
-    check(data_as('boundary-agent-a',signing)['code']=='GRANT_INVALID','revoked grant refused')
-    check(data_as('boundary-agent-b',{**signing,'grant_id':second})['code']=='SIGNING_UNAVAILABLE','revoking A leaves B authorization valid')
+    check('result' not in data_as('boundary-agent-a',signing)['data'],'revocation suppresses cached signature delivery')
+    check(data_as('boundary-agent-b',{**signing,'grant_id':second})['data']['state']=='completed','revoking A leaves B signing usable without unlocking again')
     source.write_text(json.dumps({'operation':'LIST_AUTHORIZED_KEYS'}));source.chmod(0o644)
     check(command('boundary-agent-b','data','--file',str(source)).returncode==0,'v2 CLI authenticates fixed configured endpoint')
     check(command('boundary-agent-b','data','--socket','/tmp/evil','--file',str(source)).returncode!=0,'v2 CLI has no socket override')
@@ -278,9 +288,35 @@ assert s.recv(1)==b''
             result=json.loads(listed['result']['content'][0]['text'])
             check(result['data']['keys'][0]['key_id']==hot_key['key_id'],'protected MCP lists only caller-authorized hot key')
             signed=rpc({'jsonrpc':'2.0','id':4,'method':'tools/call','params':{'name':'sign_request','arguments':{'grant_id':second,'request_id':str(uuid.uuid4()),'http':http}}})
-            check('SIGNING_UNAVAILABLE' in json.dumps(signed),'protected MCP forwards structured request without legacy fallback')
+            check('Signature-Input' in json.dumps(signed),'protected MCP completes durable v2 signature without legacy fallback')
         finally:
             child.terminate();child.wait(timeout=10)
+    # Last remaining use: many distinct requests contend for one durable slot.
+    from concurrent.futures import ThreadPoolExecutor
+    one=commit_change({'kind':'Grant','change':{**create_grant,'max_uses':1}})['effect']['effect']['grant']['grant_id']
+    calls=[{**signing,'grant_id':one,'request_id':str(uuid.uuid4())} for _ in range(8)]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        outcomes=list(pool.map(lambda op:data_as('boundary-agent-a',op),calls))
+    check(sum(r['code']=='OK' and r['data'].get('result') is not None for r in outcomes)==1, 'eight concurrent final-use requests yield exactly one signature')
+    winner=next(op for op,r in zip(calls,outcomes) if r['code']=='OK')
+    cached=data_as('boundary-agent-a',winner)
+    check(cached['data']['result'] is not None,'last completed signature remains retrievable after exhaustion')
+    # A response lost on the socket still leaves a single completed result.
+    lost=commit_change({'kind':'Grant','change':{**create_grant,'max_uses':1}})['effect']['effect']['grant']['grant_id']
+    lostop={**signing,'grant_id':lost,'request_id':str(uuid.uuid4())}
+    drop_script="import socket,struct,sys;s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);p=sys.argv[2].encode();s.sendall(struct.pack('!I',len(p))+p);s.close()"
+    subprocess.run([sys.executable,'-c',drop_script,config['sign_socket'],json.dumps({'version':2,'request':lostop})],preexec_fn=identity('boundary-agent-a'),check=True)
+    for _ in range(50):
+        recovered=data_as('boundary-agent-a',{'operation':'GET_REQUEST_STATUS','request_id':lostop['request_id']})
+        if recovered['code']=='OK':break
+        time.sleep(.02)
+    check(recovered['data']['state']=='completed' and recovered['data'].get('result') is not None,'disconnect after send preserves completed result for explicit recovery')
+    stop(process); process=start()
+    check(data_as('boundary-agent-a',{'operation':'GET_GRANT_STATUS','grant_id':lost})['data']['state'] in ['revoked_restart','exhausted'],'restart never revives consumed grants')
+    check('result' not in data_as('boundary-agent-a',{'operation':'GET_REQUEST_STATUS','request_id':lostop['request_id']})['data'],'restart suppresses old completed signature')
+    check(data_as('boundary-agent-a',{**signing,'grant_id':lost,'request_id':str(uuid.uuid4())})['code'] in ['GRANT_INVALID','GRANT_EXHAUSTED'],'restart refuses old grant for new signing')
+    with sqlite3.connect(Path(config['state_dir'])/'state.sqlite') as database:
+        check(database.execute("SELECT count(*) FROM audit_events WHERE CAST(event_data AS TEXT) LIKE '%LEGACY_AUDIT_LINKED%'").fetchone()[0]>=1,'SQLite history links verified legacy audit without rewriting it')
     policy['unexpected'] = True
     source.write_text(json.dumps({'kind':'Catalog','change':{'action':'PublishPolicy','policy_id':policy_id,'version':2,'content':policy}}))
     check(command('boundary-admin','admin','prepare','--file',str(source)).returncode != 0, 'policy schema rejects unknown fields')

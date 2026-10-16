@@ -1332,3 +1332,414 @@ fn every_nonhot_role_is_forbidden_for_grants_and_data() {
             .is_err());
     }
 }
+
+#[test]
+fn transaction_reservations_are_idempotent_and_never_refund() {
+    use requests::Reservation;
+    let (mut f, key, policy) = grant_fixture();
+    let g = new_grant(&mut f, &key, &policy);
+    let id = uuid();
+    assert!(matches!(
+        f.db.reserve_http(&g.principal_id, &g.grant_id, &id, &canonical(), now())
+            .unwrap(),
+        Reservation::New { .. }
+    ));
+    assert!(matches!(
+        f.db.reserve_http(&g.principal_id, &g.grant_id, &id, &canonical(), now())
+            .unwrap(),
+        Reservation::Existing(_)
+    ));
+    f.db.complete_http(
+        &g.principal_id,
+        &id,
+        &json!({"headers":{"Signature":"temporary"}}),
+        (1040, 45000),
+        "digest",
+        now(),
+    )
+    .unwrap();
+    let original =
+        f.db.request_status(&g.principal_id, &id, now())
+            .unwrap()
+            .result
+            .unwrap();
+    f.db.fail_reserved(&g.principal_id, &id, false, now())
+        .unwrap_err();
+    let second = uuid();
+    f.db.reserve_http(&g.principal_id, &g.grant_id, &second, &canonical(), now())
+        .unwrap();
+    f.db.fail_reserved(&g.principal_id, &second, false, now())
+        .unwrap();
+    assert!(f
+        .db
+        .reserve_http(&g.principal_id, &g.grant_id, &uuid(), &canonical(), now())
+        .is_err());
+    let cached = f.db.request_status(&g.principal_id, &id, now()).unwrap();
+    assert_eq!(cached.result.unwrap(), original);
+    assert_eq!(
+        f.db.grant_status(&g.principal_id, &g.grant_id, now())
+            .unwrap()
+            .used_uses,
+        2
+    );
+    let other = new_grant(&mut f, &key, &policy);
+    assert!(
+        matches!(f.db.reserve_http(&g.principal_id,&other.grant_id,&id,&canonical(),now()),Err(KeydError::Misuse(c)) if c=="REQUEST_ID_CONFLICT")
+    );
+    let expired = Time {
+        wall: 900,
+        monotonic_ms: 45000,
+    };
+    assert!(f
+        .db
+        .request_status(&g.principal_id, &id, expired)
+        .unwrap()
+        .result
+        .is_none());
+    assert!(f
+        .db
+        .request_status(&g.principal_id, &id, now())
+        .unwrap()
+        .result
+        .is_none());
+    verify_audit(&f.db.connection).unwrap();
+}
+#[test]
+fn reservation_and_result_audit_failures_are_atomic() {
+    let (mut f, key, policy) = grant_fixture();
+    let g = new_grant(&mut f, &key, &policy);
+    let id = uuid();
+    f.db.connection.execute_batch("CREATE TRIGGER fail_event BEFORE INSERT ON audit_events BEGIN SELECT RAISE(ABORT,'fail'); END;").unwrap();
+    assert!(f
+        .db
+        .reserve_http(&g.principal_id, &g.grant_id, &id, &canonical(), now())
+        .is_err());
+    assert_eq!(
+        grants::get(&f.db.connection, &g.grant_id)
+            .unwrap()
+            .unwrap()
+            .used_uses,
+        0
+    );
+    f.db.connection
+        .execute_batch("DROP TRIGGER fail_event")
+        .unwrap();
+    f.db.reserve_http(&g.principal_id, &g.grant_id, &id, &canonical(), now())
+        .unwrap();
+    f.db.connection.execute_batch("CREATE TRIGGER fail_event BEFORE INSERT ON audit_events BEGIN SELECT RAISE(ABORT,'fail'); END;").unwrap();
+    assert!(f
+        .db
+        .complete_http(
+            &g.principal_id,
+            &id,
+            &json!({"signature":"undelivered"}),
+            (1040, 45000),
+            "digest",
+            now()
+        )
+        .is_err());
+    f.db.connection
+        .execute_batch("DROP TRIGGER fail_event")
+        .unwrap();
+    let status = f.db.request_status(&g.principal_id, &id, now()).unwrap();
+    assert_eq!(status.state, "reserved");
+    assert!(status.result.is_none());
+    f.db.recovery(&f.config, now()).unwrap();
+    let status = f.db.request_status(&g.principal_id, &id, now()).unwrap();
+    assert_eq!(status.state, "outcome_unknown");
+    assert!(status.result.is_none());
+    assert_eq!(
+        grants::get(&f.db.connection, &g.grant_id)
+            .unwrap()
+            .unwrap()
+            .used_uses,
+        1
+    );
+}
+#[test]
+fn revocation_and_restart_suppress_completed_results() {
+    for restart in [false, true] {
+        let (mut f, key, policy) = grant_fixture();
+        let g = new_grant(&mut f, &key, &policy);
+        let id = uuid();
+        f.db.reserve_http(&g.principal_id, &g.grant_id, &id, &canonical(), now())
+            .unwrap();
+        f.db.complete_http(
+            &g.principal_id,
+            &id,
+            &json!({"signature":"cached"}),
+            (1040, 45000),
+            "digest",
+            now(),
+        )
+        .unwrap();
+        if restart {
+            f.db.recovery(&f.config, now()).unwrap();
+        } else {
+            let p =
+                f.db.prepare(
+                    1002,
+                    Change::Grant {
+                        change: grants::GrantChange::Revoke {
+                            grant_id: g.grant_id.clone(),
+                        },
+                    },
+                    now(),
+                )
+                .unwrap();
+            f.db.commit(1002, &p.operation_id, &p.digest, now())
+                .unwrap();
+        }
+        assert!(f
+            .db
+            .request_status(&g.principal_id, &id, now())
+            .unwrap()
+            .result
+            .is_none());
+        assert!(f.db.request_status(&uuid(), &id, now()).is_err());
+        verify_audit(&f.db.connection).unwrap();
+    }
+}
+
+struct FixedClock;
+impl clock::Clock for FixedClock {
+    fn now(&self) -> Result<Time> {
+        Ok(now())
+    }
+}
+fn fake_signed() -> crate::sign::rfc9421::Signed {
+    crate::sign::rfc9421::Signed {
+        expires_at: Some(1040),
+        headers: std::collections::BTreeMap::from([("Signature".into(), "test-result".into())]),
+        covered: vec!["@method".into()],
+        signature_base_digest: [7; 32],
+    }
+}
+#[test]
+fn executor_calls_backend_once_and_never_on_reservation_failure() {
+    use crate::security::executor::execute;
+    use std::cell::Cell;
+    let (mut f, key, policy) = grant_fixture();
+    let g = new_grant(&mut f, &key, &policy);
+    let id = uuid();
+    let calls = Cell::new(0);
+    f.db.connection.execute_batch("CREATE TRIGGER no_reserve BEFORE INSERT ON audit_events WHEN CAST(NEW.event_data AS TEXT) LIKE '%SIGN_RESERVED%' BEGIN SELECT RAISE(ABORT,'reserve failure'); END;").unwrap();
+    assert!(execute(
+        &mut f.db,
+        &g.principal_id,
+        &g.grant_id,
+        &id,
+        &canonical(),
+        &FixedClock,
+        |_, _, _| {
+            calls.set(calls.get() + 1);
+            Ok(fake_signed())
+        }
+    )
+    .is_err());
+    assert_eq!(calls.get(), 0);
+    f.db.connection
+        .execute_batch("DROP TRIGGER no_reserve")
+        .unwrap();
+    let first = execute(
+        &mut f.db,
+        &g.principal_id,
+        &g.grant_id,
+        &id,
+        &canonical(),
+        &FixedClock,
+        |_, _, _| {
+            calls.set(calls.get() + 1);
+            Ok(fake_signed())
+        },
+    )
+    .unwrap();
+    let cached = execute(
+        &mut f.db,
+        &g.principal_id,
+        &g.grant_id,
+        &id,
+        &canonical(),
+        &FixedClock,
+        |_, _, _| panic!("retry signed twice"),
+    )
+    .unwrap();
+    assert_eq!(first.result, cached.result);
+    assert_eq!(calls.get(), 1);
+    f.db.connection.execute_batch("CREATE TRIGGER no_complete BEFORE INSERT ON audit_events WHEN CAST(NEW.event_data AS TEXT) LIKE '%SIGN_COMPLETED%' BEGIN SELECT RAISE(ABORT,'complete failure'); END;").unwrap();
+    let id = uuid();
+    assert!(execute(
+        &mut f.db,
+        &g.principal_id,
+        &g.grant_id,
+        &id,
+        &canonical(),
+        &FixedClock,
+        |_, _, _| Ok(fake_signed())
+    )
+    .is_err());
+    f.db.connection
+        .execute_batch("DROP TRIGGER no_complete")
+        .unwrap();
+    assert!(execute(
+        &mut f.db,
+        &g.principal_id,
+        &g.grant_id,
+        &id,
+        &canonical(),
+        &FixedClock,
+        |_, _, _| panic!("uncertain result retried")
+    )
+    .unwrap()
+    .result
+    .is_none());
+    f.db.recovery(&f.config, now()).unwrap();
+    assert_eq!(
+        f.db.request_status(&g.principal_id, &id, now())
+            .unwrap()
+            .state,
+        "outcome_unknown"
+    );
+}
+#[test]
+fn executor_expiry_backend_failure_and_crash_keep_consumed_quota() {
+    use crate::security::executor::execute;
+    use std::cell::Cell;
+    struct AdvancingClock(Cell<u8>);
+    impl clock::Clock for AdvancingClock {
+        fn now(&self) -> Result<Time> {
+            let n = self.0.get();
+            self.0.set(n + 1);
+            Ok(if n == 0 {
+                now()
+            } else {
+                Time {
+                    wall: 1060,
+                    monotonic_ms: 61000,
+                }
+            })
+        }
+    }
+    let (mut f, key, policy) = grant_fixture();
+    let g = new_grant(&mut f, &key, &policy);
+    let id = uuid();
+    assert!(execute(
+        &mut f.db,
+        &g.principal_id,
+        &g.grant_id,
+        &id,
+        &canonical(),
+        &AdvancingClock(Cell::new(0)),
+        |_, _, _| panic!("expired after reserve")
+    )
+    .is_err());
+    assert_eq!(
+        f.db.request_status(&g.principal_id, &id, now())
+            .unwrap()
+            .state,
+        "failed_reserved"
+    );
+    let id = uuid();
+    assert!(execute(
+        &mut f.db,
+        &g.principal_id,
+        &g.grant_id,
+        &id,
+        &canonical(),
+        &FixedClock,
+        |_, _, _| Err(KeydError::Upstream("after signing".into()))
+    )
+    .is_err());
+    assert_eq!(
+        f.db.request_status(&g.principal_id, &id, now())
+            .unwrap()
+            .state,
+        "outcome_unknown"
+    );
+    assert_eq!(
+        f.db.grant_status(&g.principal_id, &g.grant_id, now())
+            .unwrap()
+            .used_uses,
+        2
+    );
+    let g = new_grant(&mut f, &key, &policy);
+    let id = uuid();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        execute(
+            &mut f.db,
+            &g.principal_id,
+            &g.grant_id,
+            &id,
+            &canonical(),
+            &FixedClock,
+            |_, _, _| panic!("simulated crash after reserve"),
+        )
+    }));
+    assert!(outcome.is_err());
+    f.db.recovery(&f.config, now()).unwrap();
+    assert_eq!(
+        f.db.request_status(&g.principal_id, &id, now())
+            .unwrap()
+            .state,
+        "outcome_unknown"
+    );
+}
+#[test]
+fn audit_projection_is_repeatable_read_only_and_failure_preserves_old_export() {
+    let f = Fixture::new();
+    let before =
+        f.db.connection
+            .query_row("SELECT count(*) FROM audit_events", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
+    assert_eq!(projection::export(&f.dir).unwrap(), before);
+    let path = f.dir.join("audit-export/events.jsonl");
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(projection::export(&f.dir).unwrap(), before);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    let events: Vec<Value> = std::str::from_utf8(&bytes)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(events.len(), before as usize);
+    assert_eq!(events[0]["seq"], 1);
+    f.db.connection
+        .execute(
+            "UPDATE audit_events SET event_digest='invalid' WHERE seq=1",
+            [],
+        )
+        .unwrap();
+    assert!(projection::export(&f.dir).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+#[test]
+fn sqlite_full_cannot_reserve_without_durable_audit() {
+    let (mut f, key, policy) = grant_fixture();
+    let g = new_grant(&mut f, &key, &policy);
+    let id = uuid();
+    let pages: i64 =
+        f.db.connection
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .unwrap();
+    f.db.connection.execute_batch(&format!("PRAGMA max_page_count={pages}; CREATE TRIGGER disk_full BEFORE INSERT ON requests BEGIN INSERT INTO audit_events VALUES(999999,'full','full',zeroblob(2097152)); END;")).unwrap();
+    assert!(f
+        .db
+        .reserve_http(&g.principal_id, &g.grant_id, &id, &canonical(), now())
+        .is_err());
+    assert_eq!(
+        grants::get(&f.db.connection, &g.grant_id)
+            .unwrap()
+            .unwrap()
+            .used_uses,
+        0
+    );
+    assert_eq!(
+        f.db.connection
+            .query_row("SELECT count(*) FROM requests", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    verify_audit(&f.db.connection).unwrap();
+}

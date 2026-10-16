@@ -60,6 +60,11 @@ pub fn argon2id(
     t_cost: u32,
     p_cost: u32,
 ) -> Result<[u8; 32]> {
+    // Envelope parameters are untrusted until AEAD verification, after the KDF.
+    // Bound memory, iterations and lanes before allocating or deriving anything.
+    if !(8..=262144).contains(&m_cost) || !(1..=10).contains(&t_cost) || !(1..=4).contains(&p_cost) {
+        return Err(KeydError::Crypto("argon2 cost exceeds supported resource bounds".into()));
+    }
     let params = Params::new(m_cost, t_cost, p_cost, Some(32))
         .map_err(|e| KeydError::Crypto(format!("bad argon2 params: {e}")))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);

@@ -3,6 +3,8 @@ pub mod catalog;
 pub mod clock;
 pub mod grants;
 mod policy;
+pub mod projection;
+pub mod requests;
 
 use std::fs::OpenOptions;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -93,6 +95,15 @@ fn uuid() -> String {
         &s[20..]
     )
 }
+fn capacity(connection: &Connection, pages: u32) -> Result<()> {
+    let actual: u32 = connection
+        .query_row(&format!("PRAGMA max_page_count={pages}"), [], |r| r.get(0))
+        .map_err(db_error)?;
+    if actual != pages {
+        return Err(unavailable());
+    }
+    Ok(())
+}
 fn settings(connection: &Connection) -> Result<()> {
     connection
         .busy_timeout(Duration::from_millis(500))
@@ -141,6 +152,7 @@ impl Database {
     }
 
     fn create(connection: &mut Connection, config: &ServiceConfig, now: Time) -> Result<()> {
+        capacity(connection, config.limits.database_max_pages)?;
         let tx = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;
@@ -210,6 +222,7 @@ impl Database {
     }
 
     fn recovery(&mut self, config: &ServiceConfig, now: Time) -> Result<()> {
+        capacity(&self.connection, config.limits.database_max_pages)?;
         let version: i64 = self
             .connection
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -451,6 +464,34 @@ impl Database {
             digest,
             effect,
             expires_at,
+        })
+    }
+
+    pub fn mutation_epoch(&self) -> Result<i64> {
+        self.connection
+            .query_row(
+                "SELECT mutation_epoch FROM service_meta WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(db_error)
+    }
+    pub fn commit_changes_keys(&self, operation_id: &str) -> Result<bool> {
+        let payload: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT payload FROM admin_operations WHERE operation_id=?1",
+                [operation_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        Ok(match payload {
+            Some(p) => matches!(
+                serde_json::from_str::<Resolved>(&p).map_err(|_| unavailable())?,
+                Resolved::Catalog { .. }
+            ),
+            None => false,
         })
     }
 

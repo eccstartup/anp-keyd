@@ -6,6 +6,9 @@ pub mod config;
 pub mod paths;
 pub mod protocol;
 pub mod server;
+mod coordinator;
+pub(crate) mod executor;
+pub mod limits;
 
 use crate::error::{KeydError, Result};
 use std::io::{Read, Write};
@@ -63,7 +66,7 @@ impl Write for DeadlineStream {
 
 pub fn probe(path: &Path) -> Result<()> {
     println!("anp-keyd security boundary probe");
-    println!("protected_supported: false (grant executor and Linux release acceptance pending)");
+    println!("protected_supported: false (Linux release acceptance pending)");
     require_linux()?;
     let config = config::ServiceConfig::load(path)?;
     println!("config: root-owned, symlink-free, immutable to service and Agents");
@@ -86,7 +89,7 @@ pub fn probe(path: &Path) -> Result<()> {
         "server_identity: kernel UID verified; instance={}",
         reply.instance_id.unwrap_or_default()
     );
-    println!("signing_available: false");
+    println!("signing_available: {}", reply.signing_available);
     Err(KeydError::Misuse(
         "boundary checks passed; protected release capability is not implemented".into(),
     ))

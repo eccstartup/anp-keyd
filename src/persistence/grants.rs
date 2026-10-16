@@ -58,7 +58,7 @@ fn principal(db: &Connection, id: &str) -> Result<()> {
     }
     Ok(())
 }
-fn hot_key(db: &Connection, root: &Path, id: &str) -> Result<catalog::KeyRecord> {
+pub(super) fn hot_key(db: &Connection, root: &Path, id: &str) -> Result<catalog::KeyRecord> {
     let key = catalog::get_key(db, id).map_err(|_| refused("KEY_ROLE_FORBIDDEN"))?;
     if key.role != catalog::KeyRole::Hot || key.state != "active" {
         return Err(refused("KEY_ROLE_FORBIDDEN"));
@@ -67,7 +67,7 @@ fn hot_key(db: &Connection, root: &Path, id: &str) -> Result<catalog::KeyRecord>
         .map_err(|_| refused("KEY_ROLE_FORBIDDEN"))?;
     Ok(key)
 }
-fn policy(db: &Connection, id: &str, version: u32) -> Result<Value> {
+pub(super) fn policy(db: &Connection, id: &str, version: u32) -> Result<Value> {
     let content: String = db
         .query_row(
             "SELECT content FROM policies WHERE policy_id=?1 AND version=?2",
@@ -191,11 +191,11 @@ pub(super) fn apply(
     }
     Ok(())
 }
-fn get(db: &Connection, id: &str) -> Result<Option<Grant>> {
+pub(super) fn get(db: &Connection, id: &str) -> Result<Option<Grant>> {
     db.query_row("SELECT grant_id,principal_id,key_id,policy_id,policy_version,boot_epoch,expiry,max_uses,used_uses,state FROM grants WHERE grant_id=?1",[id],|r|Ok(Grant{grant_id:r.get(0)?,principal_id:r.get(1)?,key_id:r.get(2)?,policy_id:r.get(3)?,policy_version:r.get(4)?,boot_epoch:r.get(5)?,expiry:r.get(6)?,max_uses:r.get(7)?,used_uses:r.get(8)?,state:r.get(9)?})).optional().map_err(db_error)
 }
 impl Database {
-    fn refresh_grants(&mut self, now: Time) -> Result<()> {
+    pub(super) fn refresh_grants(&mut self, now: Time) -> Result<()> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)

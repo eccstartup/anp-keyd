@@ -29,10 +29,13 @@ pub struct ServiceConfig {
     pub admin_socket: PathBuf,
     pub principals: Vec<Principal>,
     pub vault_ids: Vec<String>,
+    #[serde(default)]
+    pub limits: super::limits::Limits,
 }
 
 impl ServiceConfig {
     pub fn validate(&self) -> Result<()> {
+        self.limits.validate()?;
         if self.schema_version != 1 || self.mode != "linux-boundary-preview" {
             return Err(invalid("unsupported config version or mode"));
         }
@@ -147,6 +150,7 @@ mod tests {
                 enabled: true,
             }],
             vault_ids: vec![],
+            limits: Default::default(),
         }
     }
 

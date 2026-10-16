@@ -28,10 +28,12 @@ pub struct Boundary {
     vaults: BTreeMap<String, DaemonState>,
     // State changes serialize; KDF has a separate, non-queueing single slot.
     // Vault generation checks cancel unlocks that overlap LOCK_ALL.
-    admin_gate: Mutex<()>,
+    admin_gate: super::coordinator::Coordinator,
     kdf_gate: Mutex<()>,
     database: Mutex<Database>,
     stopped: AtomicBool,
+    rates: Mutex<super::limits::RateLimit>,
+    projection_healthy: AtomicBool,
 }
 
 impl Boundary {
@@ -55,17 +57,23 @@ impl Boundary {
         Ok(Self {
             config,
             vaults,
-            admin_gate: Mutex::new(()),
+            admin_gate: super::coordinator::Coordinator::default(),
             kdf_gate: Mutex::new(()),
             database: Mutex::new(database),
             stopped: AtomicBool::new(false),
+            rates: Mutex::new(Default::default()),
+            projection_healthy: AtomicBool::new(false),
         })
     }
 
     fn capabilities(&self, principal_id: Option<String>) -> Reply {
         let mut reply = Reply::code("OK");
+        reply.signing_available = !self.stopped.load(Ordering::SeqCst);
         reply.instance_id = Some(self.config.instance_id.clone());
         reply.principal_id = principal_id;
+        reply.data = Some(
+            json!({"audit_projection_healthy":self.projection_healthy.load(Ordering::SeqCst),"transaction_executor_available":true}),
+        );
         match self.database.lock() {
             Ok(db) => reply.boot_epoch = Some(db.boot_epoch),
             Err(_) => {
@@ -84,7 +92,10 @@ impl Boundary {
 
     fn connection(&self, stream: UnixStream, admin: bool) -> Result<()> {
         let peer = peer_identity(&stream)?;
-        let mut io = DeadlineStream::new(stream, Duration::from_secs(5));
+        let mut io = DeadlineStream::new(
+            stream,
+            Duration::from_secs(self.config.limits.frame_seconds),
+        );
         // Authorize before reading any payload, even on the management listener.
         let principal = if admin {
             if !self.config.admin_uids.contains(&peer.uid) {
@@ -148,10 +159,11 @@ impl Boundary {
             }
         };
         if reply.code == "OK" {
+            reply.signing_available = !self.stopped.load(Ordering::SeqCst);
             reply.instance_id = Some(self.config.instance_id.clone());
         }
         // New deadline for delivery; no secret payload is reflected in errors.
-        io.reset(Duration::from_secs(5));
+        io.reset(Duration::from_secs(self.config.limits.response_seconds));
         protocol::write(&mut io, &reply)
         // Exactly one request; dropping the stream rejects inherited old sessions.
     }
@@ -159,11 +171,20 @@ impl Boundary {
     fn data(&self, uid: u32, principal: &str, request: DataRequest) -> Reply {
         // Recheck the live principal after reading the frame. A stalled connection
         // must not retain access after DisablePrincipal commits.
+        let rate_now = match SystemClock.now() {
+            Ok(t) => t.monotonic_ms,
+            Err(_) => return Reply::code("AUDIT_UNAVAILABLE"),
+        };
+        if !self
+            .rates
+            .lock()
+            .map(|mut r| r.accept(principal, rate_now, &self.config.limits))
+            .unwrap_or(false)
+        {
+            return Reply::code("RESOURCE_BUSY");
+        }
         let result = (|| -> Result<Reply> {
-            let _gate = self
-                .admin_gate
-                .lock()
-                .map_err(|_| KeydError::Protocol("PERSISTENCE_UNAVAILABLE".into()))?;
+            let _gate = self.admin_gate.enter(false)?;
             if self.stopped.load(Ordering::SeqCst) {
                 return Err(KeydError::Protocol("PERSISTENCE_UNAVAILABLE".into()));
             }
@@ -181,7 +202,7 @@ impl Boundary {
                 DataRequest::Capabilities {} => {
                     reply.boot_epoch = Some(db.boot_epoch);
                     reply.data = Some(
-                        json!({"protocol_version":2,"profile":"anp-http-v2","max_body_bytes":16384,"transaction_executor_available":false}),
+                        json!({"protocol_version":2,"profile":"anp-http-v2","max_body_bytes":16384,"transaction_executor_available":true,"audit_projection_healthy":self.projection_healthy.load(Ordering::SeqCst)}),
                     );
                 }
                 DataRequest::ListAuthorizedKeys {} => {
@@ -219,16 +240,37 @@ impl Boundary {
                         return Err(KeydError::Misuse("REQUEST_ID_INVALID".into()));
                     }
                     let canonical = super::http::CanonicalHttpRequest::new(http)?;
-                    let _ = db.authorize_http(principal, &grant_id, &canonical, now)?;
-                    // M4 owns quota reservation, signing, durable result and delivery.
-                    // Never invoke legacy sign_structured from this preview path.
-                    reply = Reply::code("SIGNING_UNAVAILABLE");
+                    let status = super::executor::execute(
+                        &mut db,
+                        principal,
+                        &grant_id,
+                        &request_id,
+                        &canonical,
+                        &SystemClock,
+                        |key, expiry, deadline| {
+                            let state = self.vaults.get(&key.vault_id).ok_or_else(|| {
+                                KeydError::Protocol("missing managed vault".into())
+                            })?;
+                            state.sign_protected(
+                                self.config.service_uid,
+                                key,
+                                &canonical,
+                                expiry,
+                                deadline,
+                            )
+                        },
+                    )?;
+                    reply.data = Some(serde_json::to_value(status)?);
                 }
                 DataRequest::RequestStatus { request_id } => {
                     if !crate::principal::validate_uuid(&request_id) {
                         return Err(KeydError::Misuse("REQUEST_ID_INVALID".into()));
                     }
-                    reply = Reply::code("REQUEST_NOT_FOUND");
+                    reply.data = Some(serde_json::to_value(db.request_status(
+                        principal,
+                        &request_id,
+                        now,
+                    )?)?);
                 }
             }
             Ok(reply)
@@ -276,16 +318,21 @@ impl Boundary {
         }
         // Never queue a second KDF on the remaining admin connection slot.
         // This leaves capacity for a concurrent LOCK_ALL.
-        let _guard = if matches!(request, AdminRequest::Unlock { .. }) {
+        let unlocking = matches!(request, AdminRequest::Unlock { .. });
+        let _kdf_guard = if unlocking {
             match self.kdf_gate.try_lock() {
-                Ok(guard) => guard,
+                Ok(guard) => Some(guard),
                 Err(_) => return Reply::code("RESOURCE_BUSY"),
             }
         } else {
-            match self.admin_gate.lock() {
-                Ok(guard) => guard,
+            None
+        };
+        let _guard = if unlocking {
+            None
+        } else {
+            match self.admin_gate.enter(true) {
+                Ok(guard) => Some(guard),
                 Err(_) => {
-                    self.emergency();
                     return Reply::code("RESOURCE_BUSY");
                 }
             }
@@ -367,12 +414,16 @@ impl Boundary {
                     self.emergency();
                     return Reply::code("AUDIT_UNAVAILABLE");
                 };
-                self.lock_all();
                 let result = self
                     .database
                     .lock()
                     .map_err(|_| KeydError::Protocol("PERSISTENCE_UNAVAILABLE".into()))
-                    .and_then(|mut db| db.commit(actor, &operation_id, &digest, now));
+                    .and_then(|mut db| {
+                        if db.commit_changes_keys(&operation_id)? {
+                            self.lock_all();
+                        }
+                        db.commit(actor, &operation_id, &digest, now)
+                    });
                 match result {
                     Ok(()) => Reply::code("OK"),
                     Err(KeydError::Misuse(_)) => Reply::code("ADMIN_OPERATION_INVALID"),
@@ -405,14 +456,13 @@ impl Boundary {
                 let Some(state) = self.vaults.get(&vault_id) else {
                     return Reply::code("KEY_NOT_FOUND");
                 };
-                let verified = self
-                    .database
-                    .lock()
-                    .map_err(|_| ())
-                    .and_then(|db| db.check_key(&vault_id, &did, &kid).map_err(|_| ()));
-                if verified.is_err() {
+                let verified = self.database.lock().map_err(|_| ()).and_then(|db| {
+                    db.check_key(&vault_id, &did, &kid).map_err(|_| ())?;
+                    db.mutation_epoch().map_err(|_| ())
+                });
+                let Ok(epoch) = verified else {
                     return Reply::code("KEY_ROLE_FORBIDDEN");
-                }
+                };
                 // No disk path or default binding key may be selected by callers.
                 let prefix = format!("{did}#");
                 let Some(fragment) = kid
@@ -427,14 +477,15 @@ impl Boundary {
                     Some(fragment),
                     passphrase,
                     || {
-                        let guard = self.admin_gate.lock().map_err(|_| KeydError::Locked)?;
+                        let guard = self.admin_gate.enter(true).map_err(|_| KeydError::Locked)?;
                         if self.stopped.load(Ordering::SeqCst) {
                             Err(KeydError::Locked)
                         } else {
-                            self.database
-                                .lock()
-                                .map_err(|_| KeydError::Locked)?
-                                .check_key(&vault_id, &did, &kid)?;
+                            let db = self.database.lock().map_err(|_| KeydError::Locked)?;
+                            if db.mutation_epoch()? != epoch {
+                                return Err(KeydError::Locked);
+                            }
+                            db.check_key(&vault_id, &did, &kid)?;
                             Ok(guard)
                         }
                     },
@@ -514,7 +565,11 @@ async fn listen(
     mut stop: watch::Receiver<bool>,
 ) -> Result<()> {
     let listener = UnixListener::from_std(listener)?;
-    let slots = Arc::new(Semaphore::new(if admin { 2 } else { 16 }));
+    let slots = Arc::new(Semaphore::new(if admin {
+        boundary.config.limits.admin_connections
+    } else {
+        boundary.config.limits.data_connections
+    }));
     let mut tasks = JoinSet::new();
     let outcome = loop {
         tokio::select! {
@@ -595,7 +650,7 @@ pub async fn serve(config: ServiceConfig, mut stop: watch::Receiver<bool>) -> Re
     let (sign, _sign_guard) = bind(&config.sign_socket, config.service_uid, config.agent_gid)?;
     let (admin, _admin_guard) = bind(&config.admin_socket, config.service_uid, config.admin_gid)?;
     let boundary = Arc::new(Boundary::new(config, database)?);
-    tracing::info!("Linux boundary preview listening; signing and protected support unavailable");
+    tracing::info!("Linux transaction signer listening; protected release acceptance pending");
     let (shutdown, shutdown_rx) = watch::channel(false);
     let sweeper = {
         let boundary = boundary.clone();
@@ -606,6 +661,23 @@ pub async fn serve(config: ServiceConfig, mut stop: watch::Receiver<bool>) -> Re
                 tokio::select! {
                     changed = sweep_stop.changed() => { if changed.is_err() || *sweep_stop.borrow() { break; } }
                     _ = timer.tick() => { for vault in boundary.vaults.values() { vault.sweep_all(Instant::now()); } }
+                }
+            }
+        })
+    };
+    let exporter = {
+        let boundary = boundary.clone();
+        let mut export_stop = shutdown.subscribe();
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    changed = export_stop.changed() => {if changed.is_err() || *export_stop.borrow() {break;}}
+                    _ = timer.tick() => {
+                        let root=boundary.config.state_dir.clone();
+                        let outcome=tokio::task::spawn_blocking(move || crate::persistence::projection::export(&root)).await;
+                        boundary.projection_healthy.store(matches!(outcome,Ok(Ok(_))),Ordering::SeqCst);
+                    }
                 }
             }
         })
@@ -631,6 +703,7 @@ pub async fn serve(config: ServiceConfig, mut stop: watch::Receiver<bool>) -> Re
         }
     };
     let _ = sweeper.await;
+    let _ = exporter.await;
     boundary.lock_all();
     outcome
 }
