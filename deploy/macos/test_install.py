@@ -57,5 +57,27 @@ class Policy(unittest.TestCase):
         with self.assertRaises(ValueError): self.config()
 
 
+class ChildCredentials(unittest.TestCase):
+    def test_primary_group_survives_darwin_egid_replacement(self):
+        spec = importlib.util.spec_from_file_location('runtime_checks', Path(__file__).with_name('test-runtime.py'))
+        runtime = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runtime)
+        config = {'service_uid': 600, 'admin_uids': [501], 'agent_gid': 602, 'admin_gid': 603}
+        for uid, primary, required in [(600, 600, {602, 603}), (501, 20, {603}), (601, 601, {602}), (70, 70, {602})]:
+            user = NS(pw_uid=uid, pw_gid=primary)
+            result = runtime.child_credentials(user, config)
+            self.assertEqual(result['extra_groups'][0], primary)
+            # BSD setregid replaces group slot 0 after setgroups. Socket groups
+            # must survive that documented kernel transition.
+            after_setregid = [primary, *result['extra_groups'][1:]]
+            self.assertTrue(required <= set(after_setregid))
+            if uid in (601, 70):
+                self.assertNotIn(603, after_setregid)
+        agent = NS(pw_uid=601, pw_gid=601)
+        elevated_transport = runtime.child_credentials(agent, config, extra_admin_group=True)
+        self.assertEqual(elevated_transport['user'], 601)
+        self.assertIn(603, elevated_transport['extra_groups'][1:])
+
+
 if __name__ == '__main__':
     unittest.main()

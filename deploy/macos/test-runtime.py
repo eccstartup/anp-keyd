@@ -17,6 +17,21 @@ import time
 import uuid
 
 
+def child_credentials(user, config, extra_admin_group=False):
+    groups = [config['agent_gid']]
+    if user.pw_uid == config['service_uid']:
+        groups.append(config['admin_gid'])
+    elif user.pw_uid in config['admin_uids']:
+        groups = [config['admin_gid']]
+    if extra_admin_group:
+        groups.append(config['admin_gid'])
+    # Darwin stores EGID in kernel group slot 0. CPython calls setgroups first,
+    # then setregid, which can displace slot 0. Reserve it for the primary group
+    # so the required socket groups survive. Linux accepts the same list.
+    groups = [user.pw_gid, *sorted(set(groups) - {user.pw_gid})]
+    return {'user': user.pw_uid, 'group': user.pw_gid, 'extra_groups': groups}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=Path('/Library/ANPKeyd/service.json'))
@@ -49,18 +64,7 @@ def main():
     agent = pwd.getpwuid(installed['principals'][0]['uid'])
     env = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'RUST_LOG': 'info'}
     def credentials(user, extra_admin_group=False):
-        # Use subprocess's native credential switch, not Python after fork.
-        # Explicit minimal child groups avoid Darwin getgroups/initgroups cache
-        # differences and NGROUPS_MAX; account membership itself is not changed.
-        groups = [installed['agent_gid']]
-        if user.pw_uid == service.pw_uid:
-            groups.append(installed['admin_gid'])
-        elif user.pw_uid == admin.pw_uid:
-            groups = [installed['admin_gid']]
-        if extra_admin_group:
-            groups.append(installed['admin_gid'])
-        return {'user': user.pw_uid, 'group': user.pw_gid,
-                'extra_groups': sorted(set(groups))}
+        return child_credentials(user, installed, extra_admin_group)
     def run(user, *command):
         if command and Path(str(command[0])).name == 'anp-keyd':
             print(f'CHECK uid={user.pw_uid} keyd ' + ' '.join(map(str, command[1:4])), flush=True)
@@ -101,7 +105,13 @@ fd=os.open(state,os.O_RDONLY);os.close(fd)
 name=os.path.join(state,'.acceptance-access-probe')
 fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
 os.write(fd,b'temporary access probe');os.fsync(fd);os.close(fd);os.unlink(name)
-print(json.dumps({'uid':os.getuid(),'euid':os.geteuid(),'gid':os.getgid(),'groups':os.getgroups(),'config_read':True,'state_write':True}))
+import ctypes
+lib=ctypes.CDLL(None,use_errno=True)
+count=lib.getgroups(0,None)
+if count<0: raise OSError(ctypes.get_errno(),'getgroups')
+groups=(ctypes.c_uint*count)()
+if lib.getgroups(count,groups)<0: raise OSError(ctypes.get_errno(),'getgroups')
+print(json.dumps({'uid':os.getuid(),'euid':os.geteuid(),'gid':os.getgid(),'kernel_groups':list(groups),'config_read':True,'state_write':True}))
 '''
         access = run(service, '/usr/bin/python3', '-I', '-c', probe, path, config['state_dir'])
         assert access.returncode == 0, 'service credential/filesystem preflight failed: ' + access.stderr

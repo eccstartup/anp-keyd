@@ -240,3 +240,13 @@ Linux container using `test-signing-container.sh`; all checks passed. Its explic
 container-only mode cannot run on an unmarked Linux host or claim macOS task-port
 or graphical UI acceptance. Strict all-target Clippy and local helper generation
 also passed. CI includes that orchestration regression.
+
+Child credential setup reserves group slot 0 for the primary GID before socket
+groups. This matters on Darwin: [CPython 3.9](https://raw.githubusercontent.com/python/cpython/v3.9.6/Modules/_posixsubprocess.c)
+calls `setgroups` before `setregid`, and [XNU](https://raw.githubusercontent.com/apple-oss-distributions/xnu/main/bsd/kern/kern_credential.c)
+uses group slot 0 for EGID, replacing that entry when changing primary group.
+Passing only the administrator socket group there can discard it and cause a
+false EACCES in the harness. Primary-first role-group policy has a dedicated
+regression check; preflight reports libc kernel groups rather than the macOS
+Python account-group lookup. This correction does not widen filesystem modes or
+change any account membership.
