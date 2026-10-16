@@ -214,7 +214,8 @@ The driver copies exactly the digest-checked helper into its new root-owned test
 directory, generates root/hot/next test keys, and provisions only that separate
 temporary service. It does not enroll keys into the installed launchd instance,
 change existing account memberships, or access real vaults. A second real OS UID
-(`nobody`) receives transport group access only in its temporary child process.
+(`_www` on macOS, `nobody` in Linux regression) receives transport group
+access only in its temporary child process.
 Typed management operations confirm roles/policy/grants; there are no SQL shortcuts.
 Public generated signatures are verified independently with the upstream verifier,
 including rejection of a changed target URL. Checks cover cross-principal grants,

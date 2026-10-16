@@ -48,14 +48,21 @@ def main():
     admin = pwd.getpwuid(installed['admin_uids'][0])
     agent = pwd.getpwuid(installed['principals'][0]['uid'])
     env = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'RUST_LOG': 'info'}
-    def identity(user):
-        def drop():
-            os.initgroups(user.pw_name, user.pw_gid)
-            os.setgid(user.pw_gid)
-            os.setuid(user.pw_uid)
-        return drop
+    def credentials(user, extra_admin_group=False):
+        # Use subprocess's native credential switch, not Python after fork.
+        # Explicit minimal child groups avoid Darwin getgroups/initgroups cache
+        # differences and NGROUPS_MAX; account membership itself is not changed.
+        groups = [installed['agent_gid']]
+        if user.pw_uid == service.pw_uid:
+            groups.append(installed['admin_gid'])
+        elif user.pw_uid == admin.pw_uid:
+            groups = [installed['admin_gid']]
+        if extra_admin_group:
+            groups.append(installed['admin_gid'])
+        return {'user': user.pw_uid, 'group': user.pw_gid,
+                'extra_groups': sorted(set(groups))}
     def run(user, *command):
-        return subprocess.run(list(map(str, command)), preexec_fn=identity(user),
+        return subprocess.run(list(map(str, command)), **credentials(user),
                               env=env, capture_output=True, text=True, timeout=15, cwd="/")
     parent = '/tmp' if portable else '/Library'
     if portable:
@@ -88,7 +95,7 @@ def main():
         process = None
         def start():
             proc = subprocess.Popen([str(args.binary), 'serve-protected', '--config', str(path)],
-                                    preexec_fn=identity(service), env=env, cwd="/",
+                                    **credentials(service), env=env, cwd="/",
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             for _ in range(100):
                 if proc.poll() is not None:
@@ -116,7 +123,7 @@ def main():
             assert first['instance_id'] == config['instance_id'] and not first['protected_supported']
             checks = None
             if fixture:
-                checks = acceptance_signing.Checks(base, config, path, args, fixture, admin, agent, identity, env, cli)
+                checks = acceptance_signing.Checks(base, config, path, args, fixture, admin, agent, credentials, env, cli)
                 checks.before_restart()
             # task_for_pid queries a task port, never attaches a debugger or reads
             # memory. Root performs only the UID switch; the Agent makes the call.

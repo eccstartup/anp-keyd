@@ -30,6 +30,7 @@ def prepare(base, config, args, admin, service, run):
     work.mkdir(mode=0o700)
     os.chown(work, admin.pw_uid, admin.pw_gid)
     source = work / 'vault'
+    print(f'CHECK generating disposable fixture as administrator UID {admin.pw_uid}', flush=True)
     made = run(admin, helper, 'generate', source)
     assert made.returncode == 0, made.stderr
     manifest = json.loads(made.stdout)
@@ -56,11 +57,12 @@ def prepare(base, config, args, admin, service, run):
     config['vault_ids'] = [vault_id]
     # A real second OS UID, with transport membership applied ONLY to the child
     # process. No Directory Services account/group changes are made.
-    other = pwd.getpwnam('nobody')
+    other = pwd.getpwnam('_www' if os.uname().sysname == 'Darwin' else 'nobody')
     if other.pw_uid in {0, service.pw_uid, admin.pw_uid, *[p['uid'] for p in config['principals']]}:
         raise ValueError('second test subject overlaps configured identities')
     config['principals'] = [*config['principals'], {'principal_id': str(uuid.uuid4()),
                             'uid': other.pw_uid, 'generation': 1, 'enabled': True}]
+    print(f'PASS disposable fixture prepared; second kernel subject UID={other.pw_uid}', flush=True)
     return {'helper': helper, 'manifest': manifest, 'vault_id': vault_id, 'other': other}
 
 
@@ -94,33 +96,20 @@ print(exact(length).decode())
 
 
 class Checks:
-    def __init__(self, base, config, path, args, fixture, admin, agent, identity, env, cli):
+    def __init__(self, base, config, path, args, fixture, admin, agent, credentials, env, cli):
         self.base, self.config, self.path, self.args = base, config, path, args
         self.fixture, self.admin, self.agent = fixture, admin, agent
-        self.identity, self.env, self.cli = identity, env, cli
+        self.credentials, self.env, self.cli = credentials, env, cli
         self.key = self.grant_id = self.request = self.signed = None
 
     def request_as(self, user, operation, management=False, secret=False, extra_admin_group=False):
-        def drop():
-            self.identity(user)()
-        # setgroups must precede dropping UID. Only the second, disposable child
-        # receives signing transport access, without changing account membership.
-        if user == self.fixture['other']:
-            def drop():
-                os.setgroups([self.config['agent_gid']])
-                os.setgid(user.pw_gid)
-                os.setuid(user.pw_uid)
-        if extra_admin_group:
-            def drop():
-                os.initgroups(user.pw_name, user.pw_gid)
-                os.setgroups([*os.getgroups(), self.config['admin_gid']])
-                os.setgid(user.pw_gid)
-                os.setuid(user.pw_uid)
+        # Only these children receive test transport access; account records
+        # remain untouched. Native subprocess credential errors retain errno.
         endpoint = self.config['admin_socket' if management else 'sign_socket']
         result = subprocess.run(['/usr/bin/python3', '-I', '-c', REQUEST, endpoint,
                                  str(self.config['service_uid']), 'refuse' if extra_admin_group else ('yes' if secret else 'no')],
                                 input=json.dumps({'version': 2, 'request': operation}),
-                                capture_output=True, text=True, preexec_fn=drop,
+                                capture_output=True, text=True, **self.credentials(user, extra_admin_group),
                                 env=self.env, cwd='/', timeout=20)
         assert result.returncode == 0, result.stderr
         reply = json.loads(result.stdout)
@@ -194,12 +183,12 @@ class Checks:
         self.signed = result['data']
         public = {'document': self.fixture['manifest']['document'], **self.signed['result']}
         verified = subprocess.run([str(self.fixture['helper']), 'verify'], input=json.dumps(public),
-                                  preexec_fn=self.identity(self.admin), env=self.env, cwd='/',
+                                  **self.credentials(self.admin), env=self.env, cwd='/',
                                   capture_output=True, text=True, timeout=15)
         assert verified.returncode == 0 and verified.stdout.strip() == 'VERIFIED', verified.stderr
         tampered = {**public, 'url': 'https://example.com/other'}
         rejected = subprocess.run([str(self.fixture['helper']), 'verify'], input=json.dumps(tampered),
-                                  preexec_fn=self.identity(self.admin), env=self.env, cwd='/',
+                                  **self.credentials(self.admin), env=self.env, cwd='/',
                                   capture_output=True, text=True, timeout=15)
         assert rejected.returncode != 0, 'upstream verifier accepted changed target'
         assert self.request_as(self.agent, self.request)['data'] == self.signed
@@ -248,7 +237,7 @@ class Checks:
         def window(instruction):
             print(instruction, flush=True)
             started = time.monotonic()
-            result = subprocess.run(command, preexec_fn=self.identity(self.admin), env=self.env,
+            result = subprocess.run(command, **self.credentials(self.admin), env=self.env,
                                     cwd='/', stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=150)
             return result, time.monotonic() - started
         cancelled, _ = window('UI 1/3: check exact instance/vault/DID/key in the window; click Cancel. Do not enter a real password.')
