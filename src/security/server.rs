@@ -72,6 +72,7 @@ impl Boundary {
     fn capabilities(&self, principal_id: Option<String>) -> Reply {
         let mut reply = Reply::code("OK");
         reply.signing_available = !self.stopped.load(Ordering::SeqCst);
+        reply.protected_supported = self.config.protected_supported();
         reply.instance_id = Some(self.config.instance_id.clone());
         reply.principal_id = principal_id;
         reply.data = Some(
@@ -180,6 +181,7 @@ impl Boundary {
         };
         if reply.code == "OK" {
             reply.signing_available = !self.stopped.load(Ordering::SeqCst);
+            reply.protected_supported = self.config.protected_supported();
             reply.instance_id = Some(self.config.instance_id.clone());
         }
         // New deadline for delivery; no secret payload is reflected in errors.
@@ -747,7 +749,7 @@ pub async fn serve(config: ServiceConfig, mut stop: watch::Receiver<bool>) -> Re
     let (sign, _sign_guard) = bind(&config.sign_socket, config.service_uid, config.agent_gid)?;
     let (admin, _admin_guard) = bind(&config.admin_socket, config.service_uid, config.admin_gid)?;
     let boundary = Arc::new(Boundary::new(config, database)?);
-    tracing::info!("Linux transaction signer listening; protected release acceptance pending");
+    tracing::info!("Linux transaction signer listening");
     let (shutdown, shutdown_rx) = watch::channel(false);
     let sweeper = {
         let boundary = boundary.clone();

@@ -1,5 +1,5 @@
-> Linux v2 已实现有限授权、事务签名、迁移和管理轮换。真实 systemd 主机验收仍待完成，
-> 因此 `protected_supported=false`。同 UID 开发模式不提供 Agent 隔离；v1 解锁口令经过 socket。
+> Linux v2 已实现有限授权、事务签名、迁移和管理轮换。真实 systemd 主机验收已通过。
+> 正式 Linux 构建与显式 `linux-protected-v1` 部署报告 `protected_supported=true`；其他模式为 false。同 UID 开发模式不提供 Agent 隔离；v1 解锁口令经过 socket。
 > 软件整套目录加口令可解封；硬件保护的是解封材料。
 
 # anp-keyd
@@ -66,7 +66,7 @@ Agent 使用 `anp-keyd data --file request.json`，默认读取 `/etc/anp-keyd/s
 只提供 v2 授权工具，工具参数不能覆盖 socket、配置、DID 或 kid；未指定 `--config` 的旧 MCP
 仍是显式开发模式。v2 已接入事务预留、次数消费、持久请求去重、结果缓存与撤销。
 相同 request_id 与相同输入复用已提交结果；变更输入拒绝；不确定结果保留次数且不自动重签。
-`protected_supported=false`：systemd 真实主机验收仍未完成。重启撤销所有旧 grant 并锁定密钥。
+正式 Linux 构建在 `linux-protected-v1` 模式下报告 `protected_supported=true`；旧 preview、调试及 macOS 模式仍为 false。重启撤销所有旧 grant 并锁定密钥。
 
 Node 适配器见 [adapters/keyd-v2.mjs](adapters/keyd-v2.mjs)，包含 v2 客户端和现有 anp-sdk
 `AnpConnector` 接口。最终发送使用 daemon 返回的规范化 URL、原 body 和签名头，禁用自动重定向。
@@ -341,7 +341,7 @@ M2 首批已接入 SQLite、启动恢复、事务审计，以及两阶段主体�
 服务账号、管理员与 Agent 使用独立 UID，管理面和数据面分别监听；客户端先验证
 服务内核 UID 再发送密码。配置和安装程序由 root 持有。
 
-数据面签名、grant 和离线迁移已有实现；真实 systemd 主机验收前不能宣称完成受保护发行。
+数据面签名、grant 和离线迁移已有实现；真实 systemd 主机验收已完成，保护声明仍要求正式 Linux 构建和显式保护模式。
 安装器与一次性 Linux 容器验收见 [deploy/linux](deploy/linux/README.md)。
 旧 `serve`、CLI 和 MCP 开发流程继续保留，两种服务不会自动降级互通。
 

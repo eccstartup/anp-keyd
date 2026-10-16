@@ -17,18 +17,26 @@ import sys
 import time
 import uuid
 
-if sys.platform != 'linux' or os.geteuid() != 0 or not Path('/.dockerenv').exists():
-    sys.exit('requires disposable root Linux Docker container')
-
-os.umask(0o077)  # Installation must set modes explicitly, independent of caller umask.
-
 parser = argparse.ArgumentParser()
 parser.add_argument('--binary', required=True)
+parser.add_argument('--systemd', action='store_true', help='requires a marked disposable VM with systemd PID 1')
 args = parser.parse_args()
+if sys.platform != 'linux' or os.geteuid() != 0:
+    sys.exit('requires disposable root Linux environment')
+if args.systemd:
+    marker = Path('/var/lib/keyd-systemd-disposable')
+    if (Path('/.dockerenv').exists() or Path('/proc/1/comm').read_text().strip() != 'systemd'
+            or marker.is_symlink() or not marker.is_file() or marker.stat().st_uid != 0
+            or marker.stat().st_mode & 0o077
+            or marker.read_text().strip() != 'anp-keyd-disposable-systemd-v1'):
+        sys.exit('systemd mode requires an explicitly marked disposable systemd VM')
+elif not Path('/.dockerenv').exists():
+    sys.exit('container mode requires Docker; systemd VM testing needs --systemd')
+os.umask(0o077)  # Installer must set permissions independently of caller umask.
 for name in ['boundary-admin', 'boundary-agent-a', 'boundary-agent-b', 'boundary-stranger']:
     subprocess.run(['useradd', '--create-home', '--shell', '/bin/sh', name], check=True)
 subprocess.run([sys.executable, 'deploy/linux/install.py', '--binary', args.binary,
-                '--allow-development-build', '--sha256', hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(), '--admin-user', 'boundary-admin', '--agent-user', 'boundary-agent-a', '--agent-user', 'boundary-agent-b'], check=True)
+                *([] if args.systemd else ['--allow-development-build']), '--sha256', hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(), '--admin-user', 'boundary-admin', '--agent-user', 'boundary-agent-a', '--agent-user', 'boundary-agent-b'], check=True)
 config_path = Path('/etc/anp-keyd/service.json')
 config = json.loads(config_path.read_text())
 fixture = json.loads(Path('/tmp/keyd-boundary-fixture-info.json').read_text())
@@ -128,6 +136,23 @@ def request(endpoint, value, secret=None):
 
 
 def start():
+    if args.systemd:
+        Path('/tmp/keyd-host-visible-marker').write_text('disposable host namespace')
+        Path('/tmp/keyd-host-visible-marker').chmod(0o644)
+        dropin = Path('/run/systemd/system/anp-keyd.service.d')
+        dropin.mkdir(parents=True, exist_ok=True)
+        (dropin / 'sandbox-probe.conf').write_text('[Service]\nExecStartPost=/usr/bin/python3 ' + str(Path(__file__).resolve().with_name('sandbox-probe.py')) + '\n')
+        subprocess.run(['systemctl','enable','anp-keyd.service'], check=True)
+        subprocess.run(['systemctl', 'daemon-reload'], check=True)
+        subprocess.run(['systemd-tmpfiles', '--create', '/etc/tmpfiles.d/anp-keyd.conf'], check=True)
+        subprocess.run(['systemctl', 'reset-failed', 'anp-keyd.service'], check=True)
+        subprocess.run(['systemctl', 'start', 'anp-keyd.service'], check=True)
+        for _ in range(100):
+            if Path(config['admin_socket']).exists():
+                invocation = subprocess.check_output(['systemctl','show','anp-keyd.service','-p','InvocationID','--value'], text=True).strip()
+                return invocation
+            time.sleep(.05)
+        raise AssertionError(subprocess.check_output(['journalctl','-u','anp-keyd.service','--no-pager','-n','40'], text=True))
     process = subprocess.Popen([binary, 'serve-protected'], preexec_fn=identity('anp-keyd'), stderr=subprocess.PIPE, text=True)
     for _ in range(100):
         if process.poll() is not None:
@@ -139,9 +164,13 @@ def start():
 
 
 def stop(process):
-    process.terminate()
-    process.wait(timeout=12)
-    stderr = process.stderr.read()
+    if args.systemd:
+        subprocess.run(['systemctl','stop','anp-keyd.service'], check=True)
+        stderr = subprocess.check_output(['journalctl','_SYSTEMD_INVOCATION_ID=' + process, '--no-pager'], text=True)
+    else:
+        process.terminate()
+        process.wait(timeout=12)
+        stderr = process.stderr.read()
     check('temporary-boundary-test-secret' not in stderr, 'service log has no password')
     check(not Path(config['sign_socket']).exists() and not Path(config['admin_socket']).exists(), 'shutdown cleans owned socket inodes')
 
@@ -152,6 +181,11 @@ def capabilities(endpoint):
 
 process = start()
 try:
+    if args.systemd:
+        spec = __import__('importlib.util', fromlist=['spec_from_file_location']).spec_from_file_location('systemd_checks', Path(__file__).with_name('systemd-checks.py'))
+        host_checks = __import__('importlib.util', fromlist=['module_from_spec']).module_from_spec(spec)
+        spec.loader.exec_module(host_checks)
+        process = host_checks.run(config, check)
     # Root uses explicit privilege drop so probes are real SO_PEERCRED identities.
     code = '''import json,socket,struct,sys
 s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);data=json.dumps({'version':2,'request':{'operation':'GET_CAPABILITIES'}}).encode();s.sendall(struct.pack('!I',len(data))+data)
@@ -166,9 +200,10 @@ print(exact(struct.unpack('!I',exact(4))[0]).decode())'''
         return json.loads(result.stdout)
     a, b = as_agent('boundary-agent-a'), as_agent('boundary-agent-b')
     check(a['code'] == b['code'] == 'OK' and a['principal_id'] != b['principal_id'], 'same client maps A/B to distinct kernel principals')
-    check(a['signing_available'] and not a['protected_supported'], 'transaction executor available while protected release remains pending')
+    expected_supported = config['mode'] == 'linux-protected-v1' and json.loads(subprocess.check_output([binary, 'build-info']))['protected_supported']
+    check(a['signing_available'] and a['protected_supported'] == expected_supported, 'runtime protection declaration matches build and explicit deployment mode')
     check(command('boundary-admin', 'admin', 'status').returncode == 0, 'independent administrator authenticated')
-    check(command('boundary-admin', 'probe', '--security').returncode != 0, 'probe refuses protected release claim')
+    check((command('boundary-admin', 'probe', '--security').returncode == 0) == expected_supported, 'probe accepts only supported protected deployment')
     check(command('boundary-agent-a', 'admin', 'status').returncode != 0, 'Agent cannot invoke admin CLI')
     # A real controlling PTY does not grant administrative identity.
     pid, terminal = pty.fork()
@@ -554,6 +589,12 @@ if os.environ.get('ANP_KEYD_ANP_TARGET'):
         stop(process)
 
 state_path = Path(config['state_dir']) / 'state.sqlite'
+# Keep an exact offline test recovery point before deliberately corrupting DB.
+# This is only for the explicitly disposable systemd boot test that follows.
+if args.systemd:
+    systemd_backup = Path('/root/keyd-systemd-validated-state.sqlite')
+    shutil.copyfile(state_path, systemd_backup)
+    systemd_backup.chmod(0o600)
 check(b'temporary-boundary-test-secret' not in state_path.read_bytes(), 'SQLite contains no unlock password')
 check(command('anp-keyd', 'init-protected-state').returncode != 0, 'explicit initialization refuses an existing database')
 saved = state_path.with_suffix('.saved')
@@ -580,4 +621,23 @@ with sqlite3.connect(state_path) as database:
     database.execute('PRAGMA user_version=3')
     database.execute("UPDATE audit_events SET event_data=x'00' WHERE seq=1")
 check(command('anp-keyd', 'serve-protected').returncode != 0, 'corrupt audit stops startup')
-print(json.dumps({'passed': len(passed), 'protected_supported': False}), flush=True)
+if args.systemd:
+    # Validate the failure through the actual unit too; do not leave restart
+    # loops running while the test intentionally holds corrupt state.
+    no_restart = Path('/run/systemd/system/anp-keyd.service.d/fault-test.conf')
+    no_restart.write_text('[Service]\nRestart=no\n')
+    subprocess.run(['systemctl','daemon-reload'], check=True)
+    subprocess.run(['systemctl','reset-failed','anp-keyd.service'], check=True)
+    subprocess.run(['systemctl','start','anp-keyd.service'], capture_output=True)
+    time.sleep(.5)
+    check(not Path(config['admin_socket']).exists() and subprocess.check_output(['systemctl','show','anp-keyd.service','-p','MainPID','--value'],text=True).strip() == '0', 'systemd unit fails closed on corrupt audit state')
+    subprocess.run(['systemctl','stop','anp-keyd.service'], check=True)
+    shutil.copyfile(systemd_backup, state_path)
+    with state_path.open('rb') as restored:
+        os.fsync(restored.fileno())
+    no_restart.unlink()
+    Path('/run/systemd/system/anp-keyd.service.d/sandbox-probe.conf').unlink()
+    subprocess.run(['systemctl','daemon-reload'], check=True)
+    subprocess.run(['systemctl','reset-failed','anp-keyd.service'], check=True)
+    check(hashlib.sha256(state_path.read_bytes()).digest() == hashlib.sha256(systemd_backup.read_bytes()).digest(), 'test restores only exact pre-fault backup before boot validation')
+print(json.dumps({'passed': len(passed), 'protected_supported': expected_supported, 'systemd': args.systemd}), flush=True)

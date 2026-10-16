@@ -34,9 +34,18 @@ pub struct ServiceConfig {
 }
 
 impl ServiceConfig {
+    pub fn protected_supported(&self) -> bool {
+        super::protected_build_supported() && self.mode == "linux-protected-v1"
+    }
+
     pub fn validate(&self) -> Result<()> {
         self.limits.validate()?;
-        if self.schema_version != 1 || self.mode != "linux-boundary-preview" {
+        if self.schema_version != 1
+            || !matches!(
+                self.mode.as_str(),
+                "linux-boundary-preview" | "linux-protected-v1"
+            )
+        {
             return Err(invalid("unsupported config version or mode"));
         }
         if !validate_uuid(&self.instance_id)
@@ -152,6 +161,20 @@ mod tests {
             vault_ids: vec![],
             limits: Default::default(),
         }
+    }
+
+    #[test]
+    fn protected_mode_requires_supported_build_and_explicit_opt_in() {
+        let mut config = fixture();
+        assert!(!config.protected_supported());
+        config.mode = "linux-protected-v1".into();
+        config.validate().unwrap();
+        assert_eq!(
+            config.protected_supported(),
+            super::super::protected_build_supported()
+        );
+        config.mode = "unknown-mode".into();
+        assert!(config.validate().is_err());
     }
 
     #[test]

@@ -8,7 +8,7 @@ cargo install --path .
 
 或者 `cargo build --release`,用 `target/release/anp-keyd`。
 
-开发模式支持 macOS 和 Linux。Linux v2 使用 SQLite 和 root 管理的配置；protected supported 仍待真实主机验收。发行构建排除 hardware-software，安装/更新校验管理员给定的 SHA-256。
+开发模式支持 macOS 和 Linux。Linux v2 使用 SQLite 和 root 管理的配置；正式 Linux 构建与显式保护部署已通过 systemd 主机验收。发行构建排除 hardware-software，安装/更新校验管理员给定的 SHA-256。
 
 ::: warning 一条纪律
 交互式口令从控制终端读取。Agent 可以创建 PTY，所以终端本身不能证明人类在场；Linux v2 管理准入由独立管理员 UID 和经过认证的管理通道决定。

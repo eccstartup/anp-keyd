@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install a NEW boundary preview. Never migrate or overwrite an existing vault."""
+"""Install a NEW Linux signing boundary. Never migrate or overwrite an existing vault."""
 import argparse
 import grp
 import hashlib
@@ -67,7 +67,7 @@ def verified_binary(args):
         info = json.loads(subprocess.check_output([str(candidate), 'build-info'], timeout=10))
     if info['hardware_software'] or info['seed_export'] or (not info['release'] and not args.allow_development_build):
         raise RuntimeError('installer requires a release build without software test double or seed export')
-    return content
+    return content, info
 
 
 def update(args):
@@ -82,7 +82,7 @@ def update(args):
         if not path.is_file() or meta.st_uid != 0 or meta.st_nlink != 1 or meta.st_mode & 0o022:
             raise RuntimeError('untrusted managed deployment')
     config = json.loads(CONFIG.read_text())
-    content = verified_binary(args)
+    content, build_info = verified_binary(args)
     # No implicit restart, downgrade of configuration, or replacement of state.
     for endpoint in (config['sign_socket'], config['admin_socket']):
         with socket.socket(socket.AF_UNIX) as connection:
@@ -123,7 +123,7 @@ def install(args):
     agent_uids = {p.pw_uid for p in agents}
     if len(agent_uids) != len(agents) or len(admin_uids) != len(admins) or 0 in agent_uids or admin_uids & agent_uids:
         raise RuntimeError("administrators and distinct Agent UIDs must not overlap")
-    content = verified_binary(args)
+    content, build_info = verified_binary(args)
     for name in [SERVICE, AGENTS, ADMINS]:
         try:
             grp.getgrnam(name)
@@ -166,7 +166,7 @@ def install(args):
         dest.write(content)
         os.fsync(dest.fileno())
     config = {
-        "schema_version": 1, "mode": "linux-boundary-preview", "instance_id": str(uuid.uuid4()),
+        "schema_version": 1, "mode": "linux-protected-v1" if build_info["protected_supported"] else "linux-boundary-preview", "instance_id": str(uuid.uuid4()),
         "service_uid": service.pw_uid, "admin_uids": sorted(admin_uids),
         "agent_gid": agent_gid, "admin_gid": admin_gid, "state_dir": str(STATE),
         "sign_socket": "/run/anp-keyd/sign/sign.sock", "admin_socket": "/run/anp-keyd/admin/admin.sock",
@@ -182,7 +182,7 @@ def install(args):
         os.setgid(service.pw_gid)
         os.setuid(service.pw_uid)
     subprocess.run([str(BINARY), 'init-protected-state', '--config', str(CONFIG)], preexec_fn=service_identity, check=True)
-    print("Installed v2 transaction signer. Protected release gate remains closed pending host acceptance; migration requires the separate offline tool.")
+    print(f"Installed v2 transaction signer; mode: {config['mode']}. Migration requires the separate offline tool.")
     print("Review config, then run: systemctl daemon-reload && systemctl enable --now anp-keyd")
     print("Agents/admins need fresh login sessions for group membership. Keep Agents away from sudo, Docker and admin IPC.")
 

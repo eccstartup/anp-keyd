@@ -1,21 +1,29 @@
-//! Linux signing boundary. Protected release acceptance remains pending.
-pub mod http;
+//! Linux signing boundary.
 pub mod client;
-pub mod json;
 pub mod config;
+mod coordinator;
+pub(crate) mod executor;
+pub mod http;
+pub mod json;
+pub mod limits;
+pub mod migration;
 pub mod paths;
 pub mod protocol;
 pub mod server;
-mod coordinator;
-pub(crate) mod executor;
-pub mod limits;
-pub mod migration;
 
 use crate::error::{KeydError, Result};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
+
+/// Build capability; a running service additionally requires explicit protected mode.
+pub const fn protected_build_supported() -> bool {
+    cfg!(target_os = "linux")
+        && !cfg!(debug_assertions)
+        && !cfg!(feature = "hardware-software")
+        && !cfg!(feature = "seed-export")
+}
 
 pub fn require_linux() -> Result<()> {
     if cfg!(target_os = "linux") {
@@ -67,7 +75,6 @@ impl Write for DeadlineStream {
 
 pub fn probe(path: &Path) -> Result<()> {
     println!("anp-keyd security boundary probe");
-    println!("protected_supported: false (Linux release acceptance pending)");
     require_linux()?;
     let config = config::ServiceConfig::load(path)?;
     println!("config: root-owned, symlink-free, immutable to service and Agents");
@@ -81,19 +88,28 @@ pub fn probe(path: &Path) -> Result<()> {
     }
     paths::state_directory(&config.state_dir, config.service_uid)?;
     println!("state: service-owned 0700");
-    paths::socket(&config.sign_socket, config.service_uid, config.agent_gid)?;
-    paths::socket(&config.admin_socket, config.service_uid, config.admin_gid)?;
-    println!("sockets: separate groups and 0750 directories, 0660 endpoints");
     let admin = config.admin_uids.contains(&crate::daemon::self_uid());
+    let (endpoint, group) = if admin {
+        (&config.admin_socket, config.admin_gid)
+    } else {
+        (&config.sign_socket, config.agent_gid)
+    };
+    paths::socket(endpoint, config.service_uid, group)?;
+    println!("caller socket: trusted group and 0750 directory, 0660 endpoint");
     let reply = client::Client::connect(path, admin)?.capabilities()?;
     println!(
         "server_identity: kernel UID verified; instance={}",
         reply.instance_id.unwrap_or_default()
     );
     println!("signing_available: {}", reply.signing_available);
-    Err(KeydError::Misuse(
-        "boundary checks passed; Linux protected release acceptance is pending".into(),
-    ))
+    println!("protected_supported: {}", reply.protected_supported);
+    if reply.protected_supported && config.protected_supported() {
+        Ok(())
+    } else {
+        Err(KeydError::Misuse(
+            "boundary checks passed; build or deployment is in preview/development mode".into(),
+        ))
+    }
 }
 
 #[cfg(test)]

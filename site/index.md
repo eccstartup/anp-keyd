@@ -55,4 +55,4 @@ Signature: sig1=:VwRcADsdxfIJ5rQAXCXX3ygFsAP3l1ho+gdpNxcHzlZCdx/mef9yKzHgy9P1QzV
 - 想知道某个默认值为什么长这样 —— [不显然的默认值](/reference/defaults)
 - 想知道为什么这么做 —— [设计说明](/design/)
 
-Linux v2 事务签名、离线迁移、管理注册 proof 与热密钥轮换已有代码；systemd 主机验收前保持 `protected_supported=false`。
+Linux v2 事务签名、离线迁移、管理注册 proof 与热密钥轮换已有代码；systemd 主机验收已通过；正式 Linux 构建与显式保护模式报告 `protected_supported=true`，其他模式保持 false。

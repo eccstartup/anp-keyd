@@ -826,7 +826,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Stop => stop(root),
         Command::Keygen(args) => keygen(root, args),
         Command::BuildInfo => {
-            println!("{}", serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"release":!cfg!(debug_assertions),"hardware_software":cfg!(feature="hardware-software"),"seed_export":cfg!(feature="seed-export"),"mcp":cfg!(feature="mcp"),"protected_supported":false}));
+            println!("{}", serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"release":!cfg!(debug_assertions),"hardware_software":cfg!(feature="hardware-software"),"seed_export":cfg!(feature="seed-export"),"mcp":cfg!(feature="mcp"),"protected_supported":crate::security::protected_build_supported()}));
             Ok(())
         }
         Command::InspectVault { path, verify } => {

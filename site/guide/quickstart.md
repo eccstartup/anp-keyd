@@ -1,6 +1,6 @@
 # 五分钟跑通
 
-本页演示旧开发模式，只适合临时身份与可信进程，不提供同 UID Agent 隔离。Linux v2 请使用管理员配置与有限 grant，接入说明见 [Agent 接入](/advanced/agent)。protected supported 仍待真实 systemd 主机验收。
+本页演示旧开发模式，只适合临时身份与可信进程，不提供同 UID Agent 隔离。Linux v2 请使用管理员配置与有限 grant，接入说明见 [Agent 接入](/advanced/agent)。正式 Linux 构建与显式保护部署已通过 systemd 主机验收。
 
 这一页从零走到第一行签名头。试的时候建议全程加 `--root DIR`,免得真钥匙和实验钥匙混在一起:
 

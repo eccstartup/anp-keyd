@@ -1,6 +1,6 @@
 # Agent 接入与模式
 
-Linux v2 请使用仓库 `skills/anp-keyd/SKILL.md`、`adapters/keyd-v2.mjs` 或 `mcp --config`。必须提供管理员配置、grant 和持久 request_id；收到签名后按规范化 URL 与原 body 发送，不跟随重定向。没有普通 Agent challenge/password/raw 操作，错误不触发 v1 回退。`protected_supported=false` 仍是发行状态。
+Linux v2 请使用仓库 `skills/anp-keyd/SKILL.md`、`adapters/keyd-v2.mjs` 或 `mcp --config`。必须提供管理员配置、grant 和持久 request_id；收到签名后按规范化 URL 与原 body 发送，不跟随重定向。没有普通 Agent challenge/password/raw 操作，错误不触发 v1 回退。正式 Linux 构建且配置 `linux-protected-v1` 时 `protected_supported=true`，其他模式为 false。
 
 以下保留旧开发模式接入说明，同 UID 不提供私钥隔离。
 

@@ -5,7 +5,7 @@ description: 使用本机 anp-keyd 的 v2 有限授权签署 did:wba HTTP 请求
 
 # anp-keyd
 
-Linux v2 通过独立 OS UID 认证主体，daemon 执行 exact-key grant、目标策略、期限、次数、撤销和持久请求去重。`protected_supported=false` 仍是发布门禁；不能把容器测试当作完成 systemd 主机验收。同 UID 开发模式不提供抵御任意代码的私钥隔离。
+Linux v2 通过独立 OS UID 认证主体，daemon 执行 exact-key grant、目标策略、期限、次数、撤销和持久请求去重。实际 systemd 主机验收已通过；仅正式 Linux 构建且 root 配置为 `linux-protected-v1` 时 `protected_supported=true`，旧 preview、调试、macOS 及敏感测试特性均为 false。同 UID 开发模式不提供抵御任意代码的私钥隔离。
 
 ## 普通 Agent 工作流
 

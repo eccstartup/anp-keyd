@@ -1,5 +1,5 @@
 [Unit]
-Description=ANP transaction signing service (release acceptance pending)
+Description=ANP transaction signing service
 After=local-fs.target systemd-tmpfiles-setup.service
 
 [Service]
