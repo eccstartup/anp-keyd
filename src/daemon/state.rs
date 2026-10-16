@@ -84,11 +84,12 @@ pub struct Vault {
     /// 哪一把"会取决于解锁的先后顺序 —— 那种不确定性最后会变成"同一份
     /// 请求有时验得过有时验不过"。
     unlocked: BTreeMap<String, Unlocked>,
+    generation: u64,
 }
 
 impl Vault {
     fn new(layout: KeydLayout) -> Self {
-        Self { layout, unlocked: BTreeMap::new() }
+        Self { layout, unlocked: BTreeMap::new(), generation: 0 }
     }
 
     pub fn layout(&self) -> &KeydLayout {
@@ -130,40 +131,6 @@ impl Vault {
             .collect()
     }
 
-    /// 解开一个信封并留在内存里。口令在这里用完就擦。
-    ///
-    /// `kid` 是 **fragment**(`key-2`);不给就按 [`store::resolve`] 的规则选,
-    /// 也就是绑定密钥优先。`unlocked` 的键是完整的 `did#fragment`。
-    fn unlock(
-        &mut self,
-        did: &str,
-        kid: Option<&str>,
-        passphrase: Zeroizing<String>,
-    ) -> Result<()> {
-        let wrapped = store::resolve(&self.layout, did, kid)?;
-        let resident = wrapped.id.kid.clone();
-
-        if self.unlocked.contains_key(&resident) {
-            // 已经开着。再解一次是合法的(比如用户想确认口令还记不记得),
-            // 但没必要为了这个再跑一遍 Argon2id。
-            return Ok(());
-        }
-
-        // device.secret **每次解锁现读**,不缓存。缓存它就意味着"零个用户
-        // 解锁时进程内存里什么都没有"这句话不成立 —— 而那句话是这个设计
-        // 的核心承诺之一,不值得为省一次文件读而破掉。
-        let device_secret = device::load(&self.layout)?;
-
-        let key = crate::keystore::unwrap::unlock(&wrapped, passphrase.as_bytes(), &device_secret)?;
-
-        let now = Instant::now();
-        self.unlocked.insert(
-            resident,
-            Unlocked { key, unlocked_at: now, last_used: now },
-        );
-        Ok(())
-    }
-
     /// 锁上。返回被放掉了几把。
     ///
     /// `did == None` 是"全锁"。**这个动作不报错**:锁一个本来就没解锁的
@@ -176,6 +143,11 @@ impl Vault {
     /// `kid` 是 **fragment**(`key-2`),和 `--kid`、和线上协议一致;`unlocked`
     /// 的键是完整的 `did#fragment`,拼接在这里做一次。
     fn lock(&mut self, did: Option<&str>, kid: Option<&str>) -> usize {
+        // Even locking an absent key cancels every older in-flight unlock.
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("vault generation exhausted");
         match did {
             None => {
                 let count = self.unlocked.len();
@@ -388,7 +360,45 @@ impl DaemonState {
         kid: Option<&str>,
         passphrase: Zeroizing<String>,
     ) -> Result<()> {
-        self.with_vault(uid, |vault| vault.unlock(did, kid, passphrase))
+        self.unlock_guarded(uid, did, kid, passphrase, || Ok(()))
+    }
+
+    pub(crate) fn unlock_guarded(
+        &self,
+        uid: u32,
+        did: &str,
+        kid: Option<&str>,
+        passphrase: Zeroizing<String>,
+        before_install: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let (generation, wrapped, device_secret) = self.with_vault(uid, |vault| {
+            let wrapped = store::resolve(&vault.layout, did, kid)?;
+            let secret = device::load(&vault.layout)?;
+            Ok((vault.generation, wrapped, secret))
+        })?;
+        // Expensive derivation must not hold the vault mutex: LOCK can cancel it.
+        let key = crate::keystore::unwrap::unlock(&wrapped, passphrase.as_bytes(), &device_secret)?;
+        before_install()?;
+        self.with_vault(uid, |vault| {
+            if vault.generation != generation {
+                return Err(KeydError::Locked);
+            }
+            // A concurrent lifecycle file replacement must not install an old key.
+            let current = store::resolve(&vault.layout, did, kid)?;
+            if serde_json::to_vec(&current)? != serde_json::to_vec(&wrapped)? {
+                return Err(KeydError::Locked);
+            }
+            let now = Instant::now();
+            vault.unlocked.insert(
+                wrapped.id.kid.clone(),
+                Unlocked {
+                    key,
+                    unlocked_at: now,
+                    last_used: now,
+                },
+            );
+            Ok(())
+        })
     }
 
     pub fn lock(&self, uid: u32, did: Option<&str>, kid: Option<&str>) -> Result<usize> {
@@ -648,6 +658,34 @@ mod tests {
                 nonce: None,
             }
         }
+    }
+
+    #[test]
+    fn lock_cancels_derived_key_before_installation() {
+        let f = Fixture::new(SigningGates::new(false, false));
+        let result =
+            f.state
+                .unlock_guarded(501, &f.did, None, Zeroizing::new(PASSPHRASE.into()), || {
+                    assert_eq!(f.state.lock(501, None, None).unwrap(), 0);
+                    Ok(())
+                });
+        assert!(matches!(result, Err(KeydError::Locked)));
+        assert!(f.state.status(501).unwrap().is_empty());
+        f.unlock();
+        assert_eq!(f.state.status(501).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn emergency_lock_cancels_derived_key_before_installation() {
+        let f = Fixture::new(SigningGates::new(false, false));
+        let result =
+            f.state
+                .unlock_guarded(501, &f.did, None, Zeroizing::new(PASSPHRASE.into()), || {
+                    f.state.lock_everything();
+                    Ok(())
+                });
+        assert!(matches!(result, Err(KeydError::Locked)));
+        assert!(f.state.status(501).unwrap().is_empty());
     }
 
     #[test]

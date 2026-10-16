@@ -26,9 +26,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub struct Boundary {
     config: ServiceConfig,
     vaults: BTreeMap<String, DaemonState>,
-    // Management operations serialize, including KDF, so LOCK_ALL cannot be
-    // acknowledged while an older unlock can still install a key.
+    // State changes serialize; KDF has a separate, non-queueing single slot.
+    // Vault generation checks cancel unlocks that overlap LOCK_ALL.
     admin_gate: Mutex<()>,
+    kdf_gate: Mutex<()>,
     database: Mutex<Database>,
     stopped: AtomicBool,
 }
@@ -55,6 +56,7 @@ impl Boundary {
             config,
             vaults,
             admin_gate: Mutex::new(()),
+            kdf_gate: Mutex::new(()),
             database: Mutex::new(database),
             stopped: AtomicBool::new(false),
         })
@@ -181,9 +183,21 @@ impl Boundary {
         if matches!(request, AdminRequest::Capabilities {}) {
             return self.capabilities(None);
         }
-        let Ok(_guard) = self.admin_gate.lock() else {
-            self.lock_all();
-            return Reply::code("RESOURCE_BUSY");
+        // Never queue a second KDF on the remaining admin connection slot.
+        // This leaves capacity for a concurrent LOCK_ALL.
+        let _guard = if matches!(request, AdminRequest::Unlock { .. }) {
+            match self.kdf_gate.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => return Reply::code("RESOURCE_BUSY"),
+            }
+        } else {
+            match self.admin_gate.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    self.emergency();
+                    return Reply::code("RESOURCE_BUSY");
+                }
+            }
         };
         match request {
             AdminRequest::Capabilities {} => unreachable!(),
@@ -289,8 +303,19 @@ impl Boundary {
                 else {
                     return Reply::code("KEY_NOT_FOUND");
                 };
-                let outcome =
-                    state.unlock(self.config.service_uid, &did, Some(fragment), passphrase);
+                let outcome = state.unlock_guarded(
+                    self.config.service_uid,
+                    &did,
+                    Some(fragment),
+                    passphrase,
+                    || {
+                        if self.stopped.load(Ordering::SeqCst) {
+                            Err(KeydError::Locked)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                );
                 if !self.record(json!({"event":if outcome.is_ok() {"UNLOCKED"} else {"UNLOCK_REFUSED"},"actor":actor,"vault_id":vault_id,"kid":kid})) {
                     return Reply::code("AUDIT_UNAVAILABLE");
                 }
