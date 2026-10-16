@@ -78,7 +78,8 @@ fn help_template() -> String {
          Commands:\n\
          \n\
          \x20 serve               Run the daemon: answer signing requests over a Unix socket.\n\
-         \x20 serve-protected     Linux boundary preview (signing unavailable).\n\
+         \x20 serve-protected     Linux v2 transaction signer (release acceptance pending).\n\
+         \x20 inspect-vault       Inspect legacy inventory; --verify tests recovery via tty.\n\
          \x20 data                Send a protected v2 request from --file through trusted config.\n\
          \x20 admin               Use the independent Linux management channel.\n\
          \x20 init-protected-state  Initialize a NEW service database explicitly.\n\
@@ -142,9 +143,16 @@ fn help_template() -> String {
 /// 说明。所以这里可以继续用中文记理由,用户看不到。)
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Read-only legacy inventory; --verify opens every key and tests recovery via tty.
+    InspectVault {
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long)]
+        verify: bool,
+    },
     /// Run the daemon: answer signing requests over a Unix socket.
     Serve(ServeArgs),
-    /// Linux boundary preview; signing is unavailable until grant enforcement ships.
+    /// Linux v2 transaction signer; protected release acceptance remains separate.
     ServeProtected(ProtectedArgs),
     /// Explicit one-time SQLite initialization, as the dedicated service UID.
     InitProtectedState(ProtectedArgs),
@@ -269,6 +277,13 @@ pub struct AdminArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum AdminCommand {
+    /// Complete one exact prepared awiki registration proof (root locks on return).
+    CompleteRegistration {
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        digest: String,
+    },
     ListPrincipals,
     Catalog,
     /// Prepare a typed management change from a public JSON file. No passwords or seeds.
@@ -807,6 +822,13 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Serve(args) => serve(root, args),
         Command::Stop => stop(root),
         Command::Keygen(args) => keygen(root, args),
+        Command::InspectVault { path, verify } => {
+            if root.is_some() {
+                return Err(KeydError::Misuse("inspect-vault uses --path, not --root".into()));
+            }
+            println!("{}", serde_json::to_string_pretty(&crate::security::migration::inspect(&path, verify)?)?);
+            Ok(())
+        }
         Command::Spec(args) => write_spec(root, args),
         Command::Publish(args) => publish(root, args),
         Command::VerifyDoc(args) => verify_doc(root, args),
@@ -918,6 +940,11 @@ pub fn run(cli: Cli) -> Result<()> {
                     digest,
                 } => client.commit(operation_id, digest)?,
                 AdminCommand::Status => client.capabilities()?,
+                AdminCommand::CompleteRegistration { operation_id, digest } => {
+                    let tty = crate::tty::open()?;
+                    let secret = crate::tty::read_secret(&tty, "Registration root passphrase: ")?;
+                    AdminClient::connect(&args.config, true)?.complete_registration(operation_id, digest, secret)?
+                }
                 AdminCommand::LockAll => client.lock_all()?,
                 AdminCommand::Unlock { vault_id, did, kid } => {
                     // Preflight before prompting; reconnect and authenticate again before sending.
@@ -1107,6 +1134,7 @@ fn serve_here(layout: &KeydLayout, args: ServeArgs, sock_path: PathBuf) -> Resul
         return Err(KeydError::Misuse("raw/challenge signing requires --development and cannot use --system".into()));
     }
     layout.ensure()?;
+    let _maintenance = crate::security::paths::legacy_lease(layout.root())?;
     crate::daemon::service::install_logging()?;
     tracing::warn!("legacy development mode: no grant enforcement or same-UID Agent isolation");
     if args.allow_raw_signing || args.allow_challenge_signing {

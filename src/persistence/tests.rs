@@ -1858,3 +1858,111 @@ fn cached_signature_uses_actual_short_window_after_wall_clock_jump() {
         .result
         .is_none());
 }
+
+#[test]
+fn migration_inspection_rejects_links_and_missing_or_substituted_documents() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let mut f = Fixture::new();
+    let (vault, did, _) = vault_fixture(&mut f);
+    let path = f.dir.join("vaults").join(vault);
+    let report = crate::security::migration::inspect(&path, false).unwrap();
+    assert_eq!(report["recovery_verified"], false);
+    assert_eq!(report["keys"][0]["role"], "unclassified");
+    let layout = crate::keystore::layout::KeydLayout::at(path.clone());
+    let document = layout.did_path(&did);
+    let bytes = std::fs::read(&document).unwrap();
+    std::fs::remove_file(&document).unwrap();
+    assert!(crate::security::migration::inspect(&path, false).is_err());
+    let other = f.dir.join("other.json");
+    std::fs::write(&other, bytes).unwrap();
+    symlink(&other, &document).unwrap();
+    assert!(crate::security::migration::inspect(&path, false).is_err());
+    std::fs::remove_file(&document).unwrap();
+    std::fs::rename(other, document).unwrap();
+    std::fs::set_permissions(
+        path.join("device.secret"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert!(crate::security::migration::inspect(&path, false).is_err());
+}
+
+#[test]
+fn registration_is_exact_root_only_single_use_and_commits_audit_before_release() {
+    use catalog::*;
+    let mut f = Fixture::new();
+    let (vault, did, _) = vault_fixture(&mut f);
+    apply_change(
+        &mut f,
+        CatalogChange::EnrollVault {
+            vault_id: vault.clone(),
+        },
+    );
+    let root = f.db.catalog().unwrap().keys.remove(0);
+    let change = |challenge: &str| Change::RegistrationChallenge {
+        key_id: root.key_id.clone(),
+        origin: "https://example.com".into(),
+        challenge: challenge.into(),
+    };
+    let challenge = "0123456789abcdef0123456789abcdef";
+    assert!(f.db.prepare(1002, change(challenge), now()).is_err());
+    apply_change(
+        &mut f,
+        CatalogChange::ConfirmRole {
+            key_id: root.key_id.clone(),
+            role: KeyRole::Root,
+        },
+    );
+    for bad in ["", "0123456789abcdef", &"a".repeat(64), &"A".repeat(32)] {
+        assert!(f.db.prepare(1002, change(bad), now()).is_err());
+    }
+    let p = f.db.prepare(1002, change(challenge), now()).unwrap();
+    assert!(f
+        .db
+        .commit(1002, &p.operation_id, &p.digest, now())
+        .is_err());
+    assert!(f
+        .db
+        .complete_registration(1003, &p.operation_id, &p.digest, now(), "test-pass")
+        .is_err());
+    assert!(f
+        .db
+        .complete_registration(1002, &p.operation_id, &p.digest, now(), "wrong")
+        .is_err());
+    let result =
+        f.db.complete_registration(1002, &p.operation_id, &p.digest, now(), "test-pass")
+            .unwrap();
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(result["challenge_signature"].as_str().unwrap())
+        .unwrap();
+    let layout = crate::keystore::layout::KeydLayout::at(f.dir.join("vaults").join(&vault));
+    let wrapped = crate::keystore::store::resolve(&layout, &did, None).unwrap();
+    let key = crate::keystore::unwrap::unlock(
+        &wrapped,
+        b"test-pass",
+        &crate::keystore::device::load(&layout).unwrap(),
+    )
+    .unwrap();
+    assert!(key.verify(challenge.as_bytes(), &bytes.try_into().unwrap()));
+    assert!(f
+        .db
+        .complete_registration(1002, &p.operation_id, &p.digest, now(), "test-pass")
+        .is_err());
+    let p = f.db.prepare(1002, change(challenge), now()).unwrap();
+    f.db.connection.execute_batch("CREATE TRIGGER fail_registration_audit BEFORE INSERT ON audit_events BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
+    assert!(f
+        .db
+        .complete_registration(1002, &p.operation_id, &p.digest, now(), "test-pass")
+        .is_err());
+    assert_eq!(
+        f.db.connection
+            .query_row(
+                "SELECT state FROM admin_operations WHERE operation_id=?",
+                [p.operation_id],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "prepared"
+    );
+}

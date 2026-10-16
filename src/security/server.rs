@@ -148,7 +148,10 @@ impl Boundary {
                     Reply::code("PROTOCOL_VERSION_UNSUPPORTED")
                 }
                 Ok(request) => {
-                    let secret = if matches!(request.request, AdminRequest::Unlock { .. }) {
+                    let secret = if matches!(
+                        request.request,
+                        AdminRequest::Unlock { .. } | AdminRequest::CompleteRegistration { .. }
+                    ) {
                         match protocol::read_secret(&mut io) {
                             Ok(secret) => Some(secret),
                             Err(_) => {
@@ -362,7 +365,10 @@ impl Boundary {
         }
         // Never queue a second KDF on the remaining admin connection slot.
         // This leaves capacity for a concurrent LOCK_ALL.
-        let unlocking = matches!(request, AdminRequest::Unlock { .. });
+        let unlocking = matches!(
+            request,
+            AdminRequest::Unlock { .. } | AdminRequest::CompleteRegistration { .. }
+        );
         let _kdf_guard = if unlocking {
             match self.kdf_gate.try_lock() {
                 Ok(guard) => Some(guard),
@@ -385,6 +391,44 @@ impl Boundary {
             return Reply::code("AUDIT_UNAVAILABLE");
         }
         match request {
+            AdminRequest::CompleteRegistration {
+                operation_id,
+                digest,
+            } => {
+                let Some(secret) = secret else {
+                    return Reply::code("PROTOCOL_INVALID");
+                };
+                // The one-shot KDF has no queue. Management serialization keeps
+                // the approval, key snapshot and signature in a single order.
+                let result = (|| -> Result<serde_json::Value> {
+                    let _gate = self.admin_gate.enter(true)?;
+                    let mut db = self
+                        .database
+                        .lock()
+                        .map_err(|_| KeydError::Protocol("PERSISTENCE_UNAVAILABLE".into()))?;
+                    db.complete_registration(
+                        actor,
+                        &operation_id,
+                        &digest,
+                        SystemClock.now()?,
+                        &secret,
+                    )
+                })();
+                match result {
+                    Ok(data) => {
+                        let mut reply = Reply::code("OK");
+                        reply.data = Some(data);
+                        reply
+                    }
+                    Err(KeydError::Misuse(_)) | Err(KeydError::BadPassphrase) => {
+                        Reply::code("ADMIN_OPERATION_INVALID")
+                    }
+                    Err(_) => {
+                        self.emergency();
+                        Reply::code("AUDIT_UNAVAILABLE")
+                    }
+                }
+            }
             AdminRequest::Capabilities {} => unreachable!(),
             AdminRequest::Catalog {} => {
                 let result = self

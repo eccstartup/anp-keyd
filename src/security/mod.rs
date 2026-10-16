@@ -9,6 +9,7 @@ pub mod server;
 mod coordinator;
 pub(crate) mod executor;
 pub mod limits;
+pub mod migration;
 
 use crate::error::{KeydError, Result};
 use std::io::{Read, Write};

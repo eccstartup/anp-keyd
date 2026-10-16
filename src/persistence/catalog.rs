@@ -219,7 +219,7 @@ pub(super) fn get_key(db: &Connection, key: &str) -> Result<KeyRecord> {
         Ok(KeyRecord { key_id:r.get(0)?,vault_id:r.get(1)?,did:r.get(2)?,kid:r.get(3)?,role,envelope_digest:r.get(5)?,document_digest:r.get(6)?,state:r.get(7)?,identity_epoch:r.get(8)?,generation:r.get(9)? })
     }).optional().map_err(db_error)?.ok_or_else(invalid)
 }
-fn validate_key(root: &Path, record: &KeyRecord) -> Result<()> {
+pub(super) fn validate_key(root: &Path, record: &KeyRecord) -> Result<()> {
     let layout = layout(root, &record.vault_id)?;
     let fragment = record
         .kid

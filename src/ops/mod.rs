@@ -51,6 +51,7 @@ use crate::tty;
 /// 里悄悄改身份;没有审计的迁移等于事后说不清"这台机器上这把身份是什么
 /// 时候变成那样的"。
 pub struct Session {
+    _maintenance: nix::fcntl::Flock<std::fs::File>,
     pub layout: KeydLayout,
     tty: std::fs::File,
     audit: AuditLog,
@@ -64,8 +65,9 @@ impl Session {
         };
         crate::security::paths::deny_managed_directory(layout.root())?;
         layout.ensure()?;
+        let maintenance = crate::security::paths::legacy_lease(layout.root())?;
         let audit = AuditLog::open(&layout.audit_dir())?;
-        let session = Self { layout, tty: tty::open()?, audit };
+        let session = Self { layout, tty: tty::open()?, audit, _maintenance: maintenance };
 
         // 上次导出过就在这里说一句。
         //

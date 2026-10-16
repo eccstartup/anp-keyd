@@ -102,6 +102,33 @@ pub fn instance_lock(state: &Path, service_uid: u32) -> Result<nix::fcntl::Flock
         .map_err(|_| KeydError::Misuse("another service holds the state lock".into()))
 }
 
+/// Legacy writers and daemons hold a shared maintenance lease. Offline cutover
+/// requires its exclusive counterpart and therefore cannot race this version.
+pub fn legacy_lease(root: &Path) -> Result<nix::fcntl::Flock<std::fs::File>> {
+    deny_managed_directory(root)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(root.join(".maintenance.lock"))?;
+    let meta = file.metadata()?;
+    if !meta.is_file()
+        || meta.nlink() != 1
+        || meta.uid() != crate::daemon::self_uid()
+        || meta.mode() & 0o777 != 0o600
+    {
+        return Err(denied(root));
+    }
+    let lease = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockSharedNonblock)
+        .map_err(|_| KeydError::Misuse("vault is in offline maintenance".into()))?;
+    // The marker may have appeared while waiting for or opening the lock.
+    deny_managed_directory(root)?;
+    Ok(lease)
+}
+
 /// Legacy local commands must never act as a maintenance backdoor into a
 /// managed vault, including when --root uses a symlink or a relative spelling.
 pub fn deny_managed_directory(path: &Path) -> Result<()> {

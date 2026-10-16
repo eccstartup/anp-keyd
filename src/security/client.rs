@@ -142,6 +142,29 @@ impl Client {
         self.reply()
     }
 
+    pub fn complete_registration(
+        mut self,
+        operation_id: String,
+        digest: String,
+        secret: Zeroizing<String>,
+    ) -> Result<Reply> {
+        self.management()?;
+        self.stream.reset(Duration::from_secs(5));
+        protocol::write(
+            &mut self.stream,
+            &Envelope {
+                version: VERSION,
+                request: AdminRequest::CompleteRegistration {
+                    operation_id,
+                    digest,
+                },
+            },
+        )?;
+        protocol::write_secret(&mut self.stream, &secret)?;
+        self.stream.reset(Duration::from_secs(30));
+        self.reply()
+    }
+
     pub fn unlock(
         mut self,
         vault_id: String,

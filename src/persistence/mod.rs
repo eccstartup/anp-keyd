@@ -31,14 +31,33 @@ const GENESIS: &str = "000000000000000000000000000000000000000000000000000000000
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum Change {
-    RegisterPrincipal { uid: u32 },
-    DisablePrincipal { principal_id: String },
-    Catalog { change: catalog::CatalogChange },
-    Grant { change: grants::GrantChange },
+    /// Exact awiki registration proof, authorized only through management.
+    RegistrationChallenge {
+        key_id: String,
+        origin: String,
+        challenge: String,
+    },
+    RegisterPrincipal {
+        uid: u32,
+    },
+    DisablePrincipal {
+        principal_id: String,
+    },
+    Catalog {
+        change: catalog::CatalogChange,
+    },
+    Grant {
+        change: grants::GrantChange,
+    },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 enum Resolved {
+    RegistrationChallenge {
+        key: Box<catalog::KeyRecord>,
+        origin: String,
+        challenge: String,
+    },
     Grant {
         effect: grants::Effect,
     },
@@ -319,6 +338,29 @@ impl Database {
             }
         }
         for id in &config.vault_ids {
+            // A new vault is introduced only by the root-owned deployment
+            // configuration while the service is offline. Validate its complete
+            // public inventory, then bind registration and audit in this recovery
+            // transaction. The migration tool never edits SQLite directly.
+            let exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM vaults WHERE vault_id=?1)",
+                    [id],
+                    |r| r.get(0),
+                )
+                .map_err(db_error)?;
+            if !exists {
+                let inspection = crate::security::migration::inspect(&config.vault(id)?, false)?;
+                tx.execute(
+                    "INSERT INTO vaults VALUES(?1,?2,'active')",
+                    params![id, format!("vaults/{id}")],
+                )
+                .map_err(db_error)?;
+                append(
+                    &tx,
+                    &json!({"event":"MIGRATED_VAULT_REGISTERED","vault_id":id,"inspection":inspection}),
+                )?;
+            }
             let relative: String = tx
                 .query_row(
                     "SELECT relative_path FROM vaults WHERE vault_id=?1 AND state='active'",
@@ -398,6 +440,38 @@ impl Database {
             .map_err(db_error)?;
         let root = self.root.clone();
         let resolved = match change {
+            Change::RegistrationChallenge {
+                key_id,
+                origin,
+                challenge,
+            } => {
+                let key = catalog::get_key(&tx, &key_id)?;
+                catalog::validate_key(&root, &key)?;
+                let target = crate::security::http::CanonicalHttpRequest::new(
+                    crate::security::http::HttpRequest {
+                        method: "POST".into(),
+                        url: format!("{origin}/"),
+                        headers: Default::default(),
+                        body: crate::security::http::Body::Absent {},
+                        nonce: None,
+                    },
+                )?;
+                if key.state != "active"
+                    || key.role != catalog::KeyRole::Root
+                    || target.origin() != origin
+                    || challenge.len() != 32
+                    || !challenge
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    return Err(invalid());
+                }
+                Resolved::RegistrationChallenge {
+                    key: Box::new(key),
+                    origin,
+                    challenge,
+                }
+            }
             Change::Grant { change } => Resolved::Grant {
                 effect: grants::resolve(&tx, &root, change, self.boot_epoch, now)?,
             },
@@ -513,6 +587,32 @@ impl Database {
         digest: &str,
         now: Time,
     ) -> Result<()> {
+        self.commit_secret(actor, operation_id, digest, now, None)
+            .map(|_| ())
+    }
+
+    /// One-shot registration. Root is decrypted transiently, never installed in
+    /// the data-plane vault. Return only after the operation and audit commit.
+    pub fn complete_registration(
+        &mut self,
+        actor: u32,
+        operation_id: &str,
+        digest: &str,
+        now: Time,
+        secret: &str,
+    ) -> Result<Value> {
+        self.commit_secret(actor, operation_id, digest, now, Some(secret))?
+            .ok_or_else(invalid)
+    }
+
+    fn commit_secret(
+        &mut self,
+        actor: u32,
+        operation_id: &str,
+        digest: &str,
+        now: Time,
+        secret: Option<&str>,
+    ) -> Result<Option<Value>> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -527,7 +627,41 @@ impl Database {
         if actual != digest {
             return Err(invalid());
         }
+        let mut result = None;
+        // A credential-bearing commit cannot be used for unrelated operations.
+        if secret.is_some() != matches!(&resolved, Resolved::RegistrationChallenge { .. }) {
+            return Err(invalid());
+        }
         match resolved {
+            Resolved::RegistrationChallenge {
+                key,
+                origin,
+                challenge,
+            } => {
+                use crate::sign::Signer;
+                use base64::Engine;
+                if catalog::get_key(&tx, &key.key_id)? != *key {
+                    return Err(invalid());
+                }
+                catalog::validate_key(&self.root, &key)?;
+                let layout = crate::keystore::layout::KeydLayout::at(
+                    self.root.join("vaults").join(&key.vault_id),
+                );
+                let fragment = key
+                    .kid
+                    .strip_prefix(&format!("{}#", key.did))
+                    .ok_or_else(invalid)?;
+                let wrapped = crate::keystore::store::resolve(&layout, &key.did, Some(fragment))?;
+                let signer = crate::keystore::unwrap::unlock(
+                    &wrapped,
+                    secret.ok_or_else(invalid)?.as_bytes(),
+                    &crate::keystore::device::load(&layout)?,
+                )?;
+                let signature = signer.sign(challenge.as_bytes())?;
+                result = Some(
+                    json!({"kid":key.kid,"origin":origin,"challenge_signature":base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature)}),
+                );
+            }
             Resolved::Grant { effect } => {
                 grants::apply(&tx, &self.root, effect, self.boot_epoch, now)?
             }
@@ -566,7 +700,8 @@ impl Database {
             &tx,
             &json!({"event":"OPERATION_COMMITTED","actor":actor,"operation_id":operation_id,"digest":digest}),
         )?;
-        tx.commit().map_err(db_error)
+        tx.commit().map_err(db_error)?;
+        Ok(result)
     }
 
     pub fn catalog(&self) -> Result<catalog::Catalog> {
