@@ -4,12 +4,10 @@ Requires the explicitly provisioned accounts and root. Never touches the running
 installation's state, keys, configuration or launchd job. No new accounts created.
 """
 import argparse
-import ctypes
 import json
 import os
 from pathlib import Path
 import pwd
-import shutil
 import socket
 import subprocess
 import sys
@@ -23,13 +21,28 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=Path('/Library/ANPKeyd/service.json'))
     parser.add_argument('--binary', type=Path, default=Path('/Library/ANPKeyd/bin/anp-keyd'))
+    parser.add_argument('--signing-helper', type=Path, help='digest-pinned local-preview-fixture example; enables full temporary signing checks')
+    parser.add_argument('--helper-sha256')
+    parser.add_argument('--interactive-ui', action='store_true', help='human window checks: cancel, 120-second timeout, masked temporary-password unlock')
+    parser.add_argument('--container-regression', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
     args.config = args.config.absolute()
     args.binary = args.binary.absolute()
-    if sys.platform != 'darwin' or os.geteuid() != 0:
-        raise ValueError('requires macOS root; run in the human terminal')
+    if args.signing_helper:
+        args.signing_helper = args.signing_helper.absolute()
+    elif args.interactive_ui or args.helper_sha256:
+        raise ValueError('UI/digest options require --signing-helper')
+    portable = args.container_regression
+    if os.geteuid() != 0:
+        raise ValueError('requires root; run in the human terminal')
+    if portable:
+        if sys.platform != 'linux' or not Path('/.dockerenv').exists() or args.interactive_ui:
+            raise ValueError('container regression requires disposable root Linux Docker without UI')
+    elif sys.platform != 'darwin':
+        raise ValueError('requires macOS')
     installed = json.loads(args.config.read_text())
-    if installed['mode'] != 'macos-boundary-preview' or not installed['principals']:
+    expected_mode = 'linux-boundary-preview' if portable else 'macos-boundary-preview'
+    if installed['mode'] != expected_mode or not installed['principals']:
         raise ValueError('requires a configured macOS preview with an Agent')
     service = pwd.getpwuid(installed['service_uid'])
     admin = pwd.getpwuid(installed['admin_uids'][0])
@@ -44,7 +57,11 @@ def main():
     def run(user, *command):
         return subprocess.run(list(map(str, command)), preexec_fn=identity(user),
                               env=env, capture_output=True, text=True, timeout=15, cwd="/")
-    with tempfile.TemporaryDirectory(prefix='ANPKeydChecks-', dir='/Library') as directory:
+    parent = '/tmp' if portable else '/Library'
+    if portable:
+        parent = '/keyd-checks'
+        Path(parent).mkdir(mode=0o755, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='ANPKeydChecks-', dir=parent) as directory:
         base = Path(directory)
         base.chmod(0o755)
         config = {**installed, 'instance_id': str(uuid.uuid4()), 'vault_ids': [],
@@ -57,6 +74,10 @@ def main():
             path.mkdir()
             os.chown(path, service.pw_uid, gid)
             path.chmod(mode)
+        fixture = None
+        if args.signing_helper:
+            import acceptance_signing
+            fixture = acceptance_signing.prepare(base, config, args, admin, service, run)
         path = base / 'service.json'
         path.write_text(json.dumps(config))
         path.chmod(0o644)
@@ -93,6 +114,10 @@ def main():
             assert result.returncode == 0, result.stderr
             first = json.loads(result.stdout)
             assert first['instance_id'] == config['instance_id'] and not first['protected_supported']
+            checks = None
+            if fixture:
+                checks = acceptance_signing.Checks(base, config, path, args, fixture, admin, agent, identity, env, cli)
+                checks.before_restart()
             # task_for_pid queries a task port, never attaches a debugger or reads
             # memory. Root performs only the UID switch; the Agent makes the call.
             script = '''import ctypes,sys
@@ -106,9 +131,12 @@ if status == 0:
  sys.exit('Agent obtained daemon task port')
 print('task_for_pid denied')
 '''
-            result = run(agent, '/usr/bin/python3', '-I', '-c', script, process.pid)
-            assert result.returncode == 0 and 'task_for_pid denied' in result.stdout, result.stderr
-            print('PASS independent Agent UID cannot obtain daemon task port', flush=True)
+            if not portable:
+                result = run(agent, '/usr/bin/python3', '-I', '-c', script, process.pid)
+                assert result.returncode == 0 and 'task_for_pid denied' in result.stdout, result.stderr
+                print('PASS independent Agent UID cannot obtain daemon task port', flush=True)
+            else:
+                print('SKIP macOS task-port probe in Linux container regression', flush=True)
             stop(process)
             process = None
             assert not Path(config['admin_socket']).exists()
@@ -116,6 +144,15 @@ print('task_for_pid denied')
             second = json.loads(cli(admin, 'status').stdout)
             assert second['boot_epoch'] > first['boot_epoch']
             print('PASS graceful shutdown cleans sockets; restart advances boot epoch', flush=True)
+            if checks:
+                checks.after_restart()
+                checks.arm_crash()
+                process.kill()
+                process.wait(timeout=10)
+                process = None
+                process = start()
+                checks.after_restart(interactive=False)
+                print('PASS abrupt process death also revokes active grants, suppresses cached results and locks keys', flush=True)
             stop(process)
             process = None
             # Forge the expected filesystem UID/group/mode, but keep the listener

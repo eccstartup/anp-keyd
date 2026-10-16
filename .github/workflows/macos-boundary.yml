@@ -1,9 +1,9 @@
 name: macOS local boundary preview
 on:
   push:
-    paths: ['src/**', 'tests/**', 'deploy/macos/**', 'Cargo.*', '.github/workflows/macos-boundary.yml']
+    paths: ['src/**', 'tests/**', 'examples/**', 'deploy/macos/**', 'Cargo.*', '.github/workflows/macos-boundary.yml']
   pull_request:
-    paths: ['src/**', 'tests/**', 'deploy/macos/**', 'Cargo.*', '.github/workflows/macos-boundary.yml']
+    paths: ['src/**', 'tests/**', 'examples/**', 'deploy/macos/**', 'Cargo.*', '.github/workflows/macos-boundary.yml']
 permissions:
   contents: read
 jobs:
@@ -26,3 +26,16 @@ jobs:
         run: |
           cargo build --locked --release --features mcp
           target/release/anp-keyd build-info | python3 -c 'import json,sys; i=json.load(sys.stdin); assert i["release"] and not i["protected_supported"] and not i["seed_export"] and not i["hardware_software"]'
+
+  signing-harness-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Exercise temporary signing harness in disposable Linux domain
+        run: >-
+          docker run --rm -v "$GITHUB_WORKSPACE:/src:ro" -w /src
+          rust:1.90-bookworm@sha256:3914072ca0c3b8aad871db9169a651ccfce30cf58303e5d6f2db16d1d8a7e58f
+          bash deploy/macos/test-signing-container.sh

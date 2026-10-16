@@ -195,3 +195,47 @@ full isolation/escape resistance. The restart check used empty state, so it does
 not verify macOS live grant/key invalidation. Interactive UI, temporary-key signing,
 cross-principal grants and full reboot acceptance remain pending; macOS continues
 to report `protected_supported=false`.
+
+
+## Full temporary-key and native UI acceptance
+
+Build the test-only fixture/verifier example as the human user (never use its
+fixed public password/reduced KDF for real identities):
+
+```sh
+cargo build --locked --release --example local-preview-fixture
+shasum -a 256 target/release/examples/local-preview-fixture
+sudo /usr/bin/python3 deploy/macos/test-runtime.py \
+  --signing-helper "$PWD/target/release/examples/local-preview-fixture" \
+  --helper-sha256 VERIFIED_HELPER_SHA256 --interactive-ui
+```
+
+The driver copies exactly the digest-checked helper into its new root-owned test
+directory, generates root/hot/next test keys, and provisions only that separate
+temporary service. It does not enroll keys into the installed launchd instance,
+change existing account memberships, or access real vaults. A second real OS UID
+(`nobody`) receives transport group access only in its temporary child process.
+Typed management operations confirm roles/policy/grants; there are no SQL shortcuts.
+Public generated signatures are verified independently with the upstream verifier,
+including rejection of a changed target URL. Checks cover cross-principal grants,
+request-ID conflicts, target policy, management-group bypass, revocation, graceful
+restart and abrupt process death with real loaded keys and active grants.
+
+`--interactive-ui` adds three human steps in the trusted login session:
+
+1. Inspect exact instance/vault/DID/key and click Cancel.
+2. Leave the next window untouched until its 120-second timeout.
+3. Enter **only** `temporary-boundary-test-secret` into the masked field, then
+   click Unlock. Confirm the displayed target/input masking in the terminal.
+
+The driver verifies that cancel and timeout leave the key locked, and only the
+successful native unlock enables signing with the fresh grant. No terminal secret
+fallback is allowed; fake-daemon and Agent-UID rejection happen before a window.
+Without `--interactive-ui`, only automated checks run. UI/key host results remain
+pending until this full command passes on macOS.
+
+The same non-UI signing orchestration was exercised in a disposable Rust 1.90
+Linux container using `test-signing-container.sh`; all checks passed. Its explicit
+container-only mode cannot run on an unmarked Linux host or claim macOS task-port
+or graphical UI acceptance. Strict all-target Clippy and local helper generation
+also passed. CI includes that orchestration regression.
