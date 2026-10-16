@@ -157,7 +157,8 @@ Apple references:
 Recorded 2026-10-16 before host installation: macOS default 494 tests, MCP 506
 tests, six installer policy tests, strict Clippy and local release build passed.
 Rust 1.90 Linux container regression passed 492 default tests, one explicit fixture
-generator and 124 boundary checks. Live macOS installation/UI checks remain pending.
+generator and 124 boundary checks. See the live installation results below;
+interactive UI and temporary-key signing checks remain pending.
 
 After installation, additional bounded runtime checks can be run separately:
 
@@ -178,5 +179,19 @@ Live installation evidence, 2026-10-16: operator setup reported administrator
 service authentication and UID 601 PTY/admin-socket/state-read denials. Independent
 read-only follow-up confirmed launchd `running` as UID 600, daemon `OK`,
 `boot_epoch=1`, and healthy audit projection. A subsequent bootstrap error 5 was
-a duplicate load; the existing job remained healthy. Extended runtime checks and
-interactive UI/key tests remain pending.
+a duplicate load; the existing job remained healthy.
+
+After fixes through `2d48025`, the operator reran both acceptance scripts and
+reported all checks passing: administrator service authentication; Agent PTY admin,
+state-read and admin-socket access denial; Agent task-port access denial; graceful
+socket cleanup and restart epoch advance; and rejection of a fake listener despite
+forged expected socket ownership/mode, with no request or secret bytes transmitted.
+The probes use `/usr/bin/python3 -I` from `/` so an inaccessible operator home or
+Conda interpreter cannot be mistaken for a security refusal. Earlier socket-denial
+results before this fix were superseded by the successful explicit permission probe.
+
+These are operator-executed host results. Task-port denial alone does not prove
+full isolation/escape resistance. The restart check used empty state, so it does
+not verify macOS live grant/key invalidation. Interactive UI, temporary-key signing,
+cross-principal grants and full reboot acceptance remain pending; macOS continues
+to report `protected_supported=false`.
