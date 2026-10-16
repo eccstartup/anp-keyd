@@ -30,7 +30,14 @@ def sync_dir(path):
 
 def atomic(path, data, mode=0o600):
     tmp = path.with_name('.' + path.name + '.new')
+    if tmp.exists() or tmp.is_symlink():
+        meta = tmp.lstat()
+        if not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.geteuid() or meta.st_nlink != 1 or meta.st_mode & 0o022:
+            raise RuntimeError('unsafe interrupted temporary file')
+        tmp.unlink()  # uncommitted temporary bytes; original file remains intact
+        sync_dir(path.parent)
     fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, mode)
+    os.fchmod(fd, mode)  # Caller umask must not make config/binary unreadable to service.
     with os.fdopen(fd, 'wb') as stream:
         stream.write(data)
         stream.flush()
@@ -55,23 +62,24 @@ def trusted(path, directory=True, owners=(0,)):
             raise RuntimeError(f'linked file: {node}')
 
 
-def inventory(source):
+def inventory(source, owners=None):
     """Only recovery materials; never follow symlinks or silently omit key files."""
     uid = source.lstat().st_uid
+    owners = (uid,) if owners is None else owners
     entries = [source / 'device.secret']
     for name in ('keys', 'dids', 'audit'):
         directory = source / name
         if not directory.exists() and name == 'audit':
             continue
         m = directory.lstat()
-        if not stat.S_ISDIR(m.st_mode) or m.st_uid != uid or m.st_mode & 0o077:
+        if not stat.S_ISDIR(m.st_mode) or m.st_uid not in owners or m.st_mode & 0o077:
             raise RuntimeError('unsafe source directory')
         entries.extend(sorted(directory.iterdir()))
     result = {}
     total = 0
     for path in entries:
         m = path.lstat()
-        if not stat.S_ISREG(m.st_mode) or m.st_uid != uid or m.st_nlink != 1 or m.st_mode & 0o022:
+        if not stat.S_ISREG(m.st_mode) or m.st_uid not in owners or m.st_nlink != 1 or m.st_mode & 0o022:
             raise RuntimeError(f'unsafe source file: {path}')
         if path.parent.name != 'dids' and m.st_mode & 0o077:
             raise RuntimeError(f'public recovery secret: {path}')
@@ -85,14 +93,23 @@ def inventory(source):
 
 
 def copy_checked(source, dest, manifest):
-    dest.mkdir(mode=0o700)
-    for folder in ('keys', 'dids', 'audit'):
-        (dest / folder).mkdir(mode=0o700)
+    dest.mkdir(mode=0o700, exist_ok=True)
+    for directory in [dest, *(dest / name for name in ('keys', 'dids', 'audit'))]:
+        directory.mkdir(mode=0o700, exist_ok=True)
+        meta = directory.lstat()
+        if not stat.S_ISDIR(meta.st_mode) or meta.st_uid != os.geteuid() or meta.st_mode & 0o077:
+            raise RuntimeError('unsafe interrupted copy directory')
     for rel, expected in manifest.items():
         data = (source / rel).read_bytes()
         if len(data) != expected['size'] or hashlib.sha256(data).hexdigest() != expected['sha256']:
             raise RuntimeError('source changed during copy')
-        atomic(dest / rel, data)
+        output = dest / rel
+        if output.exists() or output.is_symlink():
+            meta = output.lstat()
+            if not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1 or meta.st_uid != os.geteuid() or meta.st_mode & 0o077 or output.read_bytes() != data:
+                raise RuntimeError('unknown bytes in interrupted copy')
+        else:
+            atomic(output, data)
     for folder in ('keys', 'dids', 'audit'):
         sync_dir(dest / folder)
     sync_dir(dest)
@@ -194,8 +211,7 @@ def run(args):
             if not marker.exists():
                 atomic(marker, encoded({'migration': vault_id, 'legacy_disabled': True}))
             backup = args.recovery_dir / 'vault'
-            if not backup.exists():
-                copy_checked(args.source, backup, manifest)
+            copy_checked(args.source, backup, manifest)
             if inventory(backup) != manifest:
                 raise RuntimeError('recovery backup changed; preserve and inspect manually')
             # Open every backup key with the operator's tty before cutover.
@@ -204,12 +220,10 @@ def run(args):
             target = state / 'vaults' / vault_id
             if not target.exists():
                 stage = state / 'vaults' / ('.migration-' + vault_id)
-                if stage.exists():
-                    raise RuntimeError('incomplete staging retained; inspect/remove only staging before resume')
                 copy_checked(backup, stage, manifest)
                 os.rename(stage, target)
                 sync_dir(target.parent)
-            if inventory(target) != manifest:
+            if inventory(target, owners=(0, config['service_uid'])) != manifest:
                 raise RuntimeError('staged vault differs from verified backup')
             # Before any DB/config mutation, record the exact backup and vault ID.
             record['phase'] = 'copied'

@@ -1923,14 +1923,14 @@ fn registration_is_exact_root_only_single_use_and_commits_audit_before_release()
         .is_err());
     assert!(f
         .db
-        .complete_registration(1003, &p.operation_id, &p.digest, now(), "test-pass")
+        .complete_secret_operation(1003, &p.operation_id, &p.digest, now(), "test-pass")
         .is_err());
     assert!(f
         .db
-        .complete_registration(1002, &p.operation_id, &p.digest, now(), "wrong")
+        .complete_secret_operation(1002, &p.operation_id, &p.digest, now(), "wrong")
         .is_err());
     let result =
-        f.db.complete_registration(1002, &p.operation_id, &p.digest, now(), "test-pass")
+        f.db.complete_secret_operation(1002, &p.operation_id, &p.digest, now(), "test-pass")
             .unwrap();
     use base64::Engine;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -1947,13 +1947,13 @@ fn registration_is_exact_root_only_single_use_and_commits_audit_before_release()
     assert!(key.verify(challenge.as_bytes(), &bytes.try_into().unwrap()));
     assert!(f
         .db
-        .complete_registration(1002, &p.operation_id, &p.digest, now(), "test-pass")
+        .complete_secret_operation(1002, &p.operation_id, &p.digest, now(), "test-pass")
         .is_err());
     let p = f.db.prepare(1002, change(challenge), now()).unwrap();
     f.db.connection.execute_batch("CREATE TRIGGER fail_registration_audit BEFORE INSERT ON audit_events BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
     assert!(f
         .db
-        .complete_registration(1002, &p.operation_id, &p.digest, now(), "test-pass")
+        .complete_secret_operation(1002, &p.operation_id, &p.digest, now(), "test-pass")
         .is_err());
     assert_eq!(
         f.db.connection
@@ -1965,4 +1965,134 @@ fn registration_is_exact_root_only_single_use_and_commits_audit_before_release()
             .unwrap(),
         "prepared"
     );
+}
+
+#[test]
+fn trusted_hot_rotation_retires_old_key_revokes_grants_and_recovers_approved_document() {
+    use catalog::*;
+    let mut f = Fixture::new();
+    let (vault, did, doc) = vault_fixture(&mut f);
+    let layout = crate::keystore::layout::KeydLayout::at(f.dir.join("vaults").join(&vault));
+    let root_envelope = crate::keystore::store::resolve(&layout, &did, None).unwrap();
+    let root_signer = crate::keystore::unwrap::unlock(
+        &root_envelope,
+        b"test-pass",
+        &crate::keystore::device::load(&layout).unwrap(),
+    )
+    .unwrap();
+    let mut unsigned = crate::did::lifecycle::strip_proof(&doc).unwrap();
+    for fragment in ["hot-old", "hot-next"] {
+        let (_, extra) = crate::keystore::create::create_extra(
+            &layout,
+            &did,
+            fragment,
+            vec![anp::authentication::DidVerificationRelationship::Authentication],
+            "test",
+            b"test-pass",
+            crate::crypto::kdf::Argon2Config {
+                m_cost: 1024,
+                t_cost: 1,
+                p_cost: 1,
+            },
+            crate::keystore::hardware::HardwareChoice::None,
+        )
+        .unwrap();
+        unsigned = crate::did::lifecycle::with_extra_key(
+            &unsigned,
+            &did,
+            &root_signer.verifying_key(),
+            extra,
+        )
+        .unwrap();
+    }
+    let original =
+        crate::did::document::sign_document(&unsigned, &root_signer, &root_envelope.id.kid)
+            .unwrap();
+    crate::keystore::store::write_did_document(&layout, &did, &original).unwrap();
+    apply_change(
+        &mut f,
+        CatalogChange::EnrollVault {
+            vault_id: vault.clone(),
+        },
+    );
+    let keys = f.db.catalog().unwrap().keys;
+    let root = keys.iter().find(|k| k.kid == root_envelope.id.kid).unwrap();
+    let old = keys.iter().find(|k| k.kid.ends_with("#hot-old")).unwrap();
+    let next = keys.iter().find(|k| k.kid.ends_with("#hot-next")).unwrap();
+    for (key, role) in [
+        (root, KeyRole::Root),
+        (old, KeyRole::Hot),
+        (next, KeyRole::Hot),
+    ] {
+        apply_change(
+            &mut f,
+            CatalogChange::ConfirmRole {
+                key_id: key.key_id.clone(),
+                role,
+            },
+        );
+    }
+    let policy = uuid();
+    apply_change(
+        &mut f,
+        CatalogChange::PublishPolicy {
+            policy_id: policy.clone(),
+            version: 1,
+            content: policy_value(),
+        },
+    );
+    let grant = new_grant(&mut f, &old.key_id, &policy);
+    let change = Change::RotateHotKey {
+        root_key_id: root.key_id.clone(),
+        old_key_id: old.key_id.clone(),
+        next_key_id: next.key_id.clone(),
+    };
+    let p = f.db.prepare(1002, change, now()).unwrap();
+    assert!(f
+        .db
+        .commit(1002, &p.operation_id, &p.digest, now())
+        .is_err());
+    // Inject a crash after approval commits, before the filesystem projection.
+    let result =
+        f.db.commit_secret(1002, &p.operation_id, &p.digest, now(), Some("test-pass"))
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        crate::keystore::store::read_did_document(&layout, &did).unwrap(),
+        original
+    );
+    assert!(f
+        .db
+        .authorize_http(&grant.principal_id, &grant.grant_id, &canonical(), now())
+        .is_err());
+    f.db.recovery(&f.config, now()).unwrap();
+    let installed = crate::keystore::store::read_did_document(&layout, &did).unwrap();
+    assert_eq!(installed, result["document"]);
+    assert!(anp::authentication::find_verification_method(&installed, &old.kid).is_none());
+    assert!(anp::authentication::find_verification_method(&installed, &next.kid).is_some());
+    assert_eq!(
+        f.db.catalog()
+            .unwrap()
+            .keys
+            .iter()
+            .find(|k| k.key_id == old.key_id)
+            .unwrap()
+            .state,
+        "retired"
+    );
+    assert!(f
+        .db
+        .complete_secret_operation(1002, &p.operation_id, &p.digest, now(), "test-pass")
+        .is_err());
+    let fresh = new_grant(&mut f, &next.key_id, &policy);
+    assert!(f
+        .db
+        .authorize_http(&fresh.principal_id, &fresh.grant_id, &canonical(), now())
+        .is_ok());
+    f.db.recovery(&f.config, now()).unwrap();
+    assert_eq!(
+        crate::keystore::store::read_did_document(&layout, &did).unwrap(),
+        installed
+    );
+    verify_audit(&f.db.connection).unwrap();
 }

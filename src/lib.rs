@@ -2,6 +2,9 @@
 //!
 //! socket 不返回私钥；同 UID 任意代码执行的隔离取决于独立的部署边界。
 
+#[cfg(all(not(debug_assertions), feature = "hardware-software"))]
+compile_error!("hardware-software is a debug-only test double; release artifacts must exclude it");
+
 pub mod audit;
 pub mod cli;
 pub mod client;

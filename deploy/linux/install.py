@@ -2,11 +2,14 @@
 """Install a NEW boundary preview. Never migrate or overwrite an existing vault."""
 import argparse
 import grp
+import hashlib
+import tempfile
+import fcntl
+import socket
 import json
 import os
 from pathlib import Path
 import pwd
-import shutil
 import subprocess
 import sys
 import uuid
@@ -49,6 +52,61 @@ def write(path, content):
         os.fsync(stream.fileno())
 
 
+def verified_binary(args):
+    if not args.sha256 or len(args.sha256) != 64:
+        raise RuntimeError('installation/update requires administrator-verified --sha256')
+    with args.binary.open('rb') as stream:
+        content = stream.read(128 * 1024 * 1024 + 1)
+    if len(content) > 128 * 1024 * 1024 or hashlib.sha256(content).hexdigest() != args.sha256.lower():
+        raise RuntimeError('binary digest mismatch or size exceeds bound')
+    # Execute exactly the digest-checked bytes from a private root-owned location.
+    with tempfile.TemporaryDirectory(prefix='keyd-build-check-') as temp:
+        candidate = Path(temp) / 'anp-keyd'
+        candidate.write_bytes(content)
+        candidate.chmod(0o700)
+        info = json.loads(subprocess.check_output([str(candidate), 'build-info'], timeout=10))
+    if info['hardware_software'] or info['seed_export'] or (not info['release'] and not args.allow_development_build):
+        raise RuntimeError('installer requires a release build without software test double or seed export')
+    return content
+
+
+def update(args):
+    if sys.platform != 'linux' or os.geteuid() != 0:
+        raise RuntimeError('update requires Linux root')
+    trusted_parent(CONFIG.parent)
+    trusted_parent(BINARY.parent)
+    if CONFIG.is_symlink() or BINARY.is_symlink():
+        raise RuntimeError('linked managed deployment')
+    for path in (CONFIG, BINARY):
+        meta = path.lstat()
+        if not path.is_file() or meta.st_uid != 0 or meta.st_nlink != 1 or meta.st_mode & 0o022:
+            raise RuntimeError('untrusted managed deployment')
+    config = json.loads(CONFIG.read_text())
+    content = verified_binary(args)
+    # No implicit restart, downgrade of configuration, or replacement of state.
+    for endpoint in (config['sign_socket'], config['admin_socket']):
+        with socket.socket(socket.AF_UNIX) as connection:
+            try:
+                connection.connect(endpoint)
+            except (FileNotFoundError, ConnectionRefusedError):
+                continue
+            raise RuntimeError('stop service before updating')
+    from importlib.util import spec_from_file_location, module_from_spec
+    spec = spec_from_file_location('keyd_migration_paths', Path(__file__).with_name('migrate-vault.py'))
+    paths = module_from_spec(spec)
+    spec.loader.exec_module(paths)
+    paths.trusted(Path(config['state_dir']), owners=(0, config['service_uid']))
+    lock_path = Path(config['state_dir']) / 'service.lock'
+    fd = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'r+b') as lock:
+        meta = os.fstat(lock.fileno())
+        if meta.st_uid != config['service_uid'] or meta.st_nlink != 1 or meta.st_mode & 0o777 != 0o600:
+            raise RuntimeError('untrusted service lock')
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        paths.atomic(BINARY, content, 0o755)
+    print('Verified binary replaced while offline; state/config retained. Review schema compatibility before restart.')
+
+
 def install(args):
     if sys.platform != "linux" or os.geteuid() != 0:
         raise RuntimeError("installation requires Linux root")
@@ -65,6 +123,7 @@ def install(args):
     agent_uids = {p.pw_uid for p in agents}
     if len(agent_uids) != len(agents) or len(admin_uids) != len(admins) or 0 in agent_uids or admin_uids & agent_uids:
         raise RuntimeError("administrators and distinct Agent UIDs must not overlap")
+    content = verified_binary(args)
     for name in [SERVICE, AGENTS, ADMINS]:
         try:
             grp.getgrnam(name)
@@ -101,12 +160,11 @@ def install(args):
     directory(Path('/run/anp-keyd'))
     directory(Path('/run/anp-keyd/sign'), service.pw_uid, agent_gid, 0o750)
     directory(Path('/run/anp-keyd/admin'), service.pw_uid, admin_gid, 0o750)
-    with source.open('rb') as src:
-        fd = os.open(BINARY, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o755)
-        os.fchmod(fd, 0o755)
-        with os.fdopen(fd, 'wb') as dest:
-            shutil.copyfileobj(src, dest)
-            os.fsync(dest.fileno())
+    fd = os.open(BINARY, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o755)
+    os.fchmod(fd, 0o755)
+    with os.fdopen(fd, 'wb') as dest:
+        dest.write(content)
+        os.fsync(dest.fileno())
     config = {
         "schema_version": 1, "mode": "linux-boundary-preview", "instance_id": str(uuid.uuid4()),
         "service_uid": service.pw_uid, "admin_uids": sorted(admin_uids),
@@ -124,7 +182,7 @@ def install(args):
         os.setgid(service.pw_gid)
         os.setuid(service.pw_uid)
     subprocess.run([str(BINARY), 'init-protected-state', '--config', str(CONFIG)], preexec_fn=service_identity, check=True)
-    print("Installed boundary preview. Grant/policy preview available; signing and vault migration remain disabled.")
+    print("Installed v2 transaction signer. Protected release gate remains closed pending host acceptance; migration requires the separate offline tool.")
     print("Review config, then run: systemctl daemon-reload && systemctl enable --now anp-keyd")
     print("Agents/admins need fresh login sessions for group membership. Keep Agents away from sudo, Docker and admin IPC.")
 
@@ -152,9 +210,18 @@ if __name__ == "__main__":
     parser.add_argument("--admin-user", action="append", default=[])
     parser.add_argument("--agent-user", action="append", default=[])
     parser.add_argument("--uninstall", action="store_true")
+    parser.add_argument("--update", action="store_true")
+    parser.add_argument("--sha256")
+    parser.add_argument("--allow-development-build", action="store_true", help="explicit preview testing only")
     args = parser.parse_args()
     try:
-        if args.uninstall:
+        if args.uninstall and args.update:
+            parser.error('choose uninstall or update')
+        if args.update:
+            if not args.binary:
+                parser.error('--update requires --binary and --sha256')
+            update(args)
+        elif args.uninstall:
             uninstall()
         elif args.binary and args.admin_user and args.agent_user:
             install(args)

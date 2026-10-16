@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Destructive to its container only. Root, Docker and explicit harness required."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -27,23 +28,55 @@ args = parser.parse_args()
 for name in ['boundary-admin', 'boundary-agent-a', 'boundary-agent-b', 'boundary-stranger']:
     subprocess.run(['useradd', '--create-home', '--shell', '/bin/sh', name], check=True)
 subprocess.run([sys.executable, 'deploy/linux/install.py', '--binary', args.binary,
-                '--admin-user', 'boundary-admin', '--agent-user', 'boundary-agent-a', '--agent-user', 'boundary-agent-b'], check=True)
+                '--allow-development-build', '--sha256', hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(), '--admin-user', 'boundary-admin', '--agent-user', 'boundary-agent-a', '--agent-user', 'boundary-agent-b'], check=True)
 config_path = Path('/etc/anp-keyd/service.json')
 config = json.loads(config_path.read_text())
 fixture = json.loads(Path('/tmp/keyd-boundary-fixture-info.json').read_text())
-vault_id = str(uuid.uuid4())
-config['vault_ids'] = [vault_id]
-config_path.write_text(json.dumps(config))
-vault = Path(config['state_dir']) / 'vaults' / vault_id
-shutil.copytree('/tmp/keyd-boundary-fixture', vault)
 service = pwd.getpwnam('anp-keyd')
-for path in [vault, *vault.rglob('*')]:
-    os.chown(path, service.pw_uid, service.pw_gid)
-# Test-only staging under root while the service is stopped; not a migration API.
-with sqlite3.connect(Path(config['state_dir']) / 'state.sqlite') as database:
-    database.execute("INSERT INTO vaults VALUES(?,?,'active')", (vault_id, 'vaults/' + vault_id))
 binary = '/usr/local/libexec/anp-keyd'
-passed = []
+source = Path('/root/keyd-migration-source')
+migration_source = source
+recovery = Path('/root/keyd-migration-recovery')
+shutil.copytree('/tmp/keyd-boundary-fixture', source)
+# Exercise the actual migration tool; no test-only SQL or catalog staging.
+dry = subprocess.run([sys.executable, 'deploy/linux/migrate-vault.py', '--source', str(source)], capture_output=True, text=True)
+assert dry.returncode == 0, dry.stderr
+assert json.loads(dry.stdout.splitlines()[-1])['dry_run']
+assert not recovery.exists()
+def apply_migration(source, recovery):
+    pid, terminal = pty.fork()
+    if pid == 0:
+        os.execv(sys.executable, [sys.executable, 'deploy/linux/migrate-vault.py', '--source', str(source), '--apply', '--recovery-dir', str(recovery)])
+    output = b''
+    sent = 0
+    import re
+    while True:
+        ready, _, _ = select.select([terminal], [], [], 30)
+        assert ready, 'migration verification timed out'
+        try:
+            chunk = os.read(terminal, 8192)
+            if not chunk:
+                break
+            output += chunk
+            prompts = len(re.findall(rb'Verify recovery of [^\r\n]*: ', output))
+            while sent < prompts:
+                os.write(terminal, b'temporary-boundary-test-secret\n')
+                sent += 1
+        except OSError:
+            break
+    _, status = os.waitpid(pid, 0)
+    os.close(terminal)
+    assert os.waitstatus_to_exitcode(status) == 0, output.decode(errors='replace')
+    assert sent == 3, output
+    return json.loads((recovery / 'migration.json').read_text())
+
+migration = apply_migration(source, recovery)
+assert migration['phase'] == 'installed_locked_unclassified'
+config = json.loads(config_path.read_text())
+vault_id = migration['vault_id']
+assert config['vault_ids'] == [vault_id]
+vault = Path(config['state_dir']) / 'vaults' / vault_id
+passed = ['migration dry-run is read-only', 'actual encrypted recovery copy opens every key', 'offline migration freezes source and installs locked unclassified vault']
 
 
 def identity(name):
@@ -487,6 +520,38 @@ print(sum(closed(s) for s in ss),flush=True)
 finally:
     stop(process)
     config_path.write_text(json.dumps(config))
+
+# Recovery and update operations are offline, preserve source history, and
+# cannot make two writers active. Re-running a completed journal is idempotent.
+import fcntl
+with (migration_source / '.maintenance.lock').open('r+b') as maintenance:
+    fcntl.flock(maintenance, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    conflict = subprocess.run([sys.executable, 'deploy/linux/migrate-vault.py', '--source', str(migration_source), '--apply', '--recovery-dir', str(recovery)], capture_output=True, text=True)
+    check(conflict.returncode != 0, 'maintenance lease prevents concurrent legacy writer cutover')
+resumed = apply_migration(migration_source, recovery)
+check(resumed['vault_id'] == vault_id and json.loads(config_path.read_text())['vault_ids'] == [vault_id], 'completed migration resume is idempotent')
+backup_key = next((recovery / 'vault/keys').glob('*.json'))
+original_backup = backup_key.read_bytes()
+backup_key.write_bytes(original_backup + b' ')
+refused = subprocess.run([sys.executable, 'deploy/linux/migrate-vault.py', '--source', str(migration_source), '--apply', '--recovery-dir', str(recovery)], capture_output=True, text=True)
+check(refused.returncode != 0 and ('backup changed' in refused.stderr or 'unknown bytes' in refused.stderr), 'changed recovery bytes prevent cutover before credential prompt')
+backup_key.write_bytes(original_backup)
+original_binary = Path(binary).read_bytes()
+wrong_update = subprocess.run([sys.executable, 'deploy/linux/install.py', '--update', '--binary', args.binary, '--sha256', '0'*64, '--allow-development-build'], capture_output=True, text=True)
+check(wrong_update.returncode != 0 and Path(binary).read_bytes() == original_binary, 'update rejects wrong binary digest without mutation')
+updated = subprocess.run([sys.executable, 'deploy/linux/install.py', '--update', '--binary', args.binary, '--sha256', hashlib.sha256(original_binary).hexdigest(), '--allow-development-build'], capture_output=True, text=True)
+check(updated.returncode == 0 and Path(binary).stat().st_mode & 0o777 == 0o755, 'offline verified update preserves executable permissions under strict umask')
+
+if os.environ.get('ANP_KEYD_ANP_TARGET'):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('keyd_real_service', Path(__file__).with_name('anp-service-acceptance.py'))
+    real = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(real)
+    process = start()
+    try:
+        print(json.dumps(real.run(globals())), flush=True)
+    finally:
+        stop(process)
 
 state_path = Path(config['state_dir']) / 'state.sqlite'
 check(b'temporary-boundary-test-secret' not in state_path.read_bytes(), 'SQLite contains no unlock password')

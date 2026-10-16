@@ -150,7 +150,7 @@ impl Boundary {
                 Ok(request) => {
                     let secret = if matches!(
                         request.request,
-                        AdminRequest::Unlock { .. } | AdminRequest::CompleteRegistration { .. }
+                        AdminRequest::Unlock { .. } | AdminRequest::CompleteSecretOperation { .. }
                     ) {
                         match protocol::read_secret(&mut io) {
                             Ok(secret) => Some(secret),
@@ -367,7 +367,7 @@ impl Boundary {
         // This leaves capacity for a concurrent LOCK_ALL.
         let unlocking = matches!(
             request,
-            AdminRequest::Unlock { .. } | AdminRequest::CompleteRegistration { .. }
+            AdminRequest::Unlock { .. } | AdminRequest::CompleteSecretOperation { .. }
         );
         let _kdf_guard = if unlocking {
             match self.kdf_gate.try_lock() {
@@ -391,7 +391,7 @@ impl Boundary {
             return Reply::code("AUDIT_UNAVAILABLE");
         }
         match request {
-            AdminRequest::CompleteRegistration {
+            AdminRequest::CompleteSecretOperation {
                 operation_id,
                 digest,
             } => {
@@ -402,11 +402,17 @@ impl Boundary {
                 // the approval, key snapshot and signature in a single order.
                 let result = (|| -> Result<serde_json::Value> {
                     let _gate = self.admin_gate.enter(true)?;
+                    if self.stopped.load(Ordering::SeqCst) {
+                        return Err(KeydError::Protocol("PERSISTENCE_UNAVAILABLE".into()));
+                    }
                     let mut db = self
                         .database
                         .lock()
                         .map_err(|_| KeydError::Protocol("PERSISTENCE_UNAVAILABLE".into()))?;
-                    db.complete_registration(
+                    if db.commit_changes_keys(&operation_id)? {
+                        self.lock_all();
+                    }
+                    db.complete_secret_operation(
                         actor,
                         &operation_id,
                         &digest,

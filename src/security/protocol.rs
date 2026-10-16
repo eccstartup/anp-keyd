@@ -39,8 +39,8 @@ pub enum DataRequest {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "operation", deny_unknown_fields)]
 pub enum AdminRequest {
-    #[serde(rename = "COMPLETE_REGISTRATION")]
-    CompleteRegistration {
+    #[serde(rename = "COMPLETE_SECRET_OPERATION")]
+    CompleteSecretOperation {
         operation_id: String,
         digest: String,
     },

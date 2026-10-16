@@ -67,11 +67,11 @@ export function keydV2Signer(client, grant_id) {
   }
 }
 
-/** Drop-in AnpConnector for the existing anp-sdk createConfig({connectors:[...]}).
- * Pass the SDK's buildAnpLoginBody and subjectOf exports, and a durable request-ID
+/** Drop-in AnpConnector for the existing anp-sdk createConfig([connector]).
+ * Pass the SDK's subjectOf export and a durable request-ID
  * callback. Canonical URLs must already match the SDK's outgoing target.
  */
-export function keydV2Connector({ client, grant_id, key_id, requestId, buildAnpLoginBody, subjectOf }) {
+export function keydV2Connector({ client, grant_id, key_id, requestId, subjectOf }) {
   async function getIdentity(want = {}) {
     const { keys } = await client.keys()
     const key = keys.find(k => k.key_id === key_id)
@@ -90,7 +90,9 @@ export function keydV2Connector({ client, grant_id, key_id, requestId, buildAnpL
     async signRequest(req) {
       if (req.successorDid != null) throw new Error('DID lifecycle requires trusted management')
       const identity = await getIdentity()
-      const body = buildAnpLoginBody({ ...req, did: identity.did, didDocument: identity.didDocument })
+      const payload = { ...(req.extraBody ?? {}), nonce: req.nonce, did: identity.did, didDocument: identity.didDocument }
+      if (req.handle != null) payload.handle = req.handle
+      const body = JSON.stringify(payload)
       const signed = await client.sign({ grant_id, request_id: requestId(req), method: req.method.toUpperCase(),
         url: req.url, headers: { 'content-type': 'application/json' }, body, nonce: req.nonce })
       if (signed.url !== req.url) throw new Error('SDK target must use the canonical URL; query original request ID before retry')

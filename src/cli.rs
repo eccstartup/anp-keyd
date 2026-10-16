@@ -79,6 +79,7 @@ fn help_template() -> String {
          \n\
          \x20 serve               Run the daemon: answer signing requests over a Unix socket.\n\
          \x20 serve-protected     Linux v2 transaction signer (release acceptance pending).\n\
+         \x20 build-info          Print build mode and security-sensitive feature flags.\n\
          \x20 inspect-vault       Inspect legacy inventory; --verify tests recovery via tty.\n\
          \x20 data                Send a protected v2 request from --file through trusted config.\n\
          \x20 admin               Use the independent Linux management channel.\n\
@@ -143,6 +144,8 @@ fn help_template() -> String {
 /// 说明。所以这里可以继续用中文记理由,用户看不到。)
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Print build mode and enabled security-sensitive features as JSON.
+    BuildInfo,
     /// Read-only legacy inventory; --verify opens every key and tests recovery via tty.
     InspectVault {
         #[arg(long)]
@@ -277,8 +280,8 @@ pub struct AdminArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum AdminCommand {
-    /// Complete one exact prepared awiki registration proof (root locks on return).
-    CompleteRegistration {
+    /// Complete a prepared registration or hot-key rotation (root destroyed on return).
+    CompleteSecretOperation {
         #[arg(long)]
         operation_id: String,
         #[arg(long)]
@@ -822,6 +825,10 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Serve(args) => serve(root, args),
         Command::Stop => stop(root),
         Command::Keygen(args) => keygen(root, args),
+        Command::BuildInfo => {
+            println!("{}", serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"release":!cfg!(debug_assertions),"hardware_software":cfg!(feature="hardware-software"),"seed_export":cfg!(feature="seed-export"),"mcp":cfg!(feature="mcp"),"protected_supported":false}));
+            Ok(())
+        }
         Command::InspectVault { path, verify } => {
             if root.is_some() {
                 return Err(KeydError::Misuse("inspect-vault uses --path, not --root".into()));
@@ -940,10 +947,11 @@ pub fn run(cli: Cli) -> Result<()> {
                     digest,
                 } => client.commit(operation_id, digest)?,
                 AdminCommand::Status => client.capabilities()?,
-                AdminCommand::CompleteRegistration { operation_id, digest } => {
+                AdminCommand::CompleteSecretOperation { operation_id, digest } => {
+                    client.capabilities()?;
                     let tty = crate::tty::open()?;
-                    let secret = crate::tty::read_secret(&tty, "Registration root passphrase: ")?;
-                    AdminClient::connect(&args.config, true)?.complete_registration(operation_id, digest, secret)?
+                    let secret = crate::tty::read_secret(&tty, "Management root passphrase: ")?;
+                    AdminClient::connect(&args.config, true)?.complete_secret_operation(operation_id, digest, secret)?
                 }
                 AdminCommand::LockAll => client.lock_all()?,
                 AdminCommand::Unlock { vault_id, did, kid } => {

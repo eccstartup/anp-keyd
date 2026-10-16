@@ -345,12 +345,12 @@ pub(super) fn resolve(
             if crate::did::lifecycle::is_deactivated(&old) {
                 return Err(invalid());
             }
-            // All catalogued envelopes must still be represented by the new document.
-            // Removing keys belongs to the explicit rotation/retirement lifecycle (M5).
+            // A root-signed replacement may retire a hot key. Root/recovery
+            // methods cannot silently disappear through this operation.
             for key in list(tx)?
                 .keys
                 .into_iter()
-                .filter(|k| k.vault_id == vault_id && k.did == did)
+                .filter(|k| k.vault_id == vault_id && k.did == did && k.state == "active")
             {
                 validate_key(root, &key)?;
                 let l = layout(root, &vault_id)?;
@@ -360,6 +360,11 @@ pub(super) fn resolve(
                     .ok_or_else(invalid)?;
                 let wrapped = store::resolve(&l, &did, Some(fragment))?;
                 if !crate::did::lifecycle::is_deactivated(&doc) {
+                    if key.role == KeyRole::Hot
+                        && anp::authentication::find_verification_method(&doc, &key.kid).is_none()
+                    {
+                        continue;
+                    }
                     verify_role(&wrapped, &doc, &key.role)?;
                 }
             }
@@ -506,21 +511,30 @@ pub(super) fn recover_files(db: &mut Connection, root: &Path) -> Result<()> {
         if digest(&binding)? != approved_digest {
             return Err(unavailable());
         }
-        let Resolved::Catalog { effect } = resolved else {
-            return Err(unavailable());
-        };
-        match *effect {
-            CatalogEffect::InstallDocument {
-                vault_id,
-                did: subject,
-                before_digest,
-                after_digest,
-                document,
-            } if vault_id == vault
-                && subject == did
-                && before_digest == before
-                && after_digest == after
-                && document == target => {}
+        match resolved {
+            Resolved::RotateHotKey {
+                root: key,
+                unsigned,
+                ..
+            } if key.vault_id == vault
+                && key.did == did
+                && key.document_digest == before
+                && crate::did::lifecycle::strip_proof(&target)? == unsigned
+                && target["proof"]["verificationMethod"] == key.kid => {}
+            Resolved::Catalog { effect } => match *effect {
+                CatalogEffect::InstallDocument {
+                    vault_id,
+                    did: subject,
+                    before_digest,
+                    after_digest,
+                    document,
+                } if vault_id == vault
+                    && subject == did
+                    && before_digest == before
+                    && after_digest == after
+                    && document == target => {}
+                _ => return Err(unavailable()),
+            },
             _ => return Err(unavailable()),
         }
         let approved = {
@@ -565,6 +579,19 @@ pub(super) fn recover_files(db: &mut Connection, root: &Path) -> Result<()> {
             .map_err(db_error)?;
         tx.execute("UPDATE keys SET document_digest=?1,identity_epoch=identity_epoch+1 WHERE vault_id=?2 AND did=?3",params![after,vault,did]).map_err(db_error)?;
         tx.execute("UPDATE keys SET state=CASE WHEN did=?1 AND ?2 THEN 'retired' ELSE 'active' END WHERE vault_id=?3 AND state='maintenance'",params![did,crate::did::lifecycle::is_deactivated(&target),vault]).map_err(db_error)?;
+        for key in list(&tx)?
+            .keys
+            .into_iter()
+            .filter(|k| k.vault_id == vault && k.did == did && k.role == KeyRole::Hot)
+        {
+            if anp::authentication::find_verification_method(&target, &key.kid).is_none() {
+                tx.execute(
+                    "UPDATE keys SET state='retired' WHERE key_id=?1",
+                    [key.key_id],
+                )
+                .map_err(db_error)?;
+            }
+        }
         tx.execute(
             "UPDATE vaults SET state='active' WHERE vault_id=?1",
             [vault],

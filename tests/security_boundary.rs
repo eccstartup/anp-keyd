@@ -51,12 +51,35 @@ fn disposable_linux_fixture() {
         HardwareChoice::None,
     )
     .unwrap();
-    let unsigned = anp_keyd::did::lifecycle::strip_proof(&doc).unwrap();
+    let mut unsigned = anp_keyd::did::lifecycle::strip_proof(&doc).unwrap();
+    unsigned["service"] = serde_json::json!([{"id":format!("{}#anp",created.did),"type":"ANPMessageService","serviceEndpoint":"https://example.com/anp-im/rpc","serviceDid":"did:wba:example.com"}]);
     let unsigned = anp_keyd::did::lifecycle::with_extra_key(
         &unsigned,
         &created.did,
         &key.verifying_key(),
         extra,
+    )
+    .unwrap();
+    let (_, next) = create::create_extra(
+        &layout,
+        &created.did,
+        "http-next",
+        vec![anp::authentication::DidVerificationRelationship::Authentication],
+        "disposable-next",
+        pass,
+        Argon2Config {
+            m_cost: 1024,
+            t_cost: 1,
+            p_cost: 1,
+        },
+        HardwareChoice::None,
+    )
+    .unwrap();
+    let unsigned = anp_keyd::did::lifecycle::with_extra_key(
+        &unsigned,
+        &created.did,
+        &key.verifying_key(),
+        next,
     )
     .unwrap();
     let doc = document::sign_document(&unsigned, &key, &wrapped.id.kid).unwrap();

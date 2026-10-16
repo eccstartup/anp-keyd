@@ -31,6 +31,12 @@ const GENESIS: &str = "000000000000000000000000000000000000000000000000000000000
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum Change {
+    /// Switch to a pre-provisioned hot key and retire the old public method.
+    RotateHotKey {
+        root_key_id: String,
+        old_key_id: String,
+        next_key_id: String,
+    },
     /// Exact awiki registration proof, authorized only through management.
     RegistrationChallenge {
         key_id: String,
@@ -53,6 +59,12 @@ pub enum Change {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 enum Resolved {
+    RotateHotKey {
+        root: Box<catalog::KeyRecord>,
+        old: Box<catalog::KeyRecord>,
+        next: Box<catalog::KeyRecord>,
+        unsigned: Value,
+    },
     RegistrationChallenge {
         key: Box<catalog::KeyRecord>,
         origin: String,
@@ -440,6 +452,45 @@ impl Database {
             .map_err(db_error)?;
         let root = self.root.clone();
         let resolved = match change {
+            Change::RotateHotKey {
+                root_key_id,
+                old_key_id,
+                next_key_id,
+            } => {
+                let root_key = catalog::get_key(&tx, &root_key_id)?;
+                let old = catalog::get_key(&tx, &old_key_id)?;
+                let next = catalog::get_key(&tx, &next_key_id)?;
+                for key in [&root_key, &old, &next] {
+                    catalog::validate_key(&root, key)?;
+                    if key.state != "active"
+                        || key.vault_id != root_key.vault_id
+                        || key.did != root_key.did
+                    {
+                        return Err(invalid());
+                    }
+                }
+                if root_key.role != catalog::KeyRole::Root
+                    || old.role != catalog::KeyRole::Hot
+                    || next.role != catalog::KeyRole::Hot
+                    || old.key_id == next.key_id
+                {
+                    return Err(invalid());
+                }
+                let layout = crate::keystore::layout::KeydLayout::at(
+                    root.join("vaults").join(&root_key.vault_id),
+                );
+                let doc = crate::keystore::store::read_did_document(&layout, &root_key.did)?;
+                let unsigned = crate::did::lifecycle::remove_method(
+                    &crate::did::lifecycle::strip_proof(&doc)?,
+                    &old.kid,
+                )?;
+                Resolved::RotateHotKey {
+                    root: Box::new(root_key),
+                    old: Box::new(old),
+                    next: Box::new(next),
+                    unsigned,
+                }
+            }
             Change::RegistrationChallenge {
                 key_id,
                 origin,
@@ -563,7 +614,7 @@ impl Database {
         Ok(match payload {
             Some(p) => matches!(
                 serde_json::from_str::<Resolved>(&p).map_err(|_| unavailable())?,
-                Resolved::Catalog { .. }
+                Resolved::Catalog { .. } | Resolved::RotateHotKey { .. }
             ),
             None => false,
         })
@@ -593,7 +644,7 @@ impl Database {
 
     /// One-shot registration. Root is decrypted transiently, never installed in
     /// the data-plane vault. Return only after the operation and audit commit.
-    pub fn complete_registration(
+    pub fn complete_secret_operation(
         &mut self,
         actor: u32,
         operation_id: &str,
@@ -601,8 +652,11 @@ impl Database {
         now: Time,
         secret: &str,
     ) -> Result<Value> {
-        self.commit_secret(actor, operation_id, digest, now, Some(secret))?
-            .ok_or_else(invalid)
+        let result = self
+            .commit_secret(actor, operation_id, digest, now, Some(secret))?
+            .ok_or_else(invalid)?;
+        catalog::recover_files(&mut self.connection, &self.root)?;
+        Ok(result)
     }
 
     fn commit_secret(
@@ -613,6 +667,7 @@ impl Database {
         now: Time,
         secret: Option<&str>,
     ) -> Result<Option<Value>> {
+        let started = std::time::Instant::now();
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -629,10 +684,54 @@ impl Database {
         }
         let mut result = None;
         // A credential-bearing commit cannot be used for unrelated operations.
-        if secret.is_some() != matches!(&resolved, Resolved::RegistrationChallenge { .. }) {
+        if secret.is_some()
+            != matches!(
+                &resolved,
+                Resolved::RegistrationChallenge { .. } | Resolved::RotateHotKey { .. }
+            )
+        {
             return Err(invalid());
         }
         match resolved {
+            Resolved::RotateHotKey {
+                root,
+                old,
+                next,
+                unsigned,
+            } => {
+                for key in [&root, &old, &next] {
+                    if catalog::get_key(&tx, &key.key_id)? != **key {
+                        return Err(invalid());
+                    }
+                    catalog::validate_key(&self.root, key)?;
+                }
+                let layout = crate::keystore::layout::KeydLayout::at(
+                    self.root.join("vaults").join(&root.vault_id),
+                );
+                let fragment = root
+                    .kid
+                    .strip_prefix(&format!("{}#", root.did))
+                    .ok_or_else(invalid)?;
+                let wrapped = crate::keystore::store::resolve(&layout, &root.did, Some(fragment))?;
+                let signer = crate::keystore::unwrap::unlock(
+                    &wrapped,
+                    secret.ok_or_else(invalid)?.as_bytes(),
+                    &crate::keystore::device::load(&layout)?,
+                )?;
+                let document = crate::did::document::sign_document(&unsigned, &signer, &root.kid)?;
+                let effect = catalog::resolve(
+                    &tx,
+                    &self.root,
+                    catalog::CatalogChange::InstallDocument {
+                        vault_id: root.vault_id.clone(),
+                        document: document.clone(),
+                    },
+                )?;
+                catalog::apply(&tx, &self.root, operation_id, effect)?;
+                result = Some(
+                    json!({"document":document,"retired_key_id":old.key_id,"next_key_id":next.key_id,"publication_required":true}),
+                );
+            }
             Resolved::RegistrationChallenge {
                 key,
                 origin,
@@ -685,6 +784,12 @@ impl Database {
                 )
                 .map_err(db_error)?;
             }
+        }
+        let elapsed_ms = i64::try_from(started.elapsed().as_millis()).map_err(|_| invalid())?;
+        if now.monotonic_ms.saturating_add(elapsed_ms) >= monotonic_deadline
+            || now.wall.saturating_add(elapsed_ms / 1000) >= expires_at
+        {
+            return Err(invalid());
         }
         tx.execute(
             "UPDATE service_meta SET mutation_epoch=mutation_epoch+1 WHERE singleton=1",

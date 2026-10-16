@@ -142,7 +142,7 @@ impl Client {
         self.reply()
     }
 
-    pub fn complete_registration(
+    pub fn complete_secret_operation(
         mut self,
         operation_id: String,
         digest: String,
@@ -154,7 +154,7 @@ impl Client {
             &mut self.stream,
             &Envelope {
                 version: VERSION,
-                request: AdminRequest::CompleteRegistration {
+                request: AdminRequest::CompleteSecretOperation {
                     operation_id,
                     digest,
                 },

@@ -6,6 +6,7 @@ if [ "$(id -u)" != 0 ] || [ "$(uname -s)" != Linux ] || [ ! -f /.dockerenv ]; th
 fi
 export CARGO_TARGET_DIR=/tmp/keyd-target
 export RUST_LOG=info
+python3 deploy/linux/test-migration.py
 cargo build --locked
 cargo test --locked --quiet
 ANP_KEYD_DISPOSABLE_LINUX_TEST=1 cargo test --locked --test security_boundary -- --ignored
