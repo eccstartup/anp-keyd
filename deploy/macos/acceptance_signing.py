@@ -121,10 +121,10 @@ class Checks:
         path = self.base / 'change.json'
         path.write_text(json.dumps(change)); path.chmod(0o644)
         prepared = self.cli(self.admin, 'prepare', '--file', path)
-        assert prepared.returncode == 0, prepared.stderr
+        assert prepared.returncode == 0, 'prepare ' + change['kind'] + '/' + change['change']['action'] + ' failed: ' + prepared.stderr
         pending = json.loads(prepared.stdout)['prepared']
         committed = self.cli(self.admin, 'commit', '--operation-id', pending['operation_id'], '--digest', pending['digest'])
-        assert committed.returncode == 0, committed.stderr
+        assert committed.returncode == 0, 'commit ' + change['kind'] + '/' + change['change']['action'] + ' failed: ' + committed.stderr
         return pending
 
     def unlock(self):
@@ -149,7 +149,9 @@ class Checks:
 
     def before_restart(self):
         self.change({'kind': 'Catalog', 'change': {'action': 'EnrollVault', 'vault_id': self.fixture['vault_id']}})
-        catalog = json.loads(self.cli(self.admin, 'catalog').stdout)['catalog']
+        listed = self.cli(self.admin, 'catalog')
+        assert listed.returncode == 0, 'catalog failed: ' + listed.stderr
+        catalog = json.loads(listed.stdout)['catalog']
         assert all(k['role'] == 'unclassified' for k in catalog['keys'])
         root = next(k for k in catalog['keys'] if k['kid'] == self.fixture['manifest']['kid'])
         path = self.base / 'change.json'

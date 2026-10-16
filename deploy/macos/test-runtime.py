@@ -62,6 +62,8 @@ def main():
         return {'user': user.pw_uid, 'group': user.pw_gid,
                 'extra_groups': sorted(set(groups))}
     def run(user, *command):
+        if command and Path(str(command[0])).name == 'anp-keyd':
+            print(f'CHECK uid={user.pw_uid} keyd ' + ' '.join(map(str, command[1:4])), flush=True)
         return subprocess.run(list(map(str, command)), **credentials(user),
                               env=env, capture_output=True, text=True, timeout=15, cwd="/")
     parent = '/tmp' if portable else '/Library'
@@ -90,10 +92,26 @@ def main():
         path.chmod(0o644)
         def cli(user, *command):
             return run(user, args.binary, 'admin', '--config', path, *command)
+        # Check the effective child credentials and exact config/state access
+        # before asking the Rust initializer to operate on this new test state.
+        probe = r'''import json,os,sys
+config,state=sys.argv[1:]
+with open(config) as handle: json.load(handle)
+fd=os.open(state,os.O_RDONLY);os.close(fd)
+name=os.path.join(state,'.acceptance-access-probe')
+fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+os.write(fd,b'temporary access probe');os.fsync(fd);os.close(fd);os.unlink(name)
+print(json.dumps({'uid':os.getuid(),'euid':os.geteuid(),'gid':os.getgid(),'groups':os.getgroups(),'config_read':True,'state_write':True}))
+'''
+        access = run(service, '/usr/bin/python3', '-I', '-c', probe, path, config['state_dir'])
+        assert access.returncode == 0, 'service credential/filesystem preflight failed: ' + access.stderr
+        print('PASS service access preflight: ' + access.stdout.strip(), flush=True)
         result = run(service, args.binary, 'init-protected-state', '--config', path)
-        assert result.returncode == 0, result.stderr
+        assert result.returncode == 0, 'init-protected-state failed: ' + result.stderr
+        print('PASS temporary state initialized', flush=True)
         process = None
         def start():
+            print('CHECK starting temporary daemon', flush=True)
             proc = subprocess.Popen([str(args.binary), 'serve-protected', '--config', str(path)],
                                     **credentials(service), env=env, cwd="/",
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -118,7 +136,8 @@ def main():
         try:
             process = start()
             result = cli(admin, 'status')
-            assert result.returncode == 0, result.stderr
+            assert result.returncode == 0, 'administrator status failed: ' + result.stderr
+            print('PASS administrator authenticated temporary daemon', flush=True)
             first = json.loads(result.stdout)
             assert first['instance_id'] == config['instance_id'] and not first['protected_supported']
             checks = None
