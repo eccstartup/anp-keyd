@@ -8,10 +8,10 @@ cargo install --path .
 
 或者 `cargo build --release`,用 `target/release/anp-keyd`。
 
-没有别的依赖:不需要数据库、不需要网络、不需要配置文件。平台是 macOS 和 Linux。
+开发模式支持 macOS 和 Linux。Linux v2 使用 SQLite 和 root 管理的配置；protected supported 仍待真实主机验收。发行构建排除 hardware-software，安装/更新校验管理员给定的 SHA-256。
 
 ::: warning 一条纪律
-凡是需要口令的命令,都要求一个**真的控制终端**。cron、CI、systemd 的 `ExecStartPre`、被 agent 拉起来的子进程都在这一条外面 —— 这是设计,不是遗漏。
+交互式口令从控制终端读取。Agent 可以创建 PTY，所以终端本身不能证明人类在场；Linux v2 管理准入由独立管理员 UID 和经过认证的管理通道决定。
 
 口令从 `/dev/tty` 读,不走命令行参数、不走环境变量、不走 stdin；CLI 解锁时会经过 v1 socket。TTY 不是人类身份认证。
 :::

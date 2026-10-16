@@ -5,6 +5,7 @@ on:
       - 'src/**'
       - 'tests/**'
       - 'deploy/linux/**'
+      - 'adapters/**'
       - 'Cargo.*'
       - '.github/workflows/linux-boundary.yml'
   pull_request:
@@ -12,6 +13,7 @@ on:
       - 'src/**'
       - 'tests/**'
       - 'deploy/linux/**'
+      - 'adapters/**'
       - 'Cargo.*'
       - '.github/workflows/linux-boundary.yml'
 permissions:
@@ -35,6 +37,10 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Check Node v2 adapter syntax
+        run: |
+          node --check adapters/keyd-v2.mjs
+          node --check adapters/test-sdk.mjs
       - name: Build and test disposable service/admin/Agent domains
         run: >-
           docker run --rm

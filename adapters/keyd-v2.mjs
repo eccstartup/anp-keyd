@@ -47,7 +47,11 @@ export class KeydV2Client {
       throw error
     }
     // Send exactly the body and URL that the daemon signed.
-    return { ...status.result, method, body: bytes }
+    // Caller retains private application headers; the durable result contains
+    // only generated headers and the profile's covered content-type.
+    const outgoing = Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]))
+    for (const [name, value] of Object.entries(status.result.headers)) outgoing[name.toLowerCase()] = value
+    return { ...status.result, headers: outgoing, method, body: bytes }
   }
   async fetch(input) {
     const signed = await this.sign(input)

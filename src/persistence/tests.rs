@@ -2096,3 +2096,54 @@ fn trusted_hot_rotation_retires_old_key_revokes_grants_and_recovers_approved_doc
     );
     verify_audit(&f.db.connection).unwrap();
 }
+
+#[test]
+fn durable_http_result_preserves_covered_type_but_not_private_application_headers() {
+    let (mut f, key, policy) = grant_fixture();
+    let grant = new_grant(&mut f, &key, &policy);
+    let request =
+        crate::security::http::CanonicalHttpRequest::new(crate::security::http::HttpRequest {
+            method: "GET".into(),
+            url: "https://service.example.com/v1/orders".into(),
+            headers: std::collections::BTreeMap::from([
+                ("Content-Type".into(), "application/json".into()),
+                (
+                    "X-Api-Key".into(),
+                    "must-not-persist-test-credential".into(),
+                ),
+            ]),
+            body: crate::security::http::Body::Absent {},
+            nonce: None,
+        })
+        .unwrap();
+    let id = uuid();
+    let result = crate::security::executor::execute(
+        &mut f.db,
+        &grant.principal_id,
+        &grant.grant_id,
+        &id,
+        &request,
+        &FixedClock,
+        |_, _, _| Ok(fake_signed()),
+    )
+    .unwrap();
+    let value = serde_json::to_value(&result).unwrap();
+    assert_eq!(
+        value["result"]["headers"]["content-type"],
+        "application/json"
+    );
+    assert!(!serde_json::to_string(&value)
+        .unwrap()
+        .contains("must-not-persist"));
+    let stored: Vec<u8> =
+        f.db.connection
+            .query_row(
+                "SELECT result FROM requests WHERE request_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+    assert!(!String::from_utf8(stored)
+        .unwrap()
+        .contains("must-not-persist"));
+}

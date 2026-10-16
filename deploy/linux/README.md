@@ -1,8 +1,9 @@
-# Linux boundary preview (M1 + M2 persistence)
+# Linux v2 signing service and release gate
 
-This is a boundary implementation for integration testing. `protected_supported`
-and `signing_available` are false. No grants or signing are exposed on its data
-socket. The legacy `serve` command remains a separate development service.
+Linux v2 provides limited grants and durable signing. Protected release support
+remains false pending actual systemd-host acceptance. The legacy `serve` command
+is a separate development service. See the M5 section below for current migration,
+client and update workflows; earlier command examples require `--sha256` too.
 
 Build on Linux, then install a **new** instance as root:
 
@@ -26,7 +27,7 @@ The runtime does not infer this isolation from executable names or TTYs.
 `admin status`, `admin lock-all` and `admin unlock --vault-id UUID --did DID --kid KID`
 use the independent admin endpoint. Unlock is only usable for vaults explicitly
 staged by an administrator and listed in the root-owned bootstrap config; managed
-migration is pending M2/M5. Unlock prompts only after a service preflight, and
+migration is available through the offline tool below. Unlock prompts only after a service preflight, and
 re-authenticates the next connection before sending the password. There is no
 `--socket`, password argument or password environment override on this path.
 
@@ -59,7 +60,7 @@ schema checks. Audit/state changes commit together. Restart increments boot epoc
 revokes active grants, marks reserved requests outcome_unknown, invalidates pending
 approvals and leaves all keys locked. Audit write failure latches emergency stop;
 a restart is required after repair. These tables/recovery rules are implemented,
-but issuing grants/signing requests remains unavailable until M3/M4.
+and grants/signing now execute through the v2 transaction coordinator.
 
 M2 adds `admin catalog` and typed `admin prepare --file CHANGE.json` operations.
 The supported catalog actions are `EnrollVault`, `ConfirmRole`, `PublishPolicy`
@@ -91,7 +92,7 @@ Then inspect `admin catalog` and prepare role confirmation:
 `PublishPolicy` accepts a UUID, consecutive positive version and fixed-schema
 policy content (schema 1). Content is canonicalized and immutable; unknown fields,
 ambiguous origins/paths/queries and unsupported profiles are rejected. This stores
-policy versions; request evaluation and grants still belong to M3/M4.
+policy versions used by the current request/grant evaluator.
 
 `InstallDocument` accepts a vault UUID and an already signed public DID document.
 It verifies the proof/path binding and existing key roles, binds the previous and
@@ -168,7 +169,7 @@ updates must pass both toolchain jobs. Clippy completed with the existing hardwa
 test import warning at that baseline. No physical power-loss test or systemd host
 acceptance was claimed for that baseline.
 
-## M2 completion verification on 2026-10-16
+## Historical M2 completion verification on 2026-10-16
 
 Rust 1.88 and 1.90 Linux containers each passed 452 default tests, one explicit
 disposable identity fixture and 60 multi-UID boundary/management checks. macOS
@@ -178,9 +179,9 @@ intent before the first file write, repeated restart recovery, journal substitut
 rejection, migration rollback, unknown roles and policy immutability. Strict
 all-targets Clippy passed; the prior hardware import warning's feature guard is
 corrected. These are deterministic crash-boundary tests, not physical power-loss
-experiments. Systemd-host acceptance and the M3/M4 signing executor remain pending.
+experiments. At that checkpoint M3/M4 was still pending; the current executor is implemented, while systemd-host acceptance remains open.
 
-## M3 authorization preview verification on 2026-10-16
+## Historical M3 authorization preview verification on 2026-10-16
 
 Rust 1.88 and 1.90 disposable Linux containers each passed 467 default tests and
 one explicit temporary-identity fixture. Their independent-UID harnesses passed
@@ -189,9 +190,101 @@ stdio initialization, v2 tool schemas, caller-scoped keys and no legacy fallback
 Set `ANP_KEYD_TEST_MCP=1` to include those MCP checks in the container harness.
 macOS `mcp,hardware-software` passed 481 tests; strict all-targets Clippy passed.
 
-M3 adds exact-hot-key grants, revocation, immutable policy evaluation, dual-clock
+At the M3 checkpoint, the implementation added exact-hot-key grants, revocation, immutable policy evaluation, dual-clock
 deadlines, schema v3 and authenticated v2 CLI/MCP clients. Valid `SIGN_HTTP`
-requests still return `SIGNING_UNAVAILABLE`: M4 must supply transactional quota
-reservation, idempotency, signing and durable result delivery before activation.
+requests then returned `SIGNING_UNAVAILABLE`; M4 subsequently supplied transactional quota
+reservation, idempotency, signing and durable result delivery.
 `protected_supported` remains false. No host accounts or real identities were
-modified; systemd-host and real-service acceptance remain pending.
+modified. That historical record predates the current M5 real-service checks; systemd-host acceptance remains open.
+
+## M5 current implementation
+
+v2 now signs through durable reservation/result transactions and exact hot-key
+grants. Restart revokes all old grants and locks keys. `protected_supported=false`
+remains the release gate until actual systemd-host acceptance is recorded.
+
+Release binaries cannot enable `hardware-software`; the compiler rejects that
+combination. `build-info` reports build mode and sensitive feature flags. Install
+and update require a SHA-256 supplied from an independently verified build:
+
+```sh
+cargo build --locked --release
+sha256sum target/release/anp-keyd
+sudo python3 deploy/linux/install.py --binary target/release/anp-keyd \
+  --sha256 VERIFIED_SHA256 --admin-user operator --agent-user agent-a --agent-user agent-b
+# Stop the service before update. The tool also requires the exclusive state lock.
+sudo python3 deploy/linux/install.py --update --binary target/release/anp-keyd --sha256 VERIFIED_SHA256
+```
+
+`--allow-development-build` is an explicit testing opt-in; software test doubles
+and seed-export builds are rejected even with this flag. Updates never overwrite
+configuration/state or restart implicitly. Keep a compatible previous binary and
+verified state backup; a schema downgrade must remain offline rather than enable v1.
+
+### Offline migration and restore
+
+Stop all legacy daemons and lifecycle writers, including versions that predate the
+maintenance lock. Move the complete source into a root-owned directory with a
+root-controlled parent chain, take ownership of all files, and restrict secrets
+to 0600/directories to 0700. Do not leave another Agent-readable live source copy.
+Then run the read-only inventory and the explicit cutover:
+
+```sh
+sudo python3 deploy/linux/migrate-vault.py --source /root/frozen-vault
+sudo python3 deploy/linux/migrate-vault.py --source /root/frozen-vault --apply --recovery-dir /root/keyd-recovery
+```
+
+The tool preserves encrypted envelopes, device.secret, public documents and audit
+history, checks hashes, and opens every backup key through the operator's tty.
+It copies only necessary recovery material, never runtime sockets/PIDs or plaintext
+keys. Root remains responsible for stopping older processes and open FDs before
+freezing the source. New legacy writers hold shared maintenance leases; cutover
+requires the exclusive lease. Source gets a managed marker and remains root-owned.
+
+`migration.json` records the exact inventory/vault/instance and durable cutover
+phase. Re-run the same arguments after interruption. Partial backup/staging copies resume only from matching completed files; uncommitted
+private temporary files are discarded. Unknown completed bytes are preserved and
+refused for administrator inspection. Never discard the source or
+recovery copy. Completed copies must match the original manifest; unknown bytes
+stop the tool. Crashes between catalog/config changes cannot create grants:
+only root config introduces the UUID, and startup registers it with audit in one
+SQLite recovery transaction. Restart always invalidates grants.
+
+After restart: prepare/commit Catalog.EnrollVault, confirm roles explicitly,
+publish policy, unlock exact hot key, issue fresh grant, verify a real service,
+then switch clients to v2. Every imported key starts locked and unclassified.
+Restoring a recovery copy is the same migration process with its `vault/` as the
+source and a fresh recovery directory/UUID. Do not restore old grants or overwrite
+an active vault. Coordinate current remotely published documents before issuing
+grants: local restore cannot roll back a remote publication.
+
+The complete software snapshot plus its password can unlock keys; the recovery
+copy is sensitive. Hardware envelopes require their actual backend/device and
+fail closed when unavailable. Portable per-key archives remain readable through
+the existing offline import flow; import into an administrator-owned staging
+vault and then migrate. Historical plaintext exports/copies are not revoked.
+
+### Client and service validation
+
+`adapters/keyd-v2.mjs` provides a Node client and an existing anp-sdk connector.
+The Rust CLI performs service authentication, callers persist request IDs, and
+there is no automatic retry/downgrade. Production fetch uses the canonical signed
+URL, original body, daemon headers and manual redirects.
+
+Registration: prepare a `RegistrationChallenge` with exact root key, HTTPS origin
+and the supported 32-character lowercase hex challenge. Confirm its digest, then
+`admin complete-secret-operation --operation-id ID --digest DIGEST`; the root is
+transient and never becomes a data key. Runtime uses hot grants. `RotateHotKey`
+selects an already provisioned next hot key, removes the old method, signs the
+new document, revokes grants and journals file recovery. Independently publish
+and verify the returned document before making fresh grants. New hot material
+can be provisioned in an offline administrator staging vault; online generation
+is outside this first migration/rotation tool.
+
+The disposable multi-UID harness exercises the actual migrator. Optionally set
+`ANP_KEYD_ANP_TARGET` to a throwaway awiki-open-server physical origin configured
+with `public_base_url=https://example.com`, `did_domain=example.com` and strict
+signed-document verification. `anp-service-acceptance.py` verifies registration,
+hot authentication, replay/body/expiry rejection and published hot rotation.
+Only this test can send a logical HTTPS target over a separate physical local
+HTTP route; production adapter does not offer that override.

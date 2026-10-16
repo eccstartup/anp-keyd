@@ -5,6 +5,7 @@ service must use https://example.com as public_base_url and strict signed docs.
 Physical HTTP override is confined to this test; production adapter uses TLS.
 """
 import json
+from email.utils import parsedate_to_datetime
 import os
 from pathlib import Path
 import subprocess
@@ -91,11 +92,14 @@ def run(ctx):
     unlock(hot)
     if os.environ.get('ANP_KEYD_TEST_SDK'):
         sdk_grant = grant(hot)
-        signed_sdk = subprocess.run(['node', 'adapters/test-sdk.mjs', os.environ['ANP_KEYD_TEST_SDK'], sdk_grant, hot['key_id'], str(uuid.uuid4())],
+        signed_sdk = subprocess.run(['node', 'adapters/test-sdk.mjs', os.environ['ANP_KEYD_TEST_SDK'], sdk_grant, hot['key_id'], str(uuid.uuid4()), str(uuid.uuid4())],
             preexec_fn=identity('boundary-agent-a'), capture_output=True, text=True, timeout=30)
         assert signed_sdk.returncode == 0, signed_sdk.stderr
         sdk_result = json.loads(signed_sdk.stdout)
-        check('result' in send(sdk_result['body'].encode(), sdk_result['headers']), 'existing anp-sdk signRequest uses v2 connector; retry consumes exactly one use')
+        sdk_response = send(sdk_result['body'].encode(), sdk_result['headers'])
+        assert 'result' in sdk_response, sdk_response
+        check(sdk_result['sdkProtocolVerified'], 'existing anp-sdk verifies v2 connector and rejects replay; Node RPC authenticates actual service')
+        print(json.dumps({'external_sdk_hot_resolver_supported': sdk_result['sdkHotResolverSupported']}), flush=True)
     body, signed, _ = sign(old_grant)
     accepted = send(body, signed['headers'])
     assert 'result' in accepted, accepted
@@ -125,7 +129,17 @@ def run(ctx):
     check(denied['code'] != 'OK', 'revoked local grant cannot produce a real-service signature')
     short = grant(next_key, seconds=3)
     body, signed, _ = sign(short)
-    time.sleep(max(0, signed['expires_at'] + 31 - time.time()))
+    # Service and signer run on different hosts. Use the verifier's HTTP Date,
+    # not the Docker VM's wall clock, to cross its actual replay/time boundary.
+    waited = time.monotonic()
+    while True:
+        with opener.open(target + '/health', timeout=10) as health:
+            verifier_now = parsedate_to_datetime(health.headers['Date']).timestamp()
+        remaining = signed['expires_at'] + 32 - verifier_now
+        if remaining <= 0:
+            break
+        assert time.monotonic() - waited < 60, 'verifier clock did not advance'
+        time.sleep(min(remaining, 5))
     check('error' in send(body, signed['headers']), 'real verifier rejects expiry beyond its documented 30-second tolerance')
     if 'apply_migration' in ctx:
         restart_grant = grant(next_key)

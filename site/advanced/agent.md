@@ -1,3 +1,9 @@
+# Agent 接入与模式
+
+Linux v2 请使用仓库 `skills/anp-keyd/SKILL.md`、`adapters/keyd-v2.mjs` 或 `mcp --config`。必须提供管理员配置、grant 和持久 request_id；收到签名后按规范化 URL 与原 body 发送，不跟随重定向。没有普通 Agent challenge/password/raw 操作，错误不触发 v1 回退。`protected_supported=false` 仍是发行状态。
+
+以下保留旧开发模式接入说明，同 UID 不提供私钥隔离。
+
 # 接到 agent 上
 
 ## 一、MCP
@@ -26,7 +32,7 @@ MCP 客户端的配置里,那一行 `command` 就指向这个子命令,参数是
 | `get_did_document` | 取回一份本机发布过的文档 |
 
 MCP 不提供解锁工具或密码参数。用户通过本机 CLI 解锁；当前 v1 会经 socket
-发送口令，尚未实现受保护服务端互认。
+发送口令；Linux v2 管理客户端已有独立服务 UID 认证。
 
 ::: info 有一条明确的"没有"
 那条比 `Raw` 窄的挑战签名路(见[不显然的默认值](/reference/defaults#关于能签任意字节的那两条路))**不进 MCP**。

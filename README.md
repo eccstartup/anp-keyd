@@ -1,6 +1,6 @@
-> 日常签名仍使用开发模式。同 UID 的 Agent 不隔离；
-> v1 解锁口令会经过 socket。Linux 边界预览已接入持久 grant 与 v2 请求策略，但签名入口保持关闭，
-> `protected_supported=false`。软件整套目录加口令仍可解封；硬件仅保护解封材料。
+> Linux v2 已实现有限授权、事务签名、迁移和管理轮换。真实 systemd 主机验收仍待完成，
+> 因此 `protected_supported=false`。同 UID 开发模式不提供 Agent 隔离；v1 解锁口令经过 socket。
+> 软件整套目录加口令可解封；硬件保护的是解封材料。
 
 # anp-keyd
 
@@ -40,7 +40,7 @@ Signature: sig1=:VwRcADsdxfIJ5rQAXCXX3ygFsAP3l1ho+gdpNxcHzlZCdx/mef9yKzHgy9P1QzV
 [硬件根](#硬件根)一节、[docs/DESIGN.md](docs/DESIGN.md) 第九节,以及还没做完
 的部分(第十节)。
 
-## Linux v2 授权预览（M3）
+## Linux v2 授权与事务签名
 
 管理员通过 `admin prepare --file change.json` / `admin commit` 创建或撤销 grant；
 创建对象为 `{"kind":"Grant","change":{"action":"Create","principal_id":"…","key_id":"…","policy_id":"…","policy_version":1,"expiry":1792125000,"max_uses":2}}`。
@@ -64,9 +64,28 @@ Agent 使用 `anp-keyd data --file request.json`，默认读取 `/etc/anp-keyd/s
 
 启用 MCP feature 后使用 `anp-keyd mcp --config /etc/anp-keyd/service.json`，
 只提供 v2 授权工具，工具参数不能覆盖 socket、配置、DID 或 kid；未指定 `--config` 的旧 MCP
-仍是显式开发模式。M3 不执行签名或消耗次数：授权校验通过返回 `SIGNING_UNAVAILABLE`，
-请求查询返回 `REQUEST_NOT_FOUND`。事务预留、去重、签名及结果交付属于 M4；
-`protected_supported=false`。schema v1/v2 可审计升级到 v3；重启撤销旧 grant 并锁定密钥。
+仍是显式开发模式。v2 已接入事务预留、次数消费、持久请求去重、结果缓存与撤销。
+相同 request_id 与相同输入复用已提交结果；变更输入拒绝；不确定结果保留次数且不自动重签。
+`protected_supported=false`：systemd 真实主机验收仍未完成。重启撤销所有旧 grant 并锁定密钥。
+
+Node 适配器见 [adapters/keyd-v2.mjs](adapters/keyd-v2.mjs)，包含 v2 客户端和现有 anp-sdk
+`AnpConnector` 接口。最终发送使用 daemon 返回的规范化 URL、原 body 和签名头，禁用自动重定向。
+注册由可信管理端准备 `RegistrationChallenge`（exact root key、HTTPS origin、服务的 32 位小写 hex
+challenge），再 `admin complete-secret-operation` 输入口令完成。root 仅瞬时解封，不进入 Agent 会话。
+`RotateHotKey` 从预先配置的热密钥切换到下一把，重建并签署文档、撤销旧 grant、退休旧方法；
+返回的公开文档仍需独立发布和验证，新授权由管理员创建。不会自动宣称远端已切换。
+
+离线迁移先停止全部旧写者，把源放在 root 控制的路径并保护所有材料，然后：
+
+```bash
+python3 deploy/linux/migrate-vault.py --source /root/frozen-vault
+python3 deploy/linux/migrate-vault.py --source /root/frozen-vault --apply --recovery-dir /root/keyd-recovery
+```
+
+工具核对摘要并通过 tty 打开恢复副本的每把钥匙；保留恢复日志和副本，旧路径标记禁用。
+迁入后密钥锁定且角色未分类。启动服务，管理端 EnrollVault、确认角色并建立新 policy/grant，
+完成真实认证后切换客户端。恢复副本含 device.secret 和加密信封，必须保持管理员保护；
+硬件绑定材料不能靠复制绕过硬件，历史私钥副本也不会因此撤回。细节见 [Linux 部署说明](deploy/linux/README.md)。
 
 ## 安装
 
@@ -307,12 +326,12 @@ cargo install --path . --features hardware-tpm   # Linux:钥匙可以绑到 TPM 
 
 ## 它挡什么,不挡什么
 
-当前只有开发模式。socket 不返回私钥；信封提供静态加密，但同 UID 任意代码执行
+开发模式的 socket 不返回私钥；信封提供静态加密，但同 UID 任意代码执行
 可接触文件与进程，不能承诺 Agent 拿不到私钥。`/dev/tty` 不能认证人类。
 
 只复制不含 device.secret 的信封不足以解封；整套软件目录加口令可以解封。
 硬件绑定增加本机解封依赖，签名仍在 daemon 普通内存执行。本地审计链与锚
-可检测部分修改，不能抵御整套回滚。独立 UID 管理域已有 Linux 预览；有限 grant 尚未交付。
+可检测部分修改，不能抵御整套回滚。Linux v2 已实现独立 UID、有限 grant、事务签名、迁移与撤销；受保护发布门禁仍未开放。
 
 ## Linux 边界预览
 
@@ -322,7 +341,7 @@ M2 首批已接入 SQLite、启动恢复、事务审计，以及两阶段主体�
 服务账号、管理员与 Agent 使用独立 UID，管理面和数据面分别监听；客户端先验证
 服务内核 UID 再发送密码。配置和安装程序由 root 持有。
 
-这一阶段不开放数据面签名、grant 或密钥迁移，不能替代完整受保护版本。
+数据面签名、grant 和离线迁移已有实现；真实 systemd 主机验收前不能宣称完成受保护发行。
 安装器与一次性 Linux 容器验收见 [deploy/linux](deploy/linux/README.md)。
 旧 `serve`、CLI 和 MCP 开发流程继续保留，两种服务不会自动降级互通。
 
@@ -419,7 +438,7 @@ anp-keyd keygen --spec mybot.spec.json --hardware secure-enclave
 假警报,比日志乱一点糟得多。锁是 `.lock` 那个文件而不是某一份 `.jsonl`,
 因为后者换月会换成另一个。
 
-**整份 `~/.anp-keyd/` 拷到另一台机器上是打不开的**,这是设计不是缺陷 ——
+**整份软件 `~/.anp-keyd/` 加口令可以解封**；只有缺少 device.secret 或所需硬件根时才不能解封。
 一半的熵是这台机器的 `device.secret`,绑了硬件根的话还多一路。要在别的机器
 上用同一把身份,走下面那条路。
 
