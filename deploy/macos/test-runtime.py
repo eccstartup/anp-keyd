@@ -104,7 +104,7 @@ if status == 0:
  sys.exit('Agent obtained daemon task port')
 print('task_for_pid denied')
 '''
-            result = run(agent, sys.executable, '-c', script, process.pid)
+            result = run(agent, '/usr/bin/python3', '-c', script, process.pid)
             assert result.returncode == 0 and 'task_for_pid denied' in result.stdout, result.stderr
             print('PASS independent Agent UID cannot obtain daemon task port', flush=True)
             stop(process)

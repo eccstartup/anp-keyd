@@ -70,9 +70,18 @@ def main():
         denied = run(user, '/bin/cat', Path(config['state_dir']) / 'state.sqlite')
         assert denied.returncode != 0, 'Agent read daemon state'
         # Direct management-socket access must fail before it can send a payload.
-        script = 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])'
-        direct = run(user, sys.executable, '-c', script, config['admin_socket'])
-        assert direct.returncode != 0, 'Agent reached admin socket'
+        script = """import errno,socket,sys
+s=socket.socket(socket.AF_UNIX)
+try:
+ s.connect(sys.argv[1])
+except PermissionError as error:
+ if error.errno not in (errno.EACCES, errno.EPERM): raise
+ print('ADMIN_SOCKET_ACCESS_DENIED')
+else:
+ sys.exit('Agent reached admin socket')
+"""
+        direct = run(user, '/usr/bin/python3', '-c', script, config['admin_socket'])
+        assert direct.returncode == 0 and direct.stdout.strip() == 'ADMIN_SOCKET_ACCESS_DENIED', direct.stdout + direct.stderr
         print(f'PASS uid={principal["uid"]}: PTY admin denied, state unreadable, admin socket denied')
     print('PASS limited live installation checks. Outstanding gates are listed in README.md.')
 
