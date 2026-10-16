@@ -78,6 +78,17 @@ impl Client {
         )?;
         self.reply()
     }
+    pub fn catalog(mut self) -> Result<Reply> {
+        self.management()?;
+        protocol::write(
+            &mut self.stream,
+            &Envelope {
+                version: VERSION,
+                request: AdminRequest::Catalog {},
+            },
+        )?;
+        self.reply()
+    }
     pub fn prepare(mut self, change: crate::persistence::Change) -> Result<Reply> {
         self.management()?;
         protocol::write(

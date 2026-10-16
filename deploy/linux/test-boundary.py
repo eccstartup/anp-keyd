@@ -183,6 +183,50 @@ def exact(n):
 print(exact(struct.unpack('!I',exact(4))[0]).decode())
 assert s.recv(1)==b''
 '''
+    def prepare_change(change):
+        source = Path('/tmp/keyd-management-change.json')
+        source.write_text(json.dumps(change))
+        source.chmod(0o644)
+        result = command('boundary-admin', 'admin', 'prepare', '--file', str(source))
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)['prepared']
+
+    def commit_change(change):
+        prepared = prepare_change(change)
+        result = command('boundary-admin', 'admin', 'commit', '--operation-id', prepared['operation_id'], '--digest', prepared['digest'])
+        assert result.returncode == 0, result.stderr
+        return prepared
+
+    commit_change({'kind': 'Catalog', 'change': {'action': 'EnrollVault', 'vault_id': vault_id}})
+    listed = command('boundary-admin', 'admin', 'catalog')
+    catalog = json.loads(listed.stdout)['catalog']
+    check(all(k['role'] == 'unclassified' for k in catalog['keys']), 'vault enrollment never infers key roles from fragments')
+    refused = subprocess.run([sys.executable, '-c', admin_call, config['admin_socket'], json.dumps(unlock)], preexec_fn=identity('boundary-admin'), capture_output=True, text=True, timeout=12)
+    check(json.loads(refused.stdout)['code'] == 'KEY_ROLE_FORBIDDEN', 'unclassified key cannot be unlocked')
+    root_key = next(k for k in catalog['keys'] if k['kid'] == fixture['kid'])
+    change = {'kind':'Catalog','change':{'action':'ConfirmRole','key_id':root_key['key_id'],'role':'hot'}}
+    source = Path('/tmp/keyd-management-change.json'); source.write_text(json.dumps(change)); source.chmod(0o644)
+    check(command('boundary-admin','admin','prepare','--file',str(source)).returncode != 0, 'root cannot be relabeled as a hot signing key')
+    commit_change({'kind':'Catalog','change':{'action':'ConfirmRole','key_id':root_key['key_id'],'role':'root'}})
+    check(command('boundary-agent-a','admin','catalog').returncode != 0, 'Agent cannot inspect or mutate managed key roles')
+    for local_command in [('keygen','--spec','/tmp/unused-spec.json'),('publish','--did',fixture['did']),('serve',)]:
+        result = command('anp-keyd','--root',str(vault),*local_command)
+        check(result.returncode != 0 and 'managed vault requires' in result.stderr, 'service UID cannot use legacy local ' + local_command[0])
+    relative = subprocess.run([binary,'--root','new-untracked-vault','keygen','--spec','/tmp/unused-spec.json'],cwd=str(vault),preexec_fn=identity('anp-keyd'),capture_output=True,text=True,timeout=12)
+    check(relative.returncode != 0 and 'managed vault requires' in relative.stderr, 'relative nonexistent root cannot bypass managed directory guard')
+    alias=Path('/tmp/keyd-managed-vault-alias');alias.symlink_to(vault)
+    check(command('anp-keyd','--root',str(alias),'status').returncode != 0, 'symlink root cannot bypass managed directory guard')
+    alias.unlink()
+    policy_id = str(uuid.uuid4())
+    policy = {'schema_version':1,'name':'read-only','purpose':'http-authentication','origin':'https://example.com','methods':['GET'],'paths':['/test'],'query':{'mode':'none'},'body':{'mode':'empty','max_bytes':0},'signature_profile':'anp-http-v2','grant_limits':{'max_duration_seconds':60,'max_uses':2}}
+    commit_change({'kind':'Catalog','change':{'action':'PublishPolicy','policy_id':policy_id,'version':1,'content':policy}})
+    policy['unexpected'] = True
+    source.write_text(json.dumps({'kind':'Catalog','change':{'action':'PublishPolicy','policy_id':policy_id,'version':2,'content':policy}}))
+    check(command('boundary-admin','admin','prepare','--file',str(source)).returncode != 0, 'policy schema rejects unknown fields')
+    doc = json.loads(next((vault / 'dids').glob('*.json')).read_text())
+    commit_change({'kind':'Catalog','change':{'action':'InstallDocument','vault_id':vault_id,'document':doc}})
+    with sqlite3.connect(Path(config['state_dir']) / 'state.sqlite') as database:
+        check(database.execute("SELECT count(*) FROM file_operations WHERE state='complete'").fetchone()[0] == 1, 'managed document install completes durable file journal')
     unlocked = subprocess.run([sys.executable, '-c', admin_call, config['admin_socket'], json.dumps(unlock)], preexec_fn=identity('boundary-admin'), capture_output=True, text=True, timeout=12)
     check(unlocked.returncode == 0 and json.loads(unlocked.stdout)['code'] == 'OK', 'authenticated admin unlocks temporary vault, connection closes: ' + unlocked.stdout + unlocked.stderr)
     check(command('boundary-admin', 'admin', 'lock-all').returncode == 0, 'independent management lock works')
@@ -317,10 +361,10 @@ try:
 finally:
     saved.rename(state_path)
 with sqlite3.connect(state_path) as database:
-    database.execute('PRAGMA user_version=2')
+    database.execute('PRAGMA user_version=3')
 check(command('anp-keyd', 'serve-protected').returncode != 0, 'newer schema stops startup')
 with sqlite3.connect(state_path) as database:
-    database.execute('PRAGMA user_version=1')
+    database.execute('PRAGMA user_version=2')
     database.execute("UPDATE audit_events SET event_data=x'00' WHERE seq=1")
 check(command('anp-keyd', 'serve-protected').returncode != 0, 'corrupt audit stops startup')
 print(json.dumps({'passed': len(passed), 'protected_supported': False}), flush=True)

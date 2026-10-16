@@ -1,5 +1,6 @@
 //! Linux protected-boundary preview. No signing or production support yet.
 pub mod client;
+pub mod json;
 pub mod config;
 pub mod paths;
 pub mod protocol;

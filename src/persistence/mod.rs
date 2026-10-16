@@ -1,5 +1,7 @@
 //! Single-writer state and transactional audit. Never stores private material.
+pub mod catalog;
 pub mod clock;
+mod policy;
 
 use std::fs::OpenOptions;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -19,7 +21,7 @@ use crate::principal::Principal;
 use crate::security::config::ServiceConfig;
 use clock::Time;
 
-const SCHEMA: i64 = 1;
+const SCHEMA: i64 = 2;
 const APPLICATION: i64 = 0x414e504b;
 const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -28,6 +30,7 @@ const GENESIS: &str = "000000000000000000000000000000000000000000000000000000000
 pub enum Change {
     RegisterPrincipal { uid: u32 },
     DisablePrincipal { principal_id: String },
+    Catalog { change: catalog::CatalogChange },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
@@ -39,6 +42,9 @@ enum Resolved {
     },
     DisablePrincipal {
         principal_id: String,
+    },
+    Catalog {
+        effect: Box<catalog::CatalogEffect>,
     },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +59,7 @@ pub struct Prepared {
 pub struct Database {
     connection: Connection,
     pub boot_epoch: i64,
+    root: std::path::PathBuf,
 }
 fn db_error(_: rusqlite::Error) -> KeydError {
     unavailable()
@@ -123,6 +130,7 @@ impl Database {
         let mut connection = open_new(&path)?;
         Self::create(&mut connection, config, now)?;
         file.sync_all()?;
+        managed_marker(&config.state_dir, &config.instance_id)?;
         std::fs::File::open(&config.state_dir)?.sync_all()?;
         Ok(())
     }
@@ -189,8 +197,10 @@ impl Database {
         let mut db = Self {
             connection: open(&path)?,
             boot_epoch: 0,
+            root: config.state_dir.clone(),
         };
         db.recovery(config, now)?;
+        managed_marker(&config.state_dir, &config.instance_id)?;
         Ok(db)
     }
 
@@ -203,7 +213,7 @@ impl Database {
             .connection
             .query_row("PRAGMA application_id", [], |r| r.get(0))
             .map_err(db_error)?;
-        if version != SCHEMA || app != APPLICATION {
+        if !(version == 1 || version == SCHEMA) || app != APPLICATION {
             return Err(unavailable());
         }
         let integrity: String = self
@@ -221,6 +231,31 @@ impl Database {
             return Err(unavailable());
         }
         verify_audit(&self.connection)?;
+        let (instance, stored_schema): (String, i64) = self
+            .connection
+            .query_row(
+                "SELECT instance_id,schema_version FROM service_meta WHERE singleton=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(db_error)?;
+        if instance != config.instance_id || stored_schema != version {
+            return Err(unavailable());
+        }
+        if version == 1 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(db_error)?;
+            tx.execute_batch(include_str!("migration-v2.sql"))
+                .map_err(db_error)?;
+            append(
+                &tx,
+                &json!({"event":"SCHEMA_MIGRATED","from":1,"to":2,"at":now.wall}),
+            )?;
+            tx.commit().map_err(db_error)?;
+        }
+        catalog::recover_files(&mut self.connection, &self.root)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -330,7 +365,11 @@ impl Database {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;
+        let root = self.root.clone();
         let resolved = match change {
+            Change::Catalog { change } => Resolved::Catalog {
+                effect: Box::new(catalog::resolve(&tx, &root, change)?),
+            },
             Change::RegisterPrincipal { uid } => {
                 if uid == 0 || uid == u32::MAX || tx.query_row("SELECT EXISTS(SELECT 1 FROM principals WHERE uid=?1 AND state='enabled')", [uid], |r| r.get::<_,bool>(0)).map_err(db_error)? { return Err(invalid()); }
                 let generation: u32 = tx
@@ -368,7 +407,7 @@ impl Database {
             serde_json_canonicalizer::to_vec(&binding).map_err(|_| invalid())?,
         ));
         tx.execute(
-            "INSERT INTO admin_operations VALUES(?1,?2,'principal',?3,?4,?5,?6,?7,?8,'prepared')",
+            "INSERT INTO admin_operations VALUES(?1,?2,'management',?3,?4,?5,?6,?7,?8,'prepared')",
             params![
                 operation_id,
                 actor,
@@ -401,6 +440,17 @@ impl Database {
         digest: &str,
         now: Time,
     ) -> Result<()> {
+        self.commit_intent(actor, operation_id, digest, now)?;
+        catalog::recover_files(&mut self.connection, &self.root)
+    }
+
+    fn commit_intent(
+        &mut self,
+        actor: u32,
+        operation_id: &str,
+        digest: &str,
+        now: Time,
+    ) -> Result<()> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -416,6 +466,7 @@ impl Database {
             return Err(invalid());
         }
         match resolved {
+            Resolved::Catalog { effect } => catalog::apply(&tx, &self.root, operation_id, *effect)?,
             Resolved::RegisterPrincipal {
                 uid,
                 principal_id,
@@ -453,6 +504,14 @@ impl Database {
         tx.commit().map_err(db_error)
     }
 
+    pub fn catalog(&self) -> Result<catalog::Catalog> {
+        catalog::list(&self.connection)
+    }
+
+    pub fn check_key(&self, vault: &str, did: &str, kid: &str) -> Result<()> {
+        catalog::check_key(&self.connection, &self.root, vault, did, kid)
+    }
+
     pub fn record(&mut self, event: Value) -> Result<()> {
         let tx = self
             .connection
@@ -461,6 +520,37 @@ impl Database {
         append(&tx, &event)?;
         tx.commit().map_err(db_error)
     }
+}
+
+fn managed_marker(root: &Path, instance: &str) -> Result<()> {
+    let path = root.join(".anp-keyd-managed");
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(instance.as_bytes())?;
+            file.sync_all()?;
+            std::fs::File::open(root)?.sync_all()?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let meta = std::fs::symlink_metadata(&path)?;
+            if !meta.is_file()
+                || meta.nlink() != 1
+                || meta.uid() != std::fs::metadata(root)?.uid()
+                || meta.mode() & 0o777 != 0o600
+                || std::fs::read_to_string(&path)? != instance
+            {
+                return Err(unavailable());
+            }
+        }
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
 }
 
 fn unconfigured(path: &Path) -> Result<Connection> {
@@ -486,7 +576,7 @@ fn open(path: &Path) -> Result<Connection> {
     let app: i64 = connection
         .query_row("PRAGMA application_id", [], |r| r.get(0))
         .map_err(db_error)?;
-    if version != SCHEMA || app != APPLICATION {
+    if !(version == 1 || version == SCHEMA) || app != APPLICATION {
         return Err(unavailable());
     }
     settings(&connection)?;

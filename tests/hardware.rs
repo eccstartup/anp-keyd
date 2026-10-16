@@ -35,7 +35,7 @@ use anp_keyd::keystore::hardware::HardwareChoice;
 #[cfg(feature = "hardware-software")]
 use anp_keyd::keystore::record::HardwareRoot;
 use anp_keyd::keystore::create;
-#[cfg(feature = "hardware-software")]
+#[cfg(all(feature = "hardware-software", feature = "seed-export"))]
 use anp_keyd::keystore::wrap;
 
 #[cfg(feature = "hardware-software")]

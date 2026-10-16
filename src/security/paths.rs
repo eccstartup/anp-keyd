@@ -101,3 +101,29 @@ pub fn instance_lock(state: &Path, service_uid: u32) -> Result<nix::fcntl::Flock
     nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
         .map_err(|_| KeydError::Misuse("another service holds the state lock".into()))
 }
+
+/// Legacy local commands must never act as a maintenance backdoor into a
+/// managed vault, including when --root uses a symlink or a relative spelling.
+pub fn deny_managed_directory(path: &Path) -> Result<()> {
+    let mut existing = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    while !existing.exists() {
+        if !existing.pop() {
+            return Ok(());
+        }
+    }
+    let existing = existing.canonicalize()?;
+    for ancestor in existing.ancestors() {
+        if ancestor.join(".anp-keyd-managed").try_exists()?
+            || ancestor.join("state.sqlite").try_exists()?
+        {
+            return Err(KeydError::Permission(
+                "managed vault requires authenticated admin client".into(),
+            ));
+        }
+    }
+    Ok(())
+}

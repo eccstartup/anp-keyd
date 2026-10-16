@@ -79,6 +79,7 @@ pub fn probe(root: Option<&Path>, did: Option<&str>) -> Result<()> {
         None => KeydLayout::user_default()?,
     };
 
+    crate::security::paths::deny_managed_directory(layout.root())?;
     println!("anp-keyd memory & layout probe");
     println!("root: {}", layout.root().display());
     println!("(this command never prints key material)");

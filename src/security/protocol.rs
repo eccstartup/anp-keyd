@@ -29,6 +29,8 @@ pub enum AdminRequest {
     Capabilities {},
     #[serde(rename = "LIST_PRINCIPALS")]
     ListPrincipals {},
+    #[serde(rename = "GET_CATALOG")]
+    Catalog {},
     #[serde(rename = "PREPARE_OPERATION")]
     Prepare { change: crate::persistence::Change },
     #[serde(rename = "COMMIT_OPERATION")]
@@ -87,6 +89,8 @@ pub struct Reply {
     pub boot_epoch: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principals: Option<Vec<crate::principal::Principal>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<crate::persistence::catalog::Catalog>,
 }
 impl Reply {
     pub fn code(code: &str) -> Self {
@@ -100,6 +104,7 @@ impl Reply {
             prepared: None,
             boot_epoch: None,
             principals: None,
+            catalog: None,
         }
     }
 }
@@ -114,8 +119,7 @@ pub fn read<R: Read, T: serde::de::DeserializeOwned>(reader: &mut R) -> Result<T
     let mut bytes = Zeroizing::new(vec![0; len]);
     reader.read_exact(&mut bytes)?;
     // serde error messages can contain attacker supplied values, including passwords.
-    serde_json::from_slice(&bytes)
-        .map_err(|_| KeydError::Protocol("malformed protected request".into()))
+    super::json::decode(&bytes)
 }
 
 pub fn write<W: Write, T: Serialize>(writer: &mut W, value: &T) -> Result<()> {

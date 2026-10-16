@@ -363,13 +363,13 @@ impl DaemonState {
         self.unlock_guarded(uid, did, kid, passphrase, || Ok(()))
     }
 
-    pub(crate) fn unlock_guarded(
+    pub(crate) fn unlock_guarded<G>(
         &self,
         uid: u32,
         did: &str,
         kid: Option<&str>,
         passphrase: Zeroizing<String>,
-        before_install: impl FnOnce() -> Result<()>,
+        before_install: impl FnOnce() -> Result<G>,
     ) -> Result<()> {
         let (generation, wrapped, device_secret) = self.with_vault(uid, |vault| {
             let wrapped = store::resolve(&vault.layout, did, kid)?;
@@ -378,7 +378,7 @@ impl DaemonState {
         })?;
         // Expensive derivation must not hold the vault mutex: LOCK can cancel it.
         let key = crate::keystore::unwrap::unlock(&wrapped, passphrase.as_bytes(), &device_secret)?;
-        before_install()?;
+        let _install_guard = before_install()?;
         self.with_vault(uid, |vault| {
             if vault.generation != generation {
                 return Err(KeydError::Locked);

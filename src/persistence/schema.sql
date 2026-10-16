@@ -1,5 +1,5 @@
 CREATE TABLE service_meta (
- singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=1),
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=2),
  instance_id TEXT NOT NULL, boot_epoch INTEGER NOT NULL CHECK(boot_epoch>=0),
  mutation_epoch INTEGER NOT NULL CHECK(mutation_epoch>=0)
 ) STRICT;
@@ -14,7 +14,7 @@ CREATE TABLE keys (
  key_id TEXT PRIMARY KEY, vault_id TEXT NOT NULL REFERENCES vaults(vault_id), did TEXT NOT NULL, kid TEXT NOT NULL,
  role TEXT NOT NULL DEFAULT 'unclassified' CHECK(role IN ('unclassified','root','hot','recovery','challenge')),
  envelope_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('active','maintenance','retired')),
- identity_epoch INTEGER NOT NULL CHECK(identity_epoch>=0), generation INTEGER NOT NULL CHECK(generation>=0), UNIQUE(vault_id,kid)
+ identity_epoch INTEGER NOT NULL CHECK(identity_epoch>=0), generation INTEGER NOT NULL CHECK(generation>=0), document_digest TEXT NOT NULL, UNIQUE(vault_id,kid)
 ) STRICT;
 CREATE TABLE policies (
  policy_id TEXT NOT NULL, version INTEGER NOT NULL CHECK(version>0), content TEXT NOT NULL, digest TEXT NOT NULL,
@@ -44,4 +44,11 @@ CREATE TABLE admin_operations (
 ) STRICT;
 CREATE TABLE audit_events (
  seq INTEGER PRIMARY KEY CHECK(seq>0), prev TEXT NOT NULL, event_digest TEXT NOT NULL, event_data BLOB NOT NULL
+) STRICT;
+
+CREATE TABLE file_operations (
+ operation_id TEXT PRIMARY KEY REFERENCES admin_operations(operation_id),
+ vault_id TEXT NOT NULL REFERENCES vaults(vault_id), did TEXT NOT NULL,
+ before_digest TEXT NOT NULL, after_digest TEXT NOT NULL, document BLOB NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('pending','complete'))
 ) STRICT;

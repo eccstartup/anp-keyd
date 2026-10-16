@@ -201,6 +201,24 @@ impl Boundary {
         };
         match request {
             AdminRequest::Capabilities {} => unreachable!(),
+            AdminRequest::Catalog {} => {
+                let result = self
+                    .database
+                    .lock()
+                    .map_err(|_| ())
+                    .and_then(|db| db.catalog().map_err(|_| ()));
+                match result {
+                    Ok(catalog) => {
+                        let mut reply = Reply::code("OK");
+                        reply.catalog = Some(catalog);
+                        reply
+                    }
+                    Err(_) => {
+                        self.emergency();
+                        Reply::code("AUDIT_UNAVAILABLE")
+                    }
+                }
+            }
             AdminRequest::ListPrincipals {} => {
                 let result = self
                     .database
@@ -258,6 +276,7 @@ impl Boundary {
                     self.emergency();
                     return Reply::code("AUDIT_UNAVAILABLE");
                 };
+                self.lock_all();
                 let result = self
                     .database
                     .lock()
@@ -295,6 +314,14 @@ impl Boundary {
                 let Some(state) = self.vaults.get(&vault_id) else {
                     return Reply::code("KEY_NOT_FOUND");
                 };
+                let verified = self
+                    .database
+                    .lock()
+                    .map_err(|_| ())
+                    .and_then(|db| db.check_key(&vault_id, &did, &kid).map_err(|_| ()));
+                if verified.is_err() {
+                    return Reply::code("KEY_ROLE_FORBIDDEN");
+                }
                 // No disk path or default binding key may be selected by callers.
                 let prefix = format!("{did}#");
                 let Some(fragment) = kid
@@ -309,10 +336,15 @@ impl Boundary {
                     Some(fragment),
                     passphrase,
                     || {
+                        let guard = self.admin_gate.lock().map_err(|_| KeydError::Locked)?;
                         if self.stopped.load(Ordering::SeqCst) {
                             Err(KeydError::Locked)
                         } else {
-                            Ok(())
+                            self.database
+                                .lock()
+                                .map_err(|_| KeydError::Locked)?
+                                .check_key(&vault_id, &did, &kid)?;
+                            Ok(guard)
                         }
                     },
                 );

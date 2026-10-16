@@ -61,10 +61,60 @@ approvals and leaves all keys locked. Audit write failure latches emergency stop
 a restart is required after repair. These tables/recovery rules are implemented,
 but issuing grants/signing requests remains unavailable until M3/M4.
 
-M2 remains partial: key-role enrollment, concurrent KDF generation cancellation,
-managed migration and cross-file lifecycle recovery are not yet implemented. New
-management events use SQLite; existing JSONL files are retained without rewriting.
-Runtime state is not silently imported from old M1 preview configurations.
+M2 adds `admin catalog` and typed `admin prepare --file CHANGE.json` operations.
+The supported catalog actions are `EnrollVault`, `ConfirmRole`, `PublishPolicy`
+and `InstallDocument`, wrapped as `{"kind":"Catalog","change":{...}}`.
+Prepare returns the exact effect/digest; use the existing `admin commit` with that
+operation ID and digest. Only authenticated administrators can access this API.
+
+An administrator must first stage an existing vault under a configured UUID while
+the service is stopped, preserving its encrypted envelopes/device secret and
+protected ownership. `EnrollVault` validates the complete inventory against signed
+DID documents and records every key as `unclassified`. `ConfirmRole` binds an
+explicit role to exact kid, envelope and document digests. It checks the public key
+and relationships; an identity binding key cannot be marked hot/recovery/challenge.
+Re-enrollment revokes grants, preserves key handles and resets roles for confirmation.
+The automated old-vault copy/backup/cutover workflow remains M5.
+
+For example, prepare vault enrollment with this public JSON file:
+
+```json
+{"kind":"Catalog","change":{"action":"EnrollVault","vault_id":"VAULT_UUID"}}
+```
+
+Then inspect `admin catalog` and prepare role confirmation:
+
+```json
+{"kind":"Catalog","change":{"action":"ConfirmRole","key_id":"KEY_UUID","role":"root"}}
+```
+
+`PublishPolicy` accepts a UUID, consecutive positive version and fixed-schema
+policy content (schema 1). Content is canonicalized and immutable; unknown fields,
+ambiguous origins/paths/queries and unsupported profiles are rejected. This stores
+policy versions; request evaluation and grants still belong to M3/M4.
+
+`InstallDocument` accepts a vault UUID and an already signed public DID document.
+It verifies the proof/path binding and existing key roles, binds the previous and
+new document digests, and journals the exact approved bytes in SQLite. It provides
+no caller-supplied signing-input operation. The commit first enters maintenance and
+revokes grants, then atomically installs/fsyncs the document and records completion.
+Restart rolls a durable intent forward only if the file matches the approved old
+or new digest; an unknown file stops startup without overwriting it. Catalog-only
+changes and audit records are atomic; interrupted file completion remains in
+maintenance until recovery succeeds. Broader identity creation/rotation/backup
+adapters remain subsequent lifecycle work.
+
+KDF runs in a separate non-queueing single slot. Lock/metadata commit invalidates
+older unlocks by generation; key installation rechecks catalog/disk state under
+the management gate. Old local CLI commands (including `--root` symlinks, relative
+paths and standalone probe) reject managed state directories. They remain available
+for development vaults. No Agent gains access to protected vault files.
+
+Schema 1 upgrades transactionally to schema 2 after integrity, instance and audit
+validation; failed migration rolls back. Existing roles reset to unclassified.
+Unknown newer versions are refused. New management events use SQLite; existing
+JSONL files are retained without rewriting. Runtime state is not silently imported
+from old M1 preview configurations.
 For a NEW empty deployment only, explicit initialization is also available as
 `anp-keyd init-protected-state` under the configured service UID. Never use deletion
 and reinitialization as a migration or repair procedure.
@@ -115,5 +165,17 @@ to verify emergency stop, and refuses missing/newer/corrupt/linked databases.
 
 rusqlite 0.39.0 is pinned to preserve the tested Rust 1.88 baseline; future dependency
 updates must pass both toolchain jobs. Clippy completed with the existing hardware
-test import warning. No physical power-loss test, systemd host acceptance, or
-cross-file lifecycle recovery acceptance is claimed.
+test import warning at that baseline. No physical power-loss test or systemd host
+acceptance was claimed for that baseline.
+
+## M2 completion verification on 2026-10-16
+
+Rust 1.88 and 1.90 Linux containers each passed 452 default tests, one explicit
+disposable identity fixture and 60 multi-UID boundary/management checks. macOS
+`mcp,hardware-software` passed 465 tests. Eighteen persistence tests include actual
+old/new signed-document replacement with injected completion-audit failure, durable
+intent before the first file write, repeated restart recovery, journal substitution
+rejection, migration rollback, unknown roles and policy immutability. Strict
+all-targets Clippy passed; the prior hardware import warning's feature guard is
+corrected. These are deterministic crash-boundary tests, not physical power-loss
+experiments. Systemd-host acceptance and the M3/M4 signing executor remain pending.

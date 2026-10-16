@@ -62,6 +62,7 @@ impl Session {
             Some(root) => KeydLayout::at(root.to_path_buf()),
             None => KeydLayout::user_default()?,
         };
+        crate::security::paths::deny_managed_directory(layout.root())?;
         layout.ensure()?;
         let audit = AuditLog::open(&layout.audit_dir())?;
         let session = Self { layout, tty: tty::open()?, audit };

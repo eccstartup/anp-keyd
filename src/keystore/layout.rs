@@ -205,9 +205,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
 
     fs::rename(&tmp, path)?;
     // 让改名本身也落盘,否则崩溃后可能看到旧文件。
-    if let Ok(dir_handle) = fs::File::open(dir) {
-        let _ = dir_handle.sync_all();
-    }
+    fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 

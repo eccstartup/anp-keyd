@@ -255,6 +255,12 @@ pub struct AdminArgs {
 #[derive(Subcommand, Debug)]
 pub enum AdminCommand {
     ListPrincipals,
+    Catalog,
+    /// Prepare a typed management change from a public JSON file. No passwords or seeds.
+    Prepare {
+        #[arg(long)]
+        file: PathBuf,
+    },
     PrepareRegisterPrincipal {
         #[arg(long)]
         uid: u32,
@@ -856,6 +862,18 @@ pub fn run(cli: Cli) -> Result<()> {
             let client = AdminClient::connect(&args.config, true)?;
             let reply = match args.operation {
                 AdminCommand::ListPrincipals => client.principals()?,
+                AdminCommand::Catalog => client.catalog()?,
+                AdminCommand::Prepare { file } => {
+                    use std::io::Read;
+                    let limit = crate::security::protocol::MAX_FRAME / 2;
+                    let mut bytes = Vec::new();
+                    std::fs::File::open(file)?.take((limit + 1) as u64).read_to_end(&mut bytes)?;
+                    if bytes.len() > limit {
+                        return Err(KeydError::Misuse("management input too large".into()));
+                    }
+                    let change = crate::security::json::decode(&bytes)?;
+                    client.prepare(change)?
+                }
                 AdminCommand::PrepareRegisterPrincipal { uid } => {
                     client.prepare(crate::persistence::Change::RegisterPrincipal { uid })?
                 }
@@ -959,10 +977,12 @@ pub fn run(cli: Cli) -> Result<()> {
 // ————————————————————————————————————————————————————————————————————————
 
 fn layout(root: Option<&Path>) -> Result<KeydLayout> {
-    match root {
-        Some(root) => Ok(KeydLayout::at(root.to_path_buf())),
-        None => KeydLayout::user_default(),
-    }
+    let layout = match root {
+        Some(root) => KeydLayout::at(root.to_path_buf()),
+        None => KeydLayout::user_default()?,
+    };
+    crate::security::paths::deny_managed_directory(layout.root())?;
+    Ok(layout)
 }
 
 fn connect(root: Option<&Path>, socket: Option<&Path>) -> Result<Client> {
