@@ -79,6 +79,7 @@ fn help_template() -> String {
          \n\
          \x20 serve               Run the daemon: answer signing requests over a Unix socket.\n\
          \x20 serve-protected     Linux v2 transaction signer (release acceptance pending).\n\
+         \x20 audit-source        Fixed-command endpoint for independent audit collection.\n\
          \x20 audit-checkpoint    Verify SQLite history against an independently retained checkpoint.\n\
          \x20 build-info          Print build mode and security-sensitive feature flags.\n\
          \x20 inspect-vault       Inspect legacy inventory; --verify tests recovery via tty.\n\
@@ -164,6 +165,13 @@ pub enum Command {
     Admin(AdminArgs),
     /// Send one typed v2 data request through the authenticated configured endpoint.
     Data(DataArgs),
+    /// Fixed-command read-only endpoint for an authenticated independent collector.
+    AuditSource {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        instance_id: String,
+    },
     /// Read-only audit evidence; retain the output in an independent trust domain.
     AuditCheckpoint {
         #[arg(long)]
@@ -836,6 +844,15 @@ pub fn run(cli: Cli) -> Result<()> {
     let Cli { root, command } = cli;
     let root = root.as_deref();
     match command {
+        Command::AuditSource { database, instance_id } => {
+            if root.is_some() {
+                return Err(KeydError::Misuse("audit-source uses --database, not --root".into()));
+            }
+            let response = crate::persistence::checkpoint::source(
+                &database, &instance_id, std::io::stdin().lock())?;
+            println!("{}", serde_json::to_string(&response)?);
+            Ok(())
+        }
         Command::AuditCheckpoint {
             database,
             instance_id,

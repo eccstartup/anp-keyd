@@ -2225,3 +2225,29 @@ fn checkpoint_rejects_corruption_bad_formats_and_unsafe_inputs_without_writes() 
     assert!(checkpoint::inspect(&f.dir.join("missing.sqlite"), id, None).is_err());
     assert!(!f.dir.join("missing.sqlite").exists());
 }
+
+#[test]
+fn fixed_audit_source_binds_previous_and_refuses_implicit_enrollment() {
+    let mut f = Fixture::new();
+    let path = f.dir.join("state.sqlite");
+    let id = f.config.instance_id.clone();
+    let first = checkpoint::source(&path, &id,
+        br#"{"version":1,"enroll":true,"previous":null}"#.as_slice()).unwrap();
+    let op = f.disable();
+    let request = serde_json::to_vec(&checkpoint::SourceRequest {
+        version: 1, enroll: false, previous: Some(first.checkpoint.clone()),
+    }).unwrap();
+    let second = checkpoint::source(&path, &id, request.as_slice()).unwrap();
+    assert_eq!(second.previous, Some(first.checkpoint));
+    assert!(second.checkpoint.sequence > second.previous.unwrap().sequence);
+    for bad in [
+        br#"{"version":1,"enroll":false,"previous":null}"#.to_vec(),
+        br#"{"version":2,"enroll":true,"previous":null}"#.to_vec(),
+        br#"{"version":1,"enroll":true,"previous":null,"database":"/other"}"#.to_vec(),
+        vec![b' ';4097],
+    ] {
+        assert!(checkpoint::source(&path, &id, bad.as_slice()).is_err());
+    }
+    // Collection neither consumes an operation nor changes authorization state.
+    f.db.commit(1002, &op.operation_id, &op.digest, now()).unwrap();
+}

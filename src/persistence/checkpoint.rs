@@ -18,7 +18,7 @@ fn rejected() -> KeydError {
 }
 
 impl Checkpoint {
-    fn validate(&self, instance: &str) -> Result<()> {
+    pub fn validate(&self, instance: &str) -> Result<()> {
         if self.version != 1
             || self.instance_id != instance
             || !crate::principal::validate_uuid(instance)
@@ -124,4 +124,39 @@ pub fn inspect(path: &Path, instance: &str, previous: Option<&Checkpoint>) -> Re
     result.validate(instance)?;
     tx.commit().map_err(db_error)?;
     Ok(result)
+}
+
+/// Fixed-command SSH endpoint. Authentication and command restriction belong to
+/// sshd; callers cannot select a path or an instance through the wire request.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceRequest {
+    pub version: u32,
+    pub enroll: bool,
+    pub previous: Option<Checkpoint>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceResponse {
+    pub version: u32,
+    pub previous: Option<Checkpoint>,
+    pub checkpoint: Checkpoint,
+}
+
+pub fn source(path: &Path, instance: &str, input: impl Read) -> Result<SourceResponse> {
+    let mut bytes = Vec::new();
+    input.take(4097).read_to_end(&mut bytes)?;
+    if bytes.len() > 4096 {
+        return Err(rejected());
+    }
+    let request: SourceRequest = serde_json::from_slice(&bytes)?;
+    if request.version != 1 || request.enroll == request.previous.is_some() {
+        return Err(rejected());
+    }
+    let checkpoint = inspect(path, instance, request.previous.as_ref())?;
+    Ok(SourceResponse {
+        version: 1,
+        previous: request.previous,
+        checkpoint,
+    })
 }
