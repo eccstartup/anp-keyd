@@ -1,87 +1,44 @@
-# 出事的时候
+# 迁移与恢复
 
-## 换机器 / 重装系统
+## Linux v2：先验证恢复点
 
-先在**旧机器**上把身份导出(需要一个**一次性的、和日常口令不同的**导出密码):
+停止旧 daemon 和所有生命周期写者，将源材料放到管理员保护的路径。离线工具先只读检查，再执行迁移：
 
-```bash
-cargo install --path . --features seed-export
-anp-keyd export-seed --did did:wba:…
+```sh
+python3 deploy/linux/migrate-vault.py --source /root/frozen-vault
+python3 deploy/linux/migrate-vault.py --source /root/frozen-vault \
+  --apply --recovery-dir /root/keyd-recovery
 ```
 
-会得到 24 个词和/或一个 `.anpkeyd.json` 归档。
+工具执行维护锁、摘要核对、恢复副本逐钥验证和旧路径禁用。恢复副本包含 device.secret 和加密信封，必须保持管理员保护；不能留在 Agent 工作目录。硬件绑定不能靠复制绕过硬件依赖。
 
-::: danger 把词抄在纸上,不要放在这台机器上
-导出之所以默认不在二进制里,就是因为这条路能一键把整把身份抽干 —— 见[它挡什么,不挡什么](/concepts/trust-model)。
-:::
+新 vault 登记后，密钥锁定、角色未分类。管理员确认角色，发布策略、解锁并创建新 grant，完成真实服务认证再切换客户端。旧 grant 不因重启或恢复重新有效。
 
-然后在**新机器**上:
+数据库丢失或损坏时停止服务，恢复经验证的成套状态；不要生成空库、重算审计链尾或使用未知文件修补。文档已发布到网络的状态也需独立核对，本地回滚不会撤回线上变更。
 
-```bash
-anp-keyd import-mnemonic --did did:wba:…    # 24 个词
-anp-keyd import-archive --file x.anpkeyd.json
-```
+## 开发身份的便携恢复
 
-导入之后两件事必须知道:
+助记词和 anp-keyd-archive v1 属于另行控制的离线维护流程。export-seed 只在启用 seed-export 的构建中存在，该构建不声明受保护支持；不要为恢复方便把导出能力加进 Agent 数据面。
 
-1. **这是一把克隆,不是副本。** 导入出来的钥匙和旧机器上的是**同一把**,两边都能签,而且**验证方分不出来**。旧机器上的那一份要处理掉。
-2. **重新封装用的是这台机器的新 `device.secret` 和新口令。** 归档里的那个导出密码从此没用了。
+24 个 BIP-39 词直接编码 32 字节 Ed25519 seed，不使用标准 BIP-39 PBKDF2 seed 派生。用其他钱包的 to_seed 可能得到不同钥匙而不报错。
 
-## 装了钥匙的机器坏了,又没有备份
+恢复可使用 import-mnemonic 或 import-archive，将 seed 用目标环境的口令和 device.secret 重新封装；托管目录不能经本地生命周期 CLI 直接修改，需经过批准的迁入流程。
 
-钥匙没了。
+旧归档仍能用旧归档口令打开，不会因为导入后换了本地口令而失效。同一 seed 的所有副本都能继续签名，清理当前文件不能撤销历史泄露；需要轮换、身份迁移及验证方状态刷新。
 
-信封打不开,而且报的错和"口令敲错了"**一模一样** —— 这是**刻意的**:两者可区分,等于告诉拿到磁盘的人"你缺的是哪个因子"。
+## 丢失材料意味着什么
 
-::: danger 所以:趁机器活着,把 24 个词抄下来
-绑了硬件根的话,这一条从"该做"变成"**只能这么做**"。
-
-导出要先解信封,解信封要硬件,所以那台机器一旦不在,**就没有第二条路** —— 也不能把磁盘搬到别的机器上再导出。
-
-那正是硬件根要的性质,代价也就在这儿。
-:::
-
-## 怀疑哪里不对劲
-
-```bash
-anp-keyd probe
-anp-keyd probe --did did:wba:…
-```
-
-它报告这台机器能不能兑现这个工具给出的承诺:
-
-| 它查什么 | 查不出来会是什么症状 |
+| 丢失内容 | 影响 |
 |---|---|
-| 内存锁定建不建得起来 | 容器里 `ulimit -l` 太小、systemd 的 `LimitMEMLOCK` 没调,症状是**启动就失败** —— 这里能当场说清是哪一条不满足 |
-| 一次崩溃会不会把种子写到磁盘上 | —— |
-| `device.secret` 在不在、模式对不对 | —— |
-| 这台机器有没有可用的硬件根、是哪一种、**能不能真的用** | SE 那一侧最容易被看出来:芯片在、框架也编进去了,但没有 Apple 签发的证书就建不出持久的 SE 私钥,于是"绑了硬件"根本兑现不了 |
+| 只有信封，没有 device.secret | 不能按原软件封装解密；新生成 secret 不能补回 |
+| 完整软件目录，仍有正确口令 | 可解封；应把完整副本视为敏感备份 |
+| 硬件根不可用 | 原硬件绑定信封无法靠磁盘复制解封；需要事先验证的独立恢复材料 |
+| 没有任何可用 seed 或恢复材料 | 不能凭 DID、公钥或文档恢复私钥 |
 
-::: tip 它一个字节的密钥材料都不打印
-走 stdout 就是为了让你能放心把输出贴到 issue 里。
-:::
+备份准备好之后必须演练真实认证，不能只检查 JSON 可读或归档解密成功。
 
-## 还有一条路:文档
+## 排查入口
 
-如果出问题的是**已发布的文档**而不是本机钥匙,有两个命令直接查它:
+受保护模式使用 admin status、admin catalog 和 probe --security；开发模式使用 probe。公开文档可用 verify-doc --did DID --file FILE 检查；检查本地文档不等于证明远端已刷新。
 
-```bash
-# 别处取来的那一份
-anp-keyd verify-doc --did did:wba:… --file did.json
-
-# 不带 --file:验本机那一份
-anp-keyd verify-doc --did did:wba:…
-
-# 也能直接从管道里验
-curl -sS https://example.com/agents/mybot/e1_abc…/did.json \
-  | anp-keyd verify-doc --did did:wba:… --file /dev/stdin
-
-anp-keyd document --did did:wba:…          # 本机那一份的原文,逐字节
-```
-
-`document` 不用解锁 —— 那份文档本来就是给外面看的。
-
-## 接着看
-
-- [信封与归档](/concepts/envelope) —— 为什么导出必须先在本机解信封
-- [磁盘布局](/reference/layout) —— 审计日志里能查出什么
+签名超时先查询原 request_id，outcome_unknown 不自动重签。签名结果与业务服务结果分开处理，详见[Agent 接入](/advanced/agent)。

@@ -1,770 +1,348 @@
-# 适配层:把密钥管理从工具里抽出来
+# anp-keyd v2 接入说明
 
-这份文档要回答一个问题:
+更新日期：2026-10-16。本文面向 CLI、MCP、Node 和 ANP SDK 的接入者，描述当前可用接口、调用顺序及失败恢复。架构与威胁模型见 [DESIGN](DESIGN.md)。旧开发协议不作为受保护接入路径。
 
-> **anp-keyd 要成为 connectx、awiki-cli-rs2 这类 ANP 工具的密钥后端 —— 需要做什么设计,改什么?**
+## 1. 接入结果与兼容范围
 
-它是一份**提案**,不是已完成的设计。还没有实现的都在这儿,已经实现的指向
-[docs/DESIGN.md](DESIGN.md) 对应章节。
+接入后，Agent 保存公开身份信息、授权引用和请求状态，通过本地 daemon 请求签名，不加载长期私钥。管理员负责身份迁入、密钥角色、解锁、策略、grant 和轮换；Agent 获得的权限由服务端逐次执行。
 
----
-
-## 一、先把"抽出来"这句话拆开
-
-"把管理密钥的部分拿出来"听起来像一件搬运,其实是**一次边界重划**。它同时是两句话:
-
-1. **密钥的寿命由守护进程管。** 诞生、封装、口令、硬件根、解锁、轮换、迁移、注销、审计
-   —— 这些今天在客户端进程里做的事,全部搬到守护进程。
-2. **协议的理解仍归客户端。** 客户端知道什么是登录、什么是挑战、什么是 handle、
-   注册请求长什么样 —— 守护进程**一个都不认识**。
-
-第二句和第一句一样重要,而且更容易被做丢。一个"适配得最好"的版本,是把
-ANP-02 的语义也搬进守护进程 —— 那样每一次协议修订都变成一次守护进程发行,
-而守护进程为了适配第一个协议引入的每一条判断,都会挡在第二个协议前面。
-
-所以这份文档的目标不是"让 anp-keyd 更好用",而是:
-
-> **在不让守护进程认识任何一个具体协议的前提下,让它能满足这些工具的签名需求。**
-
-### 四条不变量(任何改动都不许碰)
-
-写在这儿,是因为下面每一条设计都在诱惑你放弃其中某一条。
-
-| # | 不许碰的东西 | 出处 |
+| 接入方式 | 当前能力 | 边界 |
 |---|---|---|
-| 1 | 私钥字节不出守护进程 | README 开篇 |
-| 2 | 覆盖面有下限,调用方只能加、不能减 | [DESIGN.md](DESIGN.md) §七 |
-| 3 | 生命周期操作(keygen/publish/export)不进 socket | [DESIGN.md](DESIGN.md) §七 |
-| 4 | 守护进程不联网 | `Cargo.toml`:上游 `default-features = false` 关掉了 reqwest |
+| Rust CLI `data` | 全部 v2 数据操作，认证 daemon，不自动重试 | Linux，读取受保护配置 |
+| Node `KeydV2Client` | 列钥、文档、授权/请求查询、结构化签名及 fetch | 调用 Rust CLI；Node 18+；body/URL 形态有限制 |
+| `keydV2Signer` | `signHttpRequest` 接缝 | 调用方负责稳定 request_id、发送与业务恢复 |
+| `keydV2Connector` | 现有 SDK createConfig/signRequest 接缝 | 生成 ANP-02 登录体；不接生命周期和注册挑战 |
+| 受保护 MCP | 五个 v2 授权工具 | 启动时固定 config，工具参数无密码或端点覆盖 |
+| 外部 SDK 高层热密钥解析 | 尚未兼容 | 已验版本 resolver 错将 hot 指纹与 DID 根指纹比较 |
+| awiki JSON-RPC | Node v2 client 按实际 RPC body 签名的链路已验收 | SDK 原生 ANP-02 body 不能直接当作 RPC envelope |
 
-第 1 条是这些工具**已经有**的(它们的密钥本来就在自己进程里);真正被抽出来的
-是第 2 条和第 4 条 —— 客户端不再自己拼签名基,也不再有网络访问密钥的能力。
+正式 Linux release 且配置显式为 `linux-protected-v1` 时支持保护声明。调试、preview、macOS、软件硬件替身及 seed-export 不在声明内。同 UID 不受限 Agent 不具有彼此隔离。
 
----
+## 2. 管理端与 Agent 分工
 
-## 二、边界:谁保留什么
+```text
+可信管理员：准备身份/热密钥 → 迁入并登记 → 确认角色 → 发布策略
+          → 解锁 hot key → 创建 grant → 交付公开引用
 
-| 层 | 归谁 | 为什么 |
-|---|---|---|
-| 密钥材料、封装、口令、硬件根 | **keyd** | 要抽出来的就是它 |
-| 解锁 / 上锁 / 空闲自动上锁 | **keyd** | 属于密钥的寿命 |
-| 签名基的构造、覆盖面下限、content-digest 的计算 | **keyd** | 防盲签落地的地方 |
-| 审计 | **keyd** | 它是防篡改的证据,不能放在被审计的那一侧 |
-| ANP-02 的请求体(nonce / did / didDocument / handle) | 客户端 | 协议会变;见第一节 |
-| 挑战循环(401 nonce、409 superseded 重试) | 客户端 | 是网络状态机 |
-| 注册、发现、resolve | 客户端 | 是网络;见 §4.3 |
-| DID 文档的构造与自签 | **keyd** | 公私钥必须出自同一处;`publish` 今天就在做 |
+隔离 Agent：列出可用 key → 按需读取公开文档 → 保存请求及 UUID
+          → 请求签名 → 发送原始字节 → 保存服务响应
 
-这张表读下来,客户端剩下的东西有一个名字:**它只剩下协议的形状,不再有密钥。**
-这正是目标。
-
----
-
-## 三、接口面:今天有什么,缺什么
-
-**写这份文档时** socket 上只有五种消息类型:`LIST_KEYS` `SIGN` `UNLOCK` `LOCK` `STATUS`
-([src/daemon/wire.rs](../src/daemon/wire.rs))。把适配要的东西清点一遍:三件缺的,
-一件已经够用的 —— 而且第三件和前两件**不是一类**,见 §3.3。
-
-**清点完之后落地的结果,先记在这里,免得往下读时对不上号:** §3.1 是给 `SIGN` 的
-结构化路径**加一个字段**(不是新类型),§3.2 是**加一个类型** —— 所以今天是六种,
-`GET_DOCUMENT` 是第六。§3.3 那一件**落地了,但没有加类型**:它是 `SIGN` 的第三个变体。
-
-### 3.1 缺的:`nonce` —— 而且**只**缺它
-
-**这是唯一一个真正的功能性缺口,而且它小得出奇:一个对守护进程完全不透明的字符串。**
-
-先把缺口讲清楚。`SIGN` 的结构化路径今天收 method / url / headers / body / covered,
-但 [src/sign/rfc9421.rs](../src/sign/rfc9421.rs) 调上游时写死了
-`nonce: None, created: None, expires: None`。上游 `anp` crate 在 `None` 时的行为是:
-`created` = 现在、`expires` = created + 300、`nonce` = **它自己随机生成的 16 字节**。
-
-而 ANP-02 登录要求这个值由**调用方**决定,不能由签名方自己挑。两条根据:
-
-1. **它同时出现在两个地方,而必须是同一个值。** connectx 的 `signAnpLoginRequest`
-   把 nonce 写进请求体(于是它进了 content-digest),**同一个值**再进
-   `@signature-params`。先有值、再造体、再算 digest —— 挑的人只能是客户端。
-2. **它在 401 之后会换一次。** 服务端可以在 `WWW-Authenticate` 里下发一个 nonce,
-   connectx 的 `signAndPost` 拿到 401 就**用它重签一遍**。这一步是网络状态机的一部分,
-   守护进程看不到(§4.3)。
-
-守护进程随机生成的那个值,客户端既拿不到、也来不及把它放进体里 —— **所以今天签不出
-登录。**
-
-**先把一处依据改准。** 一度写在这里的说法是"服务端验签时拿 `is_valid_nonce` 核对它
-是不是自己发出去的那一个"。**那不是它的行为。** `anp` 的 `did_wba_verifier` 里那个
-`is_valid_nonce` 是一个**重放缓存**:拿 `did:nonce` 当 key 记几分钟,新鲜的放行、重复的
-拒;awiki-open-server 那套(`consume_auth_nonce`)也一样,只要求一个新鲜值、一条长度上限
-和一个时间窗口。**它不比对"我发过哪些"。** 结论不变,但理由必须换成上面那两条 ——
-因为"服务端不比对"这句话单独看,会让人以为 keyd 自己随机一个也能用;而按上面那两条,
-错的地方根本不在服务端,在**体里的 nonce 和签名里的 nonce 不是同一个值**。
-
-**为什么"多存一个字段"解决不了它。** 这里要顶住一个很自然的想法:"nonce 不就是个值吗,
-keyd 把它一起存下来不就行了?"
-
-不行,因为**这个值不是 keyd 的**。它可能是服务端下发的(401 那次),也可能是调用方
-自己挑的 —— 但两种情况下它都**在调用方手里,而且要出现在请求体里**,而 keyd 既不看
-那个挑战(keyd 不联网,§4.3)、也不知道体里写了什么(体是调用方给的一串字节)。它是
-一次性的,不是状态,是一个**参数**。
-
-所以 nonce 不是"**该由谁保管**"的问题,是"**该由谁传**"的问题 —— 而 §3.2 讲的是保管,
-这一节讲的是传递。两者是两件事,这也是为什么它们各占一节。
-
-**设计:让 `nonce` 能从调用方传进来。就这一个字段。**
-
-给它的约束有两条:一条关于**长度**,一条关于**字符集**。
-
-- nonce 进签名基,**它的长度直接变成签名基的长度** —— 所以有一个上限(`MAX_NONCE_LEN`
-  = 256 字节),超了就拒。
-- 内容是**不透明的**。守护进程不该、也无从判断它是不是一个"合法"的 nonce —— 那是
-  服务端的判断。**一个替人保管私钥的进程去"理解"挑战,正是 §一 要防的那种越界。**
-
-**第二条约束是被上游逼出来的,不是洁癖。** 起初这里只写了长度那一条,直到读了
-`anp` 1.0.6 的 `serialize_signature_params`:它写 nonce 用的是
-
-```rust
-format!("nonce=\"{}\"", value)
+可信管理员：撤销 / 轮换 / 恢复 / 发布并验证 DID 文档
 ```
 
-**一个转义都没有。** 于是 `"` 能提前把引号合上,后面接的 `;keyid="..."` 就成了调用方
-自己写的参数 —— 也就是说,一个"不透明字符串"能把签名基里**别的参数换掉**;而 `\n`
-更直接:它凭空造出一整行,`@signature-params` 那一行以下是签名的输入。这不是 nonce
-自己有没有含义的问题,是**它能不能改到别人**。
+管理员通过 `/etc/anp-keyd/service.json` 中的独立管理端点操作；Agent 在独立 UID 下通过签名端点操作。配置、程序、socket 父目录和存储不可被 Agent 修改。不要以 root 或管理员 UID 启动不可信 Agent。
 
-所以长度之外加一条字符集检查:可打印 ASCII(`0x20`–`0x7E`),去掉 `"` 和 `\`。
-这一条比"不透明"更收,是因为上游那个格式化函数没有边界;把边界放在**我们这边**,
-是不去改一个不归我们管的 crate 就能做到的最短的路。真值域(生成它的服务端)本来
-就只用 base64url 那一类字符,所以这条限制在实践上碰不到任何人。
+安装器与迁移器位于 `deploy/linux/`。安装 release 需要管理员核对并提供 `--sha256`；安装、更新和迁移应使用一次性测试环境先验证。本文的运行期示例假定服务已经安装并启动，不能用于代替完整部署检查。
 
-一句话:**守护进程管长度和"能不能写进那一行",不管含义。**
+### 2.1 管理准备示例
 
-**不做的两件事,以及为什么。**
+以下文件均为公开管理变更，UUID 占位符须替换为真实 catalog/主体记录；策略中的 URL 也须与业务目标一致。密码不写入 JSON。
 
-- **不加 `created` / `expires` 的透传。** 两个客户端今天都不用它们:connectx 把 TTL
-  硬编码成 300 秒(`DEFAULT_TTL_SECONDS`),守护进程的默认也是 300 —— 一致,但**是靠
-  巧合一致**。为一个没人用的字段付出的代价是:一个线上字段、一次窗口上限检查、一次
-  "created 该落在时钟多小的邻域里"的检查,以及一条永远要重新讨论"窗口该多大"的未决项
-  —— 全部为了一个**今天不存在的需求**。这里正好适用 §3.4 的同一原则:**等真的需要时
-  再加,比现在猜一个结构要好。**
-  代价是那条耦合从"协议"变成了"两边各写一个 300 的常量",所以它必须是一条**写下来的
-  常量加一条验收**(§十一),而不是一个没人用的透传字段。**把巧合写成注释,比把它做成参数
-  便宜,而且不会假装它被谁控制着。**
-- **不为适配打开 `Raw`。** 见下面那段 —— 以及 §3.3:那里有一条路真的会把你推回这个
-  问题,而它最后走的是**一条有上界的路**,不是 `Raw` 本身。
+管理员先查看登记结果：
 
-**为什么"传一个 nonce"和"打开 `Raw`"是两件完全不同的事。** 这是整份文档最重要的一条线:
-
-> **传参不等于传字节。**
-
-`nonce` 是"**这次签名是什么**"的一部分,不是"**签什么内容**"。它进了签名基,所以它
-**被签了**。调用方改它,最坏结果是这条签名对不上服务端的挑战、被拒 —— 它伤不到别人,
-也换不来一条覆盖面更大的签名。**守护进程甚至不需要理解它**:管长度,不管含义。
-
-而 `Raw` 是"签什么内容"整个交出去 —— 那正是 [src/sign/rfc9421.rs](../src/sign/rfc9421.rs)
-开篇整整一段注释在防的盲目签名。
-
-**这一节的分量就这么多**:把这些工具接上 keyd,**登录**这条路上缺的是一个不透明字符串
-和一条长度上限。覆盖面的形状本来就对得上,那不是运气,是两边共用一个默认列表 ——
-见 §4.1。**注册**那条路上还有一件,而且它不是这一类 —— 见 §3.3。
-
-### 3.2 缺的:读已发布的 DID 文档
-
-**先澄清一处措辞:这一节和"不联网"(不变量 4)没有因果关系。** 读本地一份文件不是
-联网 —— 原来把它们写在了相邻的位置,读起来像因果,那是措辞的问题。真正的联系是**反
-过来**的:正因为守护进程没有网络,**它也不能替你去取文档** —— 它没法 HTTP resolve
-一个 DID。所以这条原语只能回答"**这台机器上发布过的**那些 DID",别人的 DID 它答
-不了,也不该答。
-
-**为什么客户端需要这份文档。** connectx 的登录体里要内联一份 DID 文档 —— 这是
-`did:wba` 的快路径:路径型 DID 把公钥**绑定**在标识符里,服务端因此能拿这份副本去
-核对 DID 本身。**本节落笔时** socket 上没有任何一条能拿到它:`LIST_KEYS` 只回
-`did / kid / algorithm`。(它已经落地了,见下面"设计"一段和 §九。)
-
-**为什么"多存几个字段"解决不了这件事。** 这一条值得说透,因为"keyd 只要存密码学材料
-加 DID、handle 就够了"听起来完全合理。keyd 存的是两样性质**不同**的东西:
-
-- **信封**(`keys/`):私钥的封装加公钥 —— **原始材料**。
-- **文档**(`dids/`):**一件已经签好名的成品**。
-
-第二样**不能从第一样推出来**:
-
-1. **它含声明,而那些声明不来自密钥。** service 条目、`agentDescriptionUrl`、每个
-   密钥的 fragment 名(`key-1` / `key-2` / `recovery-1`)、关系集合
-   (authentication / assertionMethod / keyAgreement)—— 全部来自规格文件。
-   **你提到的 handle 恰恰就在这里面**:它就是一条 `#handle` 的 `ANPHandleService`
-   声明,和一个能推导出来的字段。
-2. **它含一个签名**(`eddsa-jcs-2022` 的 proof)。JCS 规范化之后差一个字节,proof
-   就验不过。
-3. 比第 2 点更坏的一种:客户端重新构造出一份**自洽、但与已发布那份不同**的文档 ——
-   它自己的 proof 验得过,可是服务端手里有发布过的那一份,一比就是不一致。
-
-所以"存 DID 加 handle 就够了"这句话,落到实现上就是**让客户端自己构造文档**。而那条
-路已经被一条已有的决定堵死了([DESIGN.md](DESIGN.md) §七):
-
-> `publish` 要签的正是**一份文档**,如果把它做成消息类型,调用方就能让守护进程签
-> 任意一份文档 —— 那等于把防盲签那套设计从后门拆掉。
-
-链条很短:客户端自己造 → 造完总得有人签 → 能签的只有守护进程 → 于是守护进程就得签
-一份**调用方给的**文档。**§3.2 存在的理由就是这个**:让文档的**构造权**继续留在守护
-进程手里。客户端拿到的是一份成品,它只负责内联。
-
-(一条岔路值得点出:客户端**不需要重造**文档。真要一份不同的文档 —— 比如换一组
-service 声明 —— 答案是"写一份新规格,跑 `publish`",由人来做。不是"让 keyd 签我这
-一版"。)
-
-**设计:加一个只读的 `GET_DOCUMENT`。**
-
-**它不改变授权模型。** [wire.rs](../src/daemon/wire.rs) 那张表上写着"加一个类型到
-这张表里,等于改变整个授权模型" —— 那句话是对的,但**只对会签名的类型成立**。这条
-能读的东西不进覆盖面、不碰私钥、不产生签名。它是一次**读**的开放,不是一次**授权**
-的开放。
-
-**为什么走 socket,而不是让客户端直接读那个 0644 文件。** 三个理由,第一个最硬:
-
-1. **那文件在 0700 的目录里。** 它自己 0644,意思是"这份文件可以被谁读";可是
-   0644 的**文件**放在 0700 的**目录**里,换一个 uid 连**穿**都穿不进去(读文件要
-   路径上每一层目录的 `+x`)。`--system` 模式给每个 uid 一个命名空间,而"工具和守护
-   进程不是一个 uid"正是这里要支持的情形。
-2. **文档不一定在那儿。** `publish --out DIR` 可以把它写到别处。文档最终必须被放到
-   `https://<host>/<path>/did.json`,而**谁去放是你的事**(README 原话)—— `dids/`
-   只是默认落点,不是权威副本。
-3. **那是内部布局。** 客户端一旦按路径去读,布局就从实现细节变成了接口 —— 而一个
-   `--system` 下会变的布局,正是最不该被外部依赖的那种。
-
-顺带,这条也是审计的:一次"谁在什么时候取走了哪份文档"是可查的。
-
-**落地时的两个细节,都是"原样交回"这四个字逼出来的。**
-
-1. **交回去的是文件字节,不是解析过再序列化的一份。** 服务端那一头是
-   [`store::read_did_document_bytes`](../src/keystore/store.rs),不是已有的
-   `read_did_document`。区别在 `serde_json::Value`:默认的 `Map` 是有序的,一来一回
-   会把键重排,而这份文档**是一件签好名的成品,它的字节就是被签的那些字节** ——
-   重排之后交出去的就不是发布出去的那一份了。仍然解析一遍,但只为了一件事:
-   **不把一份读不懂的文件当文档交出去**。
-2. **不进 vault、不需要解锁。** 文档是可公开的,所以这条路径上不碰私钥、不产生签名、
-   也不上锁。它开放的是**一次读**,不是一次授权 —— 这正是这一节开头那句话的实现。
-   审计里记的是 `DOCUMENT_READ`,`did` 加一个**那一刻磁盘上那一份**的摘要。
-
-### 3.3 缺的,而且**和上面两件不是一类**:注册时那个挑战签名
-
-**这一节是核对了对端源码之后才加进来的**,而且是这份文档里唯一一处**会撞上 §十 那条线**的
-地方。写在这里,是因为它决定适配的边界画在哪儿 —— 不写,它就会在写 connector 的那天
-以"顺手开个口子"的形式冒出来。
-
-**对端要什么。** awiki-open-server 的注册,除了 DID 文档自签,还要一次**一次性挑战**的
-证明:服务端发一个随机串(`challenge`),客户端**对它的原始字节**做一次 Ed25519 签名,
-放进注册体的 `challenge_signature`。服务端那边是一行:
-
-```
-public_key.verify(b64u_decode(signature), challenge.encode("utf-8"))
+```sh
+anp-keyd admin --config /etc/anp-keyd/service.json list-principals
+anp-keyd admin --config /etc/anp-keyd/service.json catalog
 ```
 
-**这不是 RFC 9421。** 没有 method、没有 url、没有 headers、没有 covered —— 就是"把这串
-字节签了"。它和 §3.1 的 nonce 的差别是**整份文档的那条线画在的地方**:nonce 是"这次签名
-是什么",所以它被签;挑战是"**签什么内容**",而且它**没有形状**。
-
-**这不是理论上的。** awiki 自己的两个浏览器扩展正是这么做的
-(`signChallenge = ed25519.sign(utf8(challenge), priv)`),注释写的是 "proving possession
-of the key *right now* by signing a server-issued challenge"。**但要说准:那两个扩展
-不是 keyd 的客户端** —— 它们的私钥在浏览器里。所以这一类调用方今天就在,可**今天要用
-keyd 去驱动注册的工具,一个都没有**。
-
-**所以 §3.1 那句"缺的是一个不透明字符串和一条长度上限"对注册不成立。** 按 §十,能做这件事
-的只有 `sign --raw`,而 §十 明确不为适配打开它。这是这份方案里唯一一处要人拍的岔口 ——
-**已经拍了。**
-
-**三条路,以及挑了哪一条:**
-
-1. **不签,走不带挑战的那条。** 对端把挑战签名当**可选** —— 两个字段都给了才验,否则退回
-   文档自签那条路。代价是丢掉"提交者此刻持有私钥"这层绑定,而且**对端以后可以把它变成
-   必需**。
-2. **开一条比 `Raw` 窄的路:签调用方给的、有长度上限的、不透明的字节。** ← **挑的是这一条。**
-3. **承认注册不在适配范围内。** 和 §4.3「注册与发现不进守护进程」是一条线:守护进程只签
-   "这条注册请求",签不出的那部分不做,留给客户端自己实现。
-
-**为什么不是第一条。** 第一条今天一分钱不花 —— 两个已知客户端都不发这个字段(connectx 走
-共享的"签名 + 401 挑战重签"管线,awiki-cli-rs2 的注册 RPC 里根本没有它;§八,两条都核过)。
-选它等于把这件事留给**对端翻脸的那一天**。理由不是"awiki 的注册将来可能要它" —— 那个理由
-本身很弱,翻不翻"必需"不是我们能定的 —— 而是:**"应用要拿自己的钥匙签一串东西"本身不是
-DID 服务端的事**,它和 login / register / ANP-02 都不相干,注册只是第一个走到这儿的需求。
-既然它会反复出现,与其每次替它想一条专门的路,不如把最小的一条开出来,把边界写死。
-
-**为什么不是第三条。** 第三条把这件事推回每个客户端各写一份 —— 而私钥在守护进程里,
-客户端的"自己实现"只剩一种:再要一条更宽的签名路。那不是收窄,是把同一件事藏起来。
-
-**边界。这就是"不能顺手开"里的那个"不顺手",逐条写死:**
-
-- **上限 256 字节**(`MAX_CHALLENGE_LEN`,和 §3.1 的 nonce 同一个数)。这条是承重墙,不是
-  随手取的:它**低于任何一份 DID 文档、也低于任何一条签名基**。于是 §3.2 担心的那种滥用
-  —— 调用方自己构造一份文档让守护进程签 —— 在这里**构造上做不到**。
-- **不做字符集过滤。** 和 §3.1 正相反:那里的 `"` 和 `\n` 会被拼进签名基,所以要挡;这里的
-  字节**原样就是被签的内容**,没有拼接,也就没有可注入的地方。照抄一条字符集限制,只会把
-  边界说成一个它不在的地方。
-- **它不解释那串字节。** 不问是不是挑战、不解析、不校验、不重试 —— 和 §3.1 对 nonce 的
-  态度同源:一个替人保管私钥的进程去"理解"别人的挑战,正是 §一 要防的那种越界。
-- **单独一条审计**(`CHALLENGE_SIGNED`,记 `did` / 长度 / 摘要),和 `RAW_SIGNED` 分开 ——
-  事后要分得出"签的是挑战"还是"签的是别的"。
-- **单独的开关** `--allow-challenge-signing`,默认关;打开 `--allow-raw-signing` 时它自动
-  也开着,因为 `Raw` 严格更宽。
-- **落点在共用层。** 它是 `SIGN` 的第三个变体(`SignRequest::Challenge`),不是新消息类型,
-  也不是某一个前端的参数 —— §9.1 那条约束在这里照旧。
-
-**一句要说白的话,免得这条路被读得比实际干净:在密码学上,256 字节以内的挑战签名和 `Raw`
-产出的是同一个东西** —— 同一把私钥、同一串字节,出来是同样的 64 字节签名。差别全在**程序
-上**:一个长度上界、一条独立审计、一个独立开关、一个独立的名字。把它说成"另一种签名"是
-自欺;它是 `Raw` 的一个**有上界的、有名字的、每次留痕的**版本。§十 那句"窄路不是 `Raw`"
-因此只在**"有上界"**这一个意义上成立 —— 这个支点够不够承重,取决于那条上限,不取决于措辞。
-
-**两个已知客户端仍然都不发它**(§八),所以这条路**今天没有调用方**,默认也关着。开它不是因为
-眼下的需求,是因为把边界写下来比等它自己长出来便宜。
-
-### 3.4 够用的:`LIST_KEYS`
-
-客户端要回答"我用哪个 agent"这一个问题,`did / kid / algorithm` 够了。
-"哪把是根密钥""哪把是热密钥"这些**先不加** —— 客户端要的是签名密钥,给多了
-等于把内部结构开放成一个客户端会开始依赖的接口。见 §十二。
-
----
-
-## 四、三个硬决定
-
-### 4.1 适配的是 RFC 9421,不是 ANP-02
-
-守护进程**不认识** "login"、"register"、"handle"、"ANP-02" 这些词。
-
-**理由有两个,第二个是决定性的:**
-
-1. 协议会变。ANP-02 → 1.2 → 后续的每一次修订,都不该变成一次守护进程发行。
-2. **这些工具本来就都落在 RFC 9421 上。** awiki-cli-rs2 在 `anp` crate 上 —— 和
-   anp-keyd 今天调的是**同一个上游函数**。connectx 的基构造器是它**自己用 JS 写的**
-   (`src/core/crypto/signatureBase.ts`,不是那个 crate)—— **但那恰恰是要被抽掉的
-   那部分**:适配之后它不再拼基,只把 method / url / headers / body / nonce 交给守护
-   进程。也就是说"ANP 的签名"和"RFC 9421 的签名"在这些工具这里是同一件事,守护进程
-   只要把 RFC 9421 那一层说准(覆盖面 + 参数),两边都不用改自己对协议的理解。
-
-这条决定同时解释了一件事:**为什么 §3.1 的缺口只有一个 nonce。** 覆盖面下限
-`@method @target-uri @authority (+content-digest)` 就是两边的默认值 —— `anp` crate
-的默认覆盖面,和 connectx 的 `ANP_COMPONENTS`,是同一个列表。形状本来就对得上,差的
-只是参数。
-
-### 4.2 签名参数开放,覆盖面仍然是"只加不减"
-
-家规没变(DESIGN §七)。新增的只是"参数可以传"。
-
-要写清楚的是它们的**方向相反**:
-
-- 覆盖面:**客户端只能让签名保护得更多**,不许更少。
-- `nonce`:**客户端只能让这次签名是它要的那一次**,不许把它变成别的一次。
-
-一条"能减覆盖面"的路等于给调用方一个"悄悄签得比你以为的少"的开关 —— 那是
-把 §一 第 2 条不变量拆掉。这条线不因为新协议而移动。
-
-### 4.3 注册与发现不进守护进程
-
-`anp` crate 的 `default-features = false` 关掉了网络,而 README 说得很直白:
-"一个持有私钥的守护进程不应该有这些。"
-
-所以 connectx 的 `did register`、awiki 的注册流程,**全部留在客户端**。守护进程
-给的只是"签这条注册请求"。代价是客户端要自己实现挑战循环和重试 —— 而它本来
-就有(`register()` 里那一整套 401/409 处理)。
-
-**这条决定的证据不在文档里,在 Cargo.toml 里** —— 它是已经花过代价换来的,
-不该为了适配方便而退回去。
-
----
-
-## 五、身份的生命周期怎么切
-
-| 动作 | 今天在客户端 | 改成 | 理由 |
-|---|---|---|---|
-| 造一把密钥 | `connectx did create` | **keyd `keygen`** | 密钥必须诞生在守护进程里,否则第 1 条不变量从第一天就破了 |
-| 绑定到 DID 服务器 | `connectx did register` | 客户端(签名走 keyd) | 是网络,见 §4.3 |
-| 构造并自签 DID 文档 | SDK 内 | **keyd `publish`** | 已实现;公私钥同源 |
-| 把文档放到该在的地方 | 客户端 | **人** | README 原话:"这个工具不托管任何东西" |
-| 轮换热密钥 | — | keyd `rotate-hot-key`(**这两个工具都不调用**) | 见 §十 那张表 |
-| 迁移 / 注销 | `did update` | **keyd `migrate` / `deactivate`** | 已实现 |
-
-四处代价,都要说清楚:
-
-1. **客户端不能再自己推导 DID。** DID 是坐标加公钥算出来的,公钥在守护进程里。
-   所以客户端要**从守护进程读** DID 和文档,而不是本地算一个 —— 两边各算一次,
-   迟早会出现一个对不上的 DID,而那种 bug 的症状是"签名没问题是身份不对"。
-   (一条待核实的风险见 §十二:connectx 的指纹推导是它自己实现的。)
-2. **"注册"和"自持"是两个模型。** connectx 的 `did:wba` 是绑定到一台 DID 服务器
-   的;anp-keyd 的 `publish` 只写出文件,谁托管是你的事。适配层要做的不是抹平
-   这个差别,而是让客户端把"文件放哪儿"当成外部输入。
-3. **`publish` 不进 socket**(第 3 条不变量)。所以工具的首次装配里会有一段
-   **人工步骤**。这是设计,不是待办。
-4. **已经存在的身份搬不进来 —— 已有的 DID 会换掉。** keyd 只收**种子**:24 个词
-   (`import-mnemonic`)或一个归档(`import-archive`),而这两样东西的前提都是
-   "这把钥匙当初就在 keyd 里"。一把由**别的工具**生成的 did:wba 密钥没有这条路
-   —— 它导不出 keyd 认的那 24 个词。`import-mnemonic --did X` 也不是"随便填个
-   DID"就能接上:它拿词推出来的公钥去和 X 的 `e1_` 段**逐字符**比,对不上直接拒
-   ([src/ops/import.rs:356](../src/ops/import.rs:356) 的 `check_fingerprint`)。
-   **所以"把现有身份迁到 keyd"通常等于换一个 DID** —— did:wba 把公钥焊在标识符
-   里,新密钥必然是新的 DID。要保住旧 DID,唯一的入口是它当初就从 keyd 出去过。
-   这条不是缺陷,但它决定了**时机**:这件事要在身份还新的时候做,而不是等它在
-   别的地方跑熟、被服务端记熟了之后。
-
----
-
-## 六、运行模型:锁定是常态,不是故障
-
-守护进程默认空闲 15 分钟自动上锁。一个跑得久一点的工具会话,中途一定会撞上
-`Locked`。
-
-**设计:`Locked` 是一个可重试的结果,不是一次失败。** 调用方把它原样交回给人,
-人在终端 `anp-keyd unlock`,然后重跑这条操作。
-
-这不需要发明什么 —— connectx 里已经有这个形状:OKX provider 遇到钱包要确认时,
-不是 `--force` 硬来,而是回一个 `wallet_confirmation_required`,让驱动它的 agent
-等一个人。**同一个模式,换一个原因。**
-
-要写下来的只有一句话:**适配层不许自己重试,也不许把 `Locked` 翻译成
-"签名失败"。** 前者会在人看不到的地方空转,后者会让人去查一个不存在的错误。
-
----
-
-## 七、两套错误词汇怎么碰头
-
-守护进程的码**故意是粗的**([wire.rs](../src/daemon/wire.rs) 里那段注释:错口令和
-错 `device.secret` 合成一个码,分得越细越是给爆破的人送信息)。客户端的码是细的
-(connectx 有九个值的错误词汇)。
-
-**设计原则:映射只能变粗,不能变细。**
-
-| keyd 的码 | 客户端应该报什么 | 不许报什么 |
-|---|---|---|
-| `BadCredential` | 解锁失败 / 需要口令 | "口令错"与"因子缺"分开 |
-| `Locked` | **可重试**,交回给人 | 一次失败 |
-| `KeyNotFound` | 这个 DID/密钥不在这台机器上 | 猜一个 |
-| `HardwareUnavailable` | 硬件根不在(这句可以说全,它本来就是给人看的) | 降级继续 |
-| `CoveredSetRejected` | 适配层提的需求守护进程不签 | 自动降级成一小组重签 |
-| `Protocol` / `Internal` | 内部错误,无信息量 | 把上游文本透出去 |
-
-最后一行值得单独说:守护进程的 `Internal` 按它自己的约定**要求消息对调用方
-无信息量**。适配层**不许**在这里做"帮它说清楚一点"的好事。
-
----
-
-## 八、客户端侧要写什么
-
-### connectx:一个 connector,不是一个 provider
-
-connectx 有两个接缝,要挑对的那一个:
-
-- **`AnpConnector.signRequest(req)`** —— 收 method / url / nonce / handle,
-  回 body 加签名头。**形状正好对上** keyd 的结构化路径。
-- **EIP-1193 provider** —— 只提供 `signMessage` 这一级的原语,太细了。用它就得
-  开 `Raw`,而 §3.1 已经论证过那是不该开的门。**这一类原语还有第二个入口**:§3.3
-  的挑战签名也是"签一串没有形状的字节"。它够不到 `signRequest` 的形状,所以
-  connector 这个接缝**挡得住它** —— 真要用(而 connectx 今天根本不发它),那也该是
-  connector 上**另一个有名有姓的方法**,不是把 provider 那条通用口子打开。
-
-所以是 connector。**实现纪律照抄 `providers/README.md` 里那条教训**:适配器里
-不出现钱包知识、不出现协议知识,**只做转发和错误翻译**。一个 keyd connector 里
-出现 "ANP" 这个词,就是边界划错了地方。
-
-### awiki-cli-rs2:接缝已经在了,而且它的形状就是 keyd 的形状
-
-**源码核过了(2026-10-14,`~/code/claude/awiki-cli-rs2`)。** 结论比预期的好:
-它不是"要不要为它抽象一层"的问题 —— **那层已经在了,而且已经插过第二种 custody。**
-
-那层叫 `IdentitySigner`(`crates/im-core/src/internal/key_provider/mod.rs`),同步,
-方法正好是 §三 那两条原语的形状:
-
-- `did_document()` / `optional_did_document()` —— 就是 §3.2 的 `GET_DOCUMENT`。
-- `http_signature_headers(kid, url, method, headers, body, options)` —— 就是 §3.1
-  的结构化 `SIGN`,而且 `options`(`anp::authentication::HttpSignatureOptions`)
-  **本来就带 `nonce` / `created` / `expires` / `covered_components` 四个字段。**
-
-关键是它**已经有好几个实现**,而**其中两个正是"custody 在别处"的做法**:
-
-| 实现 | custody 在哪 |
-|---|---|
-| `FileBackedIdentitySigner` / `HostedIdentitySigner` / `VaultBackedIdentitySigner` | 本进程,私钥 PEM 在手里 |
-| **`AnpIdentitySigner`** | **转手给 `anp-identity` crate**:`identity.prepare_http_signature(ExactHttpRequest{…})` |
-| `ProviderIdentitySigner` | 转手给一个异步 `IdentitySession`(外部进程) |
-
-`AnpIdentitySigner` 把 `http_signature_headers`、`sign_object_proof`、
-`sign_document_proof`、`sign_origin_proof`、`legacy_did_wba_header` **逐个覆盖**,
-每一个都转手给 custody 层,im-core 这层手里没有私钥材料。**这就是 keyd 要照抄的
-模板**:再写一个 `KeydIdentitySigner`,同样那几个覆盖,把结构化请求发给守护进程。
-
-**为什么不能接在那个 `sign` 上。** trait 里确实有一个底层原语
-`sign(kid, message: &[u8])`,而那几段默认实现都落在它上面 —— **那正是 `Raw` 的形状**,
-接上去等于 §十 那条线白划。所以落点是**覆盖那几个结构化方法**,不是实现那个最底层的。
-(它旁边还有一层异步的 `IdentitySession` / `IdentityCustody`,是给"custody 在另一个
-进程"准备的;`export_root_for_legacy_envelope` 的默认实现返回 `CapabilityUnavailable`
-—— **做不到的能力声明做不到,不假装**,和 keyd 的 `probe` 是同一种脾气。)
-
-**一处要留意的错位。** `sign_document_proof` 收的是**调用方构造的文档**。keyd 不签
-调用方给的文档(不变量 3、§3.2),这边对应的答案是"文档由 `publish` 造、客户端用
-`GET_DOCUMENT` 取"。所以这个方法在 keyd 后端里要么不实现,要么转成取文档 ——
-**注册那一段的改法和其余几段不一样**,这一点在动手时要单独想。
-
-**§3.3 那个挑战签名,它不发。** `challenge_signature` 在这个仓库里一次都没出现
-(Rust / TS / Dart / 文档全查过);注册 RPC 的 payload 是
-`did_document / handle / name / phone / otp_code / email / invite_code`
-(`crates/im-core/src/internal/identity_wire/registration.rs`)。
-
-**顺带一条和 §12.3 对上号的:** 它钉死 `anp = "=1.0.3"`(path 依赖 `../anp/anp/rust`,
-配 `anp-release.lock.json` 的 `candidateVersion: 1.0.3`)—— **和 Python 服务端
-`anp==1.0.3` 同版**。所以那道错位是"整条 awiki 都在 1.0.3,只有 keyd 在 1.0.6"。
-
----
-
-## 九、第二个门面:MCP
-
-**这一节在适配文档里,因为 MCP 是这件事"已经做过一遍"的证据。** keyd 今天就有第二个前端:agent 直接对它说话、不经过任何工具 —— 而它没有变成第二套实现。适配层要抄的正是这个做法。
-
-**它是什么。** `anp-keyd mcp` 子命令(`--features mcp`),在 stdin/stdout 上说 MCP,把 `list_my_keys` / `status` / `unlock` / `sign_request` / `get_did_document` 这几个工具转发给守护进程。一个 MCP 客户端的配置里那一行是:
+迁入 vault 的密钥初始为 unclassified。准备角色确认 `role.json`：
 
 ```json
-{"mcpServers": {"anp-keyd": {"command": "/path/to/anp-keyd", "args": ["mcp"]}}}
+{"kind":"Catalog","change":{"action":"ConfirmRole","key_id":"HOT_KEY_UUID","role":"hot"}}
 ```
 
-**为什么它不算第三条路。** 它自己不开密钥库、不碰密码学、不持口令、不持连接 —— 一次调用连一次 socket,和 `client` 的约定一致。所以它和"工具通过 socket 驱动 keyd"不是并列的两条路,**它们是同一扇门的两种说话方式**。三条理由,分量递增([src/mcp/mod.rs](../src/mcp/mod.rs) 模块头):
+对每个管理变更使用以下两步；检查返回的 `prepared.effect`、摘要及期限，再提交该次批准：
 
-1. `client` 里已经有正好这几个操作,一行不多一行不少。
-2. 自动上锁、审计、覆盖面下限这些判断**只有一处**。门面各自实现一遍,迟早会有一边的墙少砌一块。
-3. 这个进程是**agent 拉起来的**,跑在 agent 的 uid 下。走 socket 意味着守护进程那边的对端凭证检查、策略、按 uid 分命名空间**照旧生效**;要是把密钥库读进来在本地解封,这一整层就被绕过去了 —— 而且绕过它的是"我们自己的 MCP 服务器"这种听起来很正当的东西。
+```sh
+anp-keyd admin --config /etc/anp-keyd/service.json prepare --file role.json
+anp-keyd admin --config /etc/anp-keyd/service.json commit \
+  --operation-id PREPARED_OPERATION_UUID --digest PREPARED_DIGEST
+```
 
-第 3 条是这一节最值得搬走的东西:**第二个前端最容易犯的错,是在第二个进程里重新实现一遍授权。** 适配层的 connector 面对的是同一个诱惑。
+根绑定钥匙不能被确认成 hot。并发管理变更、过期或重启可能使批准失效，此时重新 prepare；不能复用旧摘要提交另一份内容。
 
-### 9.1 对 §三 那几件缺的东西,这条约束是真的
+策略变更 `policy.json` 的实际结构如下：
 
-上面那段不是原则宣讲。它落在适配这一侧,有一条具体的、会咬人的:
+```json
+{
+  "kind": "Catalog",
+  "change": {
+    "action": "PublishPolicy",
+    "policy_id": "POLICY_UUID",
+    "version": 1,
+    "content": {
+      "schema_version": 1,
+      "name": "read-agent-status",
+      "purpose": "http-authentication",
+      "origin": "https://service.example.com",
+      "methods": ["GET"],
+      "paths": ["/v1/status"],
+      "query": {"mode": "none"},
+      "body": {"mode": "empty", "max_bytes": 0},
+      "signature_profile": "anp-http-v2",
+      "grant_limits": {"max_duration_seconds": 900, "max_uses": 100}
+    }
+  }
+}
+```
 
-**§3.1 的 `nonce` 必须加在共用的那一层,否则它只对一半调用方成立。**
+同样 prepare/commit 发布。policy 版本不可变，后续修改须使用连续新版本。`origin` 使用小写 DNS host，不写默认 `:443`；路径精确匹配。query 可为 `{"mode":"none"}` 或 `{"mode":"exact","value":"page=1"}`。body 可为 empty 或 bounded，bounded 要求显式 present，即使字节为空。
 
-`anp-keyd sign` 的参数和 MCP 的 `SignArgs` 是两个**分开的结构体**,各自构造同一个 `SignRequest::Structured`([src/cli.rs:1369](../src/cli.rs:1369) 与 [src/mcp/mod.rs:237](../src/mcp/mod.rs:237))。加了 nonce 之后漏掉第二个,症状不是编译错误,也不是"MCP 坏了" —— 是**走 MCP 的 agent 登不了录**,而同一个 agent 在命令行上怎么试都是好的。排查成本全花在"另一个入口"这四个字上。
+创建 grant 的 `grant.json`：
 
-**落地时这一条守住了,而且是被四条测试分头守住的**(这条约束本身不会自己成立,得有人去钉):`wire` 那条 round-trip、`daemon::handlers` 的 `a_caller_supplied_nonce_reaches_the_signature`、`tests/cli.rs` 和 `tests/mcp.rs` 各一条端到端(`..._over_mcp` 那条)。最后一条是真正被 §9.1 点名的那一条 —— 它走 MCP 子进程、拿上游的验签实现验,所以"命令行能签、agent 不能"这种分叉在这儿会红。
+```json
+{
+  "kind": "Grant",
+  "change": {
+    "action": "Create",
+    "principal_id": "AGENT_PRINCIPAL_UUID",
+    "key_id": "HOT_KEY_UUID",
+    "policy_id": "POLICY_UUID",
+    "policy_version": 1,
+    "expiry": 0,
+    "max_uses": 10
+  }
+}
+```
 
-所以这一节给 §3.1 / §3.2 补一条约束,不改它们的结论:**那两个加法的落点是 `wire` 的类型和它下游的共用代码,不是某一个前端的参数表。** 每多一个前端,就多一处要记得同步、而编译器不会提醒你的地方。§9.4 的两条测试存在的理由就是这个。
+**`expiry: 0` 必须在执行前替换为未来 Unix 秒数**，且剩余期限不超过策略的 900 秒上限；0 不表示永久有效。提交后使用返回 effect 中的 grant_id，不能把 key_id 当作 grant_id。grant 绑定 exact key 和 principal，不能转交给另一个 UID 使用。
 
-**§3.3 那一条是反过来读的,而且更该读。** 前两件缺的是"多一个字段",落点错了
-顶多是漏一个入口;§3.3 缺的是"要不要开一扇新门" —— 一旦有人图省事在**某一个**
-前端里把它开了(`mcp` 的 `sign_request` 加个 `--raw` 形状的参数,或者 connector
-自己实现一遍),第二个前端要么跟着重开一遍,要么就出现"命令行能签注册、agent
-不能"这种按入口分叉的授权。**门的形状只该有一个,而且只在共用层。** 所以 §3.3 的
-三选一**在动手之前就拍了**,没有留给写 connector 的那天 —— 拍的结果落在共用层:`SIGN`
-的第三个变体,不是任何一个前端的参数表。
+管理员通过受认证通道解锁指定 hot key：
 
-### 9.2 `unlock` 是这几个工具里唯一带秘密的那个
+```sh
+anp-keyd admin --config /etc/anp-keyd/service.json unlock \
+  --vault-id VAULT_UUID --did DID --kid FULL_KID
+```
 
-**没什么可回避的:接了 `unlock` 的 agent 手里会有口令。** 三条限制让它不至于变成灾难,但这是一个**权衡,不是免费的东西**:
+口令由管理 CLI 在终端读取，并在验证 daemon 后通过独立秘密帧发送；不经过 MCP。TTY 限制不构成身份认证。密钥未解锁也可以存在 grant，但签名会失败；预留后才发现锁定会消费次数，因此应先确认可用状态再交给 Agent。
 
-1. **口令只是两个因子里的一个。** 信封的另外一半熵是 `device.secret`,它留在守护进程那边、从不经手 MCP。拿到口令的人手上剩下的东西,不比一个口令保护的压缩包多。
-2. **它不给出新的能力。** `sign_request` 本来就让 agent 能签 —— 那是这个产品的用途。`unlock` 省掉的只是"某个人得在终端前敲一次";它不是那把钥匙的授予,是那道锁的开关。
-3. **不想要就别构建这个门面。** `mcp` 是编译期特性:`cargo install --path .` 出来的二进制里没有这个模块,agent 就够不到这条路。
+## 3. CLI 与线协议
 
-口令在这一层被 `Zeroizing` 包住、读完即擦。**反向那句话才是有用的:哪天有人想给 `unlock` 加一个"记住口令"的缓存,那才是把两因子变成一因子** —— 到那天请回到这里从头读一遍。
+### 3.1 CLI 请求
 
-### 9.3 它明确没有的东西
+`data --file` 接收一个 **DataRequest 对象**，无需手工添加 version/request 包装。以获准 Agent UID 执行：
 
-`list_my_keys` / `status` / `unlock` / `sign_request` / `get_did_document`。**没有 raw 签名,没有 keygen,没有导出,没有生命周期操作** —— 这不是还没做,是不做:
+```sh
+anp-keyd data --config /etc/anp-keyd/service.json --file request.json
+```
 
-- **raw 签名**是守护进程里唯一一条能给调用方**任意签名**的路。它在 CLI 里藏在 `--allow-raw-signing` 后面;把它做成一个 MCP 工具,等于让 agent 手里那条口子**默认开着** —— 那正是那道开关要挡的东西。
-- **生成、轮换、注销、迁移**要改文档、要签文档,走的是本地文件而不是 socket(不变量 3,§五)。MCP 是给**运行期签名**用的门面,不是给身份管理用的。
+请求文件示例：
 
-**这里原先写的是"四个,没有第五个",而落地时加了第五个。** 记下来,因为这条改动
-正好演示了那张清单是怎么用的:它列的不是**数量**,是**性质** ——"不改任何东西"。
+```json
+{
+  "operation": "SIGN_HTTP",
+  "grant_id": "ADMIN_SUPPLIED_GRANT_ID",
+  "request_id": "6b79d06e-33cf-44e2-8209-81938b6a8ed3",
+  "http": {
+    "method": "GET",
+    "url": "https://service.example.com/v1/status",
+    "headers": {},
+    "body": {"state": "absent"},
+    "nonce": null
+  }
+}
+```
 
-- 上面两条排除(以及 §十 那些)说的都是**会签名、会改文档、会动授权**的东西。
-- `get_did_document` 三样都不占:**只读、不改、不需要解锁**。它和 §3.2 是同一件事的
-  另一扇门,而 §3.2 已经论证过它不改变授权模型。一个"读一次可公开的成品"的口子,
-  不在这张清单的射程里。
-- 而**不给**它,代价是 §9.1 那种症状的一个变体:**走 MCP 的 agent 登不了录**(登录体
-  要内联那份文档,§3.2),而命令行上怎么试都是好的。
+示例 UUID 只用于展示格式。应用为每个新操作生成 UUID 并持久保存；重试复用原 ID，不能让所有请求使用这个示例值。若业务需要服务端 nonce，先从对端取得，并按应用协议同时放入 body 和签名参数。
 
-所以 §9.3 与 §9.1 不冲突:§9.1 说"落点在共用层",§9.3 说"形状不能比门更宽"。加这个
-工具两条都守住了 —— 它走 `wire` 的 `GET_DOCUMENT`,而它比 `sign_request` **窄**。
-
-这和 §十 里对 `Raw` 的处理是同一条线:**一个前端的形状,不能比它背后那扇门更宽。** 适配层的 connector 同理 —— 它如果为了让某个工具好用一点而绕过 §3.1 的论证去要一条更宽的通道,那它就不是这个门面的同类了。§3.3 那条待定的路口也在这个判断之下:无论哪种选择,**结果都体现在这一层**,不是某一家的客户端里。
-
-### 9.4 它怎么被钉住
-
-两条测试,守的不是同一件事:
-
-- `src/mcp/mod.rs` 的单元测试 `exactly_five_tools_and_none_of_them_signs_raw_bytes` —— 守"我们的代码里**注册**了几个"。
-- `tests/mcp.rs` 的 `a_client_sees_exactly_the_five_documented_tools` —— 守"一个**真的** MCP 客户端**看得见**几个"。
-
-中间隔着 rmcp 的 schema 生成和协议编解码,而一个工具在客户端看不见等于不存在 —— 所以两条都得有,一条替不了另一条。这份测试跑在**进程边界**上:真守护进程、真 socket、真子进程,子进程 stdout 的每一行都按 JSON 解析。**stdout 归协议** —— 一句 `println!` 就能把一次初始化打成 JSON 解析错误,而症状看起来像"MCP 客户端不认这个服务器",和真正的原因隔了十万八千里。诊断一律走 `tracing`(stderr)。
-
-顺带一条和 §七 同源的:工具失败时递回去的是**粗码**(`wire_message`),不是 `Display` —— 后者可能带着细节,而协议层已经决定过哪些细节不出门。`a_wrong_passphrase_comes_back_as_a_coarse_refusal` 守的就是"刚关上的那扇门不许在这里重新打开"。
-
-### 9.5 对适配的结论
-
-**MCP 不改变 §3.1 / §3.2 / §3.3 的任何结论,它只要求那几个加法落在共用层。** 它也不是 socket 客户端的替代品:一个只要 agent 签名的部署可以完全不写 connector,一个只要工具签名的部署可以完全不构建 `mcp`。两个前端对着同一个守护进程、同一套授权模型(uid),所以"走哪条"是**部署**问题,不是设计问题 —— 这也正是当初不把它做成第二套实现换来的。
-
-代价也要说清楚:**共用一个守护进程,就是共用一个上锁状态。** MCP 那边解锁了,工具这边就是解锁的(见 §六:空闲 15 分钟自动上锁)。这不是漏洞,是同一个密钥库的必然;把它说清楚,免得有人以为两个前端是两份独立的授权。
-
----
-
-## 十、明确不做
-
-- **不为适配打开 `Raw`。** 开了它,守护进程就退回成一个"私钥不出进程的
-  ssh-agent" —— 第 1 条不变量还在,但"守护进程替你想过"没了。那是**另一个产品**,
-  而且是一个已经被 ssh-agent 做完了的产品。**这条线有一个正经的压力点**,
-  不是假想的:§3.3 那个注册挑战签名,用 `Raw` 一定签得出来 —— 而且**只有**它,
-  在 §3.3 拍定之前。所以这一条和 §3.3 必须一起读 —— 拒绝 `Raw` 不等于拒绝那个需求,
-  它只是把"怎么满足"限制在 §3.3 那三条路里。**§3.3 最后挑的是"开一条窄路",这一条
-  因此仍然成立** —— 不过要说得比原先准:窄路的形状是"签一串**有上界**的不透明字节",
-  上界 256 字节。它和 `Raw` 在密码学上是同一个东西,分开它们的是那条上限、一条独立审计、
-  一个独立开关(§3.3 最后那两段)。这个支点够不够承重,取决于那条上限,不取决于措辞。
-- **不让守护进程认识 ANP-02 的语义。** 不认识 login、不认识 handle、不认识注册体。
-- **不让守护进程联网。** 见 §4.3。
-- **`export` 仍然不上 socket。** 已有决定,这里重申,因为它最容易被"适配一个
-  工具"这个理由说服。
-- **不做多用户细粒度授权。** uid 是授权模型的地基(已有决定);`--allow-binary`
-  是这一层上唯一加过的粒度,不因为适配而再开一层。
-
-### 已有的、但不在这条适配路径上的东西
-
-减法不止"少加一个字段"。把 keyd 现有的能力按"适配用不用得到"过一遍,有几样是
-**留着有用、但这条路上用不到**的。列出来是为了让边界可见,**不是要删它们**:
-
-| 能力 | 为什么不在适配路径上 |
-|---|---|
-| **MCP**(`--features mcp`) | 这条适配不走它。但它是**现成的答案**,见 §九:"第二个前端怎么不变成第二套实现"。 |
-| `rotate-hot-key` / `add-recovery-key` / `remove-key` | keyd 自己的密钥生命周期。connectx 和 awiki-cli 的命令面都不暴露它们(它们只有 create / register / resolve / update 这一组)。留着不等于这条路上要用。 |
-| `export-seed` | 默认构建里根本不存在(§六 不变量之外的东西),不在这儿重开。 |
-| **硬件根(SE / TPM)** | **它不是多余的,是反过来的** —— 它是"**为什么值得把密钥抽出来**"的理由之一:抽出来之后才有地方绑硬件根。适配路径不依赖它,但整个抽取动作有一半的价值在它身上。 |
-
----
-
-## 十一、验收:怎么证明这件事真的成了
-
-判据必须**能证伪**,否则"抽出来了"只是说法。
-
-端到端剧本:拿 connectx 对一个真的 ANP 服务端(awiki-open-server)完成
-`register` + `login`,全程私钥字节不进 connectx 进程。五条反证:
-
-1. **停掉守护进程,connectx 必须失败。** 如果它转而用本地密钥签成功,那就说明
-   密钥**没有**被抽出来,只是多了一条可选路径。
-2. **锁上之后,connectx 拿到的是可重试的 `Locked`,不是崩溃或超时。** 这条验的是
-   §六,而且是唯一能验它的方式。
-3. **审计日志里每一次签名都在。** 包括被拒的那些 —— 拒绝也是证据。
-4. **把 connectx 的 DID 和守护进程里的 DID 逐字节对一遍。** 这条验的是 §五 代价 1:
-   两边各推一次 DID,迟早会分岔。
-5. **换一个对端实现,签名仍然验得过。** 只在一个服务端上跑通,证明的可能是"两边碰巧
-   一样"。签名基是跨语言拼出来的(守护进程 Rust / 服务端 Python),**跨语言验过一次
-   才算** —— 见 §12.4。
-
-**剧本要用的两个原语,现在都在 socket 上了。** 这条剧本从来不是"等连接器写出来
-再说"的事 —— 它要的两样东西此前在协议面上根本不存在:**调用方能指定的 `nonce`**
-(§3.1,`login` 非它不可)和**读一份已发布的文档**(§3.2,登录体内联的就是它)。
-两样都已经落地,而且是落在共用层(`wire` 的 `GET_DOCUMENT` 与 `SignRequest::Structured`
-上的 `nonce`),两个前端各接一处 —— 见 §9.1。
-
-**这条剧本有一个前提,现在写出来:** connectx 和 awiki-cli-rs2 的 `register` **都不发**
-`challenge_signature`(§八)。
-
-**剧本跑过了(2026-10-14)。** 两个脚本,一个对真守护进程、一个对真的
-`awiki-open-server`,都在 `anp-sdk/scripts/`,都用自己的临时 root 和守护进程、跑完
-删掉:
-
-| 脚本 | 对谁 | 覆盖 |
+| 操作 | 字段 | 结果 `reply.data` |
 |---|---|---|
-| `keyd-acceptance.mjs` | 真守护进程 | 第 1 / 2 / 3 / 4 条,外加一条挑战签名 |
-| `keyd-server-acceptance.mjs` | 真的 `awiki-open-server` | **第 5 条**,以及 `register` + `login` 本身 |
+| GET_CAPABILITIES | 无 | profile、body 上限、事务执行器与审计投影健康信息 |
+| LIST_AUTHORIZED_KEYS | 无 | `{keys:[{key_id,did,kid}]}`，仅本主体当前获准的钥匙 |
+| GET_GRANT_STATUS | grant_id | 授权状态、期限与次数 |
+| GET_DOCUMENT | key_id | `{key_id,document}`，仅当前获准 key 的公开文档 |
+| SIGN_HTTP | grant_id、request_id、http | 请求状态；有效 completed 结果含签名头等 |
+| GET_REQUEST_STATUS | request_id | 本主体已有请求状态；满足条件时附原结果 |
 
-第二个是**唯一跨语言的那一条**:服务端拿 Python `anp` 重算签名基、拿 pip 的
-`cryptography` 验 Ed25519,中间隔着进程边界、一条 socket、两种语言。十条全过 ——
-包括"同一份签名重放被拒"和"为另一个 URL 签的头被拒"两条负例。记录在
-[TODO-archive.md](TODO-archive.md) 的「追加六」。
+成功 CLI 回复是 version=2、code=OK 的 Reply，业务数据在 data 中；读取 instance_id、principal_id 等信息时不要把它们当作客户端自选参数。`signing_available=true` 表示执行器未停止，不保证某把钥匙已解锁或 grant 可用。
 
-**但别把这份绿读宽了。** 两处要说清:
+### 3.2 原生 socket 实现
 
-- **注册那半**是连接器走的(取 keyd 自己发布的那份文档 + `keydConnector.signChallenge`),
-  但**挑战那一步是脚本显式调的**(§3.3 那个变体,守护进程上开着
-  `--allow-challenge-signing`)—— connectx 的 `register` 流程自己**仍然不发**那个字段
-  (SDK 里除了连接器自己的测试,没有第二处调 `signChallenge`)。
-- **登录那半没走 connectx 的 API。** 那个口要的是**纯 JSON-RPC 信封**,而
-  `AnpConnector.signRequest` 签的体永远是 `buildAnpLoginBody` 产出的
-  `{nonce, did, didDocument}` —— `extra="forbid"` 的 `JsonRpcRequest` 收不下它,
-  形状对不上,在验签之前就被拒;`RequestEnvelope` 又跑在签名**之后**,改不了已经
-  算进摘要的字节。所以验收走的是 CLI 那条公开接缝(`anp-keyd sign --url --header
-  --body <FILE>`),**不为它新开 SDK API**。这和注册那边是同一类错位(ADR-0003)。
+直接实现客户端时，每帧为 4 字节大端长度加 UTF-8 JSON，长度为 1–65536 字节。请求包装为：
 
-所以今天绿的是"**这条路走得通、而且对端认**",**不是**"connectx 那套调用已经能登
-录了"。对端一旦把挑战签名翻成必需,要改的是 connectx / awiki-cli-rs2 那两处
-`register`,**不是守护进程** —— 那边有地方可补,而且补过了。
-**别让一个绿的剧本冒充比它更宽的结论。**
+```json
+{"version":2,"request":{"operation":"GET_CAPABILITIES"}}
+```
 
----
+客户端必须先加载并验证受保护配置、校验 socket 及内核服务 UID，再发请求；只实现 JSON 编解码不足以实现可信客户端。每连接一请求，无自动重连或 v1 降级。未知字段、重复 JSON 成员、越界及未知版本拒绝。
 
-## 十二、未决 / 动手前要先核实的
+接口定义见 `src/security/protocol.rs`，服务端认证见 `src/security/client.rs`。普通数据面不存在 UNLOCK、LOCK_ALL、SIGN_RAW、SIGN_CHALLENGE 或生命周期操作。
 
-按"不核实就会做错"的次序 —— **已经核掉的,结论写在条目里,不再挂着**:
+## 4. HTTP 字节和发送规则
 
-1. **DID 推导 —— 已核,两边逐字节一致。** connectx 的 `ed25519Fingerprint`
-   (`src/core/crypto/fingerprint.ts`:RFC 7638 JWK → SHA-256 → base64url 无填充)和守护
-   进程走的 `anp` 上游 `compute_multikey_fingerprint` 是同一串字节 —— 拿 connectx 自己的
-   测试向量独立算过,对上(`e1_UDDReOZl1ipXAfp9wYsm13sDBMK5og--QWdBjzuf6o4`)。**已经
-   钉住了**(2026-10-14):`tests/vectors/anp_sdk_ed25519_fingerprint.json` —— 种子、
-   公钥、JWK 的 `x`、规范化 JSON、SHA-256、`e1_` 段逐项比。只比最后那 46 个字符是
-   不够的:两边各错一处、恰好抵消,看上去照样是绿的。记录在
-   [TODO-archive.md](TODO-archive.md) 的「追加二」。
-2. **awiki-cli-rs2 的接缝 —— 已核,结论在 §八。** 它已有一层 `IdentitySigner`,方法
-   形状就是 §3.1 / §3.2 那两条;而且 `AnpIdentitySigner` 已经是"custody 在别处"的
-   现成先例,keyd 照它再做一份即可。注册不发 `challenge_signature`。**剩下要单独想
-   的只有一处**:`sign_document_proof` 收调用方构造的文档,和 keyd 的不变量 3 错位。
-3. **上游版本错位 —— 已核,签名基逐字节一致,不构成风险。** 整条 awiki(Rust CLI 的
-   path 依赖 `=1.0.3` + Python 服务端的 wheel `anp-1.0.3`)都在 **1.0.3**,只有
-   anp-keyd 钉 **`=1.0.6`** —— 差一个补丁版。把 keyd 真正**产字节**的三个入口各自
-   比了一遍(`~/code/github/anp` 里有 1.0.3 那个 pin 的 commit `096ca3e`,与 crates.io
-   上的 1.0.6 对拉):
+签名对“最终发送的请求”负责。应用先确定 URL、方法、body 的准确字节和必需头，再请求签名；不要签完后交由另一层重新序列化 JSON、添加换行或包装 RPC。
 
-   | keyd 调的 | 住在哪 | 1.0.3 ↔ 1.0.6 |
-   |---|---|---|
-   | `prepare/complete_http_signature_headers`、`build_content_digest` | `authentication/http_signatures.rs` | **两份文件逐字节相同**(548 行,`diff` 空) |
-   | `compute_multikey_fingerprint` | `authentication/did_wba.rs` | **不在差异清单里** |
-   | `prepare/complete_w3c_proof` | `proof/mod.rs:103,170` | 文件有差异,但改动在**验证那一支**(行 270 之后,紧挨 `public_key.verify_message`) |
+- URL 只接受当前支持的 HTTPS DNS 子集；host 小写、默认端口规范化。拒绝 IP、百分号编码、fragment、点路径、重复斜线及重复 query 键。发送使用返回的规范化 URL。
+- headers 使用名称到字符串的映射；大小写重复名称拒绝。Host、Authorization、Signature、Signature-Input、Content-Length、Transfer-Encoding、Connection 不可由调用方在签名请求中指定。
+- body 必须显式 absent，或 present 加字节数组。present 空数组是明确的空请求体，并覆盖 Content-Digest。body 最多 16384 字节；JSON 字节数组会膨胀，仍受 65536 字节整帧上限约束。
+- profile 固定覆盖方法、目标 URI、authority，以及存在的 body 摘要和 content-type。不能传入 covered、did、kid 或任意 profile 覆盖参数。
+- 最终请求使用 daemon 返回的生成头及被覆盖的 content-type，保留原始 body 字节；其余应用头由调用方管理，不应假设都被签名或持久化。
+- 禁用自动重定向。新目标需要独立检查策略和签名，不能复用旧签名头跨目标发送。
 
-   `proof/mod.rs` 那处改动是"验证时也认 multibase base58(`z…`)的 `proof_value`",
-   上游自己写着 *"Keep legacy base64url **signing/generation** bytes unchanged"* ——
-   **生成字节没动**。所以 1.0.3 和 1.0.6 拼出来的基是同一串字节,版本错位**不动签名
-   基**。其余差异与签名无关:`device_manifest.rs`(253 行)、`did_resolver.rs`(135 行)、
-   新模块 `did_web.rs` 都是 did:web;`group_e2ee/*` 是 rusqlite 事务 API 改写加一个
-   `prepare_recovery`。唯一值得记一笔的是 `verification_methods.rs`:1.0.6 把
-   `Multikey` 按 multicodec 前缀分流(`0xec 0x01` → X25519,否则 Ed25519),上游注释
-   写着"agreement keys must never enter the signing parser" —— **对 keyd 是空操作**:
-   keyd 的签名键是 `0xed 0x01` 的 `Multikey`,agreement 那一档用的是
-   `X25519KeyAgreementKey2019` 而不是 `Multikey`,而且这个 build **根本不做 X25519
-   密钥**(`src/did/document.rs:58`)。
-4. **签名基 —— 已核到序列化这一层;`:443` 那处分岔也收了。** 覆盖面、参数顺序
-   (`created;expires;nonce;keyid`,两边都不带 `alg`)、`@signature-params` 那一行的拼法、
-   行分隔 `\n`,以及 300 秒的 `expires`,四种拼法(Rust `anp` crate / Python 服务端 /
-   connectx 的 JS)逐字节相同,而且第 3 条已排掉"两边 `anp` 版本不同"这个变量。
-   **原先记的那处分岔已经收了**(2026-10-14):`@authority` 对显式默认端口 `:443` 的
-   处理不一致 —— connectx 用 WHATWG `URL.host`(吃掉它),keyd 从 URL 文本切(保留它)。
-   核到源码那一层之后发现**留下的是 keyd 一个**:上游 `anp` 开 `network` 时走 `url`
-   crate,也是吃掉的那一种;`anp-sdk/src/core/crypto/resolveDid.ts:591` 更把 `Host`
-   **头**都设成了 `url.host` —— 线上跑的就是不带端口的那一份。所以 keyd 现在在把 URL
-   交给上游之前先规范化(小写 host、去掉默认端口),`@authority` 和 `@target-uri` 一起
-   正。记录在 [TODO-archive.md](TODO-archive.md) 的「追加二」。
-   **已经拿真对端跑过了(2026-10-14)** —— 上面这些是对着源码核出来的,而
-   `keyd-server-acceptance.mjs` 又对着真的 `awiki-open-server` 量了一遍:客户端签的
-   URL 里 `@authority` 来自它要签的那个地址,服务端从自己的 `AWIKI_PUBLIC_BASE_URL`
-   重算,两边拼出同一个串才验得过;反证是同一份体、为另一个 URL 签的头被拒
-   (`invalid_http_signature`)。记录在 [TODO-archive.md](TODO-archive.md) 的「追加六」。
-5. **§3.3 那个岔口 —— 已定(2026-10-14):开第二条,边界钉在 256 字节的上限上。**
-   核过两个客户端(connectx、awiki-cli-rs2),**没有一个发那个挑战签名**,所以这条路
-   **今天没有调用方**,而且默认关着 —— 它今天零成本这一点没有变。定下来不是为了眼下的
-   需求,是为了别让它在写 connector 的那天以"顺手开个口子"的形式自己冒出来。落点在共用层:
-   `SIGN` 的第三个变体(`SignRequest::Challenge`),不是新消息类型,也不是某个前端的参数。
-   **这个岔口留下的是一个仍然有效的判断** —— 它是 `Raw` 的有上界版本,不是另一类东西;
-   要不要开、上限定在哪儿,是 §3.3 里写着的那几条,不是措辞能决定的。
-   **已落地(2026-10-14):** 四样边界都实现了,而且四条各有一条测试量着(256 字节签得出、
-   257 字节在解码层被拒、关着时拒的话里说出开关的名字、开了之后交付的是拿**已发布那份
-   文档**里的公钥在外面验过的签名)。`--allow-challenge-signing` 默认关,`mcp` 不接 ——
-   记录在 [TODO-archive.md](TODO-archive.md)「追加五」。
-6. **`LIST_KEYS` 要不要报出密钥角色。** 见 §3.4 —— 现在判断是"不加"。**新证据削弱
-   了"加"的理由,不是加强:`IdentitySigner` 里确实有一套角色词表**
-   (`DeviceAssertion` / `Authentication` / `KeyAgreement` / `RootControl`),但它
-   **从文档里推**(`root_control_key_id` 读 `proof.verificationMethod`,
-   `agreement_key_id` 读 `keyAgreement`),不从密钥列表里要。也就是说客户端要的
-   是 §3.2 那份文档,不是 `LIST_KEYS` 多几个字段。
+签名最长 300 秒，且不能超过 grant 的双时钟有效窗口。对端仍须检查签名、公钥用途、body 摘要、预期 nonce 与重放状态。业务成功须依据对端响应判断，本地 completed 只表示签名结果持久化。
+
+## 5. Node 客户端
+
+实现文件为 [adapters/keyd-v2.mjs](../adapters/keyd-v2.mjs)。它通过 execFile 调用 Rust CLI，让配置/路径/服务身份检查集中在一个实现里；临时请求文件权限为 0600，finally 删除。请求可能包含业务秘密，Agent 的本地请求存储和日志仍需自身保护。
+
+```js
+// 将导入路径改为部署后的实际位置。
+import { randomUUID } from 'node:crypto'
+import { KeydV2Client } from './adapters/keyd-v2.mjs'
+
+const client = new KeydV2Client({
+  config: '/etc/anp-keyd/service.json',
+  binary: '/usr/local/libexec/anp-keyd',
+})
+const request = {
+  grant_id: administratorSuppliedGrantId,
+  request_id: randomUUID(),
+  method: 'GET',
+  url: 'https://service.example.com/v1/status',
+}
+// 持久化此对象和操作状态后再调用；该函数由应用实现。
+await saveOperation(request)
+const signed = await client.sign(request)
+const response = await fetch(signed.url, {
+  method: signed.method,
+  headers: signed.headers,
+  body: signed.body,
+  redirect: 'manual',
+})
+```
+
+`client.fetch(request)` 合并上述签名和发送步骤，也禁用重定向；它不持久化业务状态、不自动重试。`keys()`、`document(key_id)`、`grant(grant_id)`、`status(request_id)` 返回解包后的 data。`sign` 成功时返回签名结果并合并调用方头、method 和原 body；durable result 不保存原 body，恢复发送必须从应用自己的记录取得相同字节。
+
+构造参数允许选择 config/binary，部署方须固定到管理员批准的文件，不从模型工具参数或远端服务输入获得。Node 的超时或子进程错误可能发生在服务已经签名之后，不能理解为未消费额度。
+
+## 6. 现有 ANP SDK connector
+
+```js
+import { createConfig, signRequest, subjectOf } from '@connectx-sdk/core'
+import { KeydV2Client, keydV2Connector } from './adapters/keyd-v2.mjs'
+
+const client = new KeydV2Client()
+const connector = keydV2Connector({
+  client,
+  grant_id: administratorSuppliedGrantId,
+  key_id: administratorSuppliedExactKeyId,
+  subjectOf,
+  requestId: req => durableRequestIdForThisExactPayload(req),
+})
+const config = createConfig([connector])
+const signed = await signRequest(config, connector.id, {
+  method: 'POST',
+  url: canonicalLoginUrl,
+  nonce: serverNonce,
+})
+```
+
+`durableRequestIdForThisExactPayload` 由应用实现，必须在调用前持久化操作关联，不能每调用一次就生成新 ID。它需要区分最终 body、nonce、目标及身份文档版本；同一高层调用若读到了更新文档，旧 ID 应冲突而非静默重新签名。SDK 传输层也要保持相同 URL/body 并禁用自动重定向。
+
+connector 从已授权列表选定 exact key，读取公开文档，构造 ANP-02 JSON 登录体并签名。successorDid 等生命周期请求拒绝。若 daemon 返回 URL 与 SDK 请求 URL 不同，connector 在签名后拒绝交付；此时必须查询原 ID，不能直接改 URL 换 ID 再试。
+
+### 6.1 已验收与未兼容的部分
+
+现有验收覆盖 SDK createConfig/signRequest、同 ID 去重及配额；SDK HTTP verifier 在预先核对根签署文档、exact authentication 方法后，显式提供 hot 公钥、expectedNonce 和 nonceStore 验签并拒绝重放。
+
+这不等于默认 `resolveVerificationKey` 已支持热密钥：已验版本把选中的 hot 指纹与 DID 根指纹直接比较，拒绝合法热方法。本仓库没有修复外部 SDK，不允许用 root grant 绕过。SDK 更新后应重新验证高层路径再扩大声明。
+
+awiki did-auth RPC 要求 JSON-RPC envelope，SDK signRequest 生成的 ANP-02 `{nonce,did,didDocument,...}` 是另一种 body。已签 body 不能再包装成 RPC；awiki 链路使用同一 v2 client 对正确 RPC 字节请求签名。实际服务验收采用一次性本地服务、逻辑 HTTPS origin 与测试 HTTP 通道，不能据此提供生产 fetch 的目标覆盖能力。
+
+### 6.2 其他 SDK 接缝
+
+`keydV2Signer(client, grant_id)` 只包装 `signHttpRequest(input)`，不会增加注册、文档 proof 或密钥导出能力。接入其他 IdentitySigner 接口时应逐个核对方法；需要“签调用方提供的任意文档”的接口不能直接映射数据面。当前没有宣称 awiki-cli-rs2 全部命令或其他外部工具已完成 v2 接入。
+
+## 7. 注册、轮换、撤销与恢复
+
+### 7.1 注册挑战走可信管理端
+
+可信适配器负责从正确 TLS 服务获取挑战并确认 origin。准备的公开变更为：
+
+```json
+{
+  "kind": "RegistrationChallenge",
+  "key_id": "ROOT_KEY_UUID",
+  "origin": "https://service.example.com",
+  "challenge": "0123456789abcdef0123456789abcdef"
+}
+```
+
+challenge 必须替换为服务实际给出的 32 位小写 hex 字符串。管理员 prepare 后查看 effect，再使用：
+
+```sh
+anp-keyd admin --config /etc/anp-keyd/service.json complete-secret-operation \
+  --operation-id PREPARED_OPERATION_UUID --digest PREPARED_DIGEST
+```
+
+CLI 读取管理口令，daemon 单次、短期、精确绑定地完成根签名，用后销毁根密钥。管理适配器把结果提交给原服务；数据面和 MCP 无 challenge 工具。若服务运行期不接受 hot key，报告兼容失败，不自动以 root 或 raw 签名兜底。
+
+### 7.2 热密钥轮换
+
+管理员提前配置下一把合法 hot key，准备 `RotateHotKey`，字段为 root_key_id、old_key_id、next_key_id；使用 complete-secret-operation 完成根签署文档。操作撤销旧授权并退休旧公开方法，但不自动向网络发布。
+
+可信发布者发布返回文档并确认远端可解析、旧方法被拒、新方法认证通过，再创建并交付新 grant。不能把本地文件生成、服务端文档刷新和运行期授权切换当作同一件事。
+
+### 7.3 撤销与重启
+
+撤销变更为 `{"kind":"Grant","change":{"action":"Revoke","grant_id":"GRANT_ID"}}`，通过 prepare/commit 执行。确认后不开始新的获准签名；此前结果不能追回，远端业务撤销取决于验证方。
+
+重启后所有旧 grant 失效、密钥锁定、未决批准失效。Agent 应暂停工作，等待管理员重新解锁及建权；不能从本地文件恢复旧 active 标记。备份恢复还需验证真实认证、旧权限失效和公开文档状态，文件解密成功只是其中一步。
+
+## 8. 失败和重试处理
+
+服务端错误、CLI 失败和网络错误是不同层。Rust client 将非 OK code 返回为错误；当前 Node 包装器的 CLI 失败可能表现为子进程异常，不能保证错误对象含独立稳定 code。生产集成应保留原 request_id，并用状态查询判断已发生的事，避免仅凭错误文案分类。
+
+| 观察结果 | 处理 |
+|---|---|
+| REQUEST_ID_CONFLICT | 停止；核对原始 grant、规范化输入和持久操作记录，不能覆盖旧 ID |
+| completed 且含 result | 在仍有效时可复用原签名；是否重发网络请求还取决于业务幂等和 nonce |
+| completed 但无 result | 结果已不可交付；状态不授权重新签名 |
+| reserved / outcome_unknown | 不自动换 ID 重签；查询、检查审计和业务服务状态，必要时交管理端处置 |
+| failed_reserved / KEY_LOCKED | 预留可能已消费次数；先查状态，解锁不会使旧 ID 重新签名 |
+| GRANT_INVALID / EXPIRED / EXHAUSTED、角色或策略拒绝 | 停止该操作，查询授权或请求管理员按新范围建权 |
+| RESOURCE_BUSY / 连接失败 / 超时 | 查询原 ID；只有核清预留状态才考虑再次提交同一操作，绝不自动生成新 ID |
+| AUDIT_UNAVAILABLE / PERSISTENCE_UNAVAILABLE | 服务可能已停止签名；管理员检查状态，不能自动建空库或重写审计 |
+| REQUEST_NOT_FOUND | 该主体没有可查询记录；仍须考虑原连接是否在途和远端业务状态，重试也保留原 ID |
+
+同一个 request_id 的摘要包含方法、规范化 URL、headers、body 和 nonce；改变未覆盖的普通请求头也可能造成冲突。保存最终待签输入，不仅保存业务参数。
+
+`GET_REQUEST_STATUS` 只查询本主体。查询返回 completed 也不能证明服务请求已发送；网络响应丢失时，还需业务服务的幂等键或查询接口。签名去重不会提供业务 exactly-once。
+
+## 9. MCP 接入
+
+编译启用 mcp feature 后，在 Agent 所属执行域启动：
+
+```sh
+anp-keyd mcp --config /etc/anp-keyd/service.json
+```
+
+受保护工具只有以下五个，均调用同一个 v2 数据客户端：
+
+| 工具 | 输入 |
+|---|---|
+| list_my_keys | 空对象 |
+| grant_status | grant_id |
+| get_did_document | key_id |
+| sign_request | grant_id、request_id、http |
+| request_status | request_id |
+
+工具返回文本 JSON，其内容是完整 Reply，业务结果仍在 data 中。工具不解锁、不批准 grant、不生成根签名，参数不能覆盖 config/socket/root/did/kid/covered。stdout 用于 MCP 协议，诊断走 stderr。
+
+不带 `--config` 的旧 MCP 是开发路径，不能当作自动降级；两种模式必须明确选择。当前 `src/mcp/protected.rs` 的部分工具描述仍含“M4 未启用”的阶段文案，实际服务端已接入事务执行器；接入判断使用 capabilities 和实际结果，后续应单独修正这处源码文案。本文不以修改文档代替修改工具 schema 描述。
+
+## 10. 接入验收
+
+验收使用临时身份、独立 Agent/管理员 UID 和隔离服务，不操作真实用户密钥。
+
+1. 正常链路能完成列钥、读文档、hot 签名和实际服务验签；Agent 进程不加载 seed。
+2. 停掉或锁定 daemon 后调用失败，不回退本地私钥、root、raw 或 v1。
+3. A/B 使用同一程序仍不能互用 grant；PTY 启动管理 CLI 仍被拒，假 socket 不取得秘密。
+4. 方法、URL、body、必签头改变时策略与签名一致；对端拒绝重放、过期及换 body。
+5. 并发最后一次配额仅成功预留一次；同 ID 同输入不重复签，不同输入冲突。
+6. 响应丢失后查询原 ID；撤销和重启后不交付失效结果、不复活授权。
+7. 注册、轮换、远端发布、新方法认证和恢复分别有证据，SDK 高层 resolver 限制明确保留。
+
+现有脚本包括 `deploy/linux/test-boundary.py`、`anp-service-acceptance.py`、`systemd-checks.py`、`systemd-boot-check.py` 及 `adapters/test-sdk.mjs`。后者是实际环境验收驱动，需要 SDK dist、有效 grant/key 和稳定请求 ID，不能当作无需部署的单元测试。
+
+Linux systemd、Node/SDK 签名接缝及一次性真实服务链路已有验收记录；本文没有重新运行这些环境。新增对端、SDK 版本、平台或策略形态时重新验证相应路径，不能沿用历史记录扩大支持范围。

@@ -1,64 +1,62 @@
-# 安装
+# 安装与模式选择
 
-需要 **Rust 1.88 或更新**。目前只能从源码构建:
+需要 Rust 1.88 或更新。开发模式支持 macOS 和 Linux；受保护部署当前只支持 Linux。
 
-```bash
+## Linux 受保护部署
+
+在 Linux 构建正式 release。需要 MCP 时另加 --features mcp：
+
+```sh
+cargo build --locked --release
+```
+
+由管理员独立核对构建来源与 SHA-256，然后为新的服务实例安装：
+
+```sh
+sudo python3 deploy/linux/install.py --binary target/release/anp-keyd \
+  --sha256 VERIFIED_BINARY_SHA256 \
+  --admin-user operator --agent-user agent-a --agent-user agent-b
+sudo systemctl daemon-reload
+sudo systemctl enable --now anp-keyd
+anp-keyd admin status
+anp-keyd probe --security
+```
+
+替换示例用户名和摘要。安装器拒绝已有部署，更新使用单独的 --update 流程；它不自动迁移身份。组权限变更后需新登录会话。管理员和 Agent UID 不得重叠，Agent 无 sudo 或宿主管理 socket。
+
+合格 release 的新安装选择 linux-protected-v1；旧 preview 配置升级保留原模式，需管理员停机后明确切换。正式 Linux release 且显式保护模式才报告 protected_supported=true；这是支持范围声明，probe 也不能代替完整宿主检查。
+
+安装后还需迁入身份、确认 hot 角色、发布策略、解锁并建立 grant，才有可用签名。见[Agent 接入](/advanced/agent)及仓库 [ADAPTER](https://github.com/eccstartup/anp-keyd/blob/master/docs/ADAPTER.md)。
+
+## 本地开发
+
+```sh
 cargo install --path .
-```
-
-或者 `cargo build --release`,用 `target/release/anp-keyd`。
-
-开发模式支持 macOS 和 Linux。Linux v2 使用 SQLite 和 root 管理的配置；正式 Linux 构建与显式保护部署已通过 systemd 主机验收。发行构建排除 hardware-software，安装/更新校验管理员给定的 SHA-256。
-
-::: warning 一条纪律
-交互式口令从控制终端读取。Agent 可以创建 PTY，所以终端本身不能证明人类在场；Linux v2 管理准入由独立管理员 UID 和经过认证的管理通道决定。
-
-口令从 `/dev/tty` 读,不走命令行参数、不走环境变量、不走 stdin；CLI 解锁时会经过 v1 socket。TTY 不是人类身份认证。
-:::
-
-## 只在特定构建里存在的几个
-
-默认构建里没有下面这些。要哪个就带哪个 feature:
-
-```bash
-cargo install --path . --features seed-export    # 多出 export-seed
-cargo install --path . --features mcp            # 多出 mcp
-cargo install --path . --features hardware-se    # macOS:钥匙可以绑到 Secure Enclave
-cargo install --path . --features hardware-tpm   # Linux:钥匙可以绑到 TPM 2.0
-```
-
-| 特性 | 多出什么 | 为什么默认不在 |
-|---|---|---|
-| `seed-export` | `export-seed` | 一个能一键把整把身份抽干的接口,是 agent 被注入之后最想找的东西 —— 它干脆不在二进制里。见[导出为什么是缺席的](/design/) |
-| `mcp` | `mcp` 子命令 | 在 stdin/stdout 上说 MCP,把几个工具转给守护进程。不想要这条门面就别构建它 |
-| `hardware-se` | `--hardware secure-enclave` | 只认这个平台上成立的取值 |
-| `hardware-tpm` | `--hardware tpm` | 同上 |
-
-`--hardware` 那个开关也只在对应构建里认那几种取值 —— **一个在这个平台上压根不成立的取值不会被列出来**。这是[硬件根](/advanced/hardware-root)那一节的原则:不给"看起来在保护、其实没有"的中间态。
-
-导入和导出是**不对称**的,而且是故意的:`import-mnemonic` / `import-archive` 在默认构建里就有,恢复自己的身份不该需要一次特殊编译;而**交出**身份应该。
-
-## 装完先做一件事
-
-```bash
 anp-keyd probe
 ```
 
-它报告这台机器能不能兑现这个工具给出的承诺:内存锁定建不建得起来、一次崩溃会不会把种子写到磁盘上、`device.secret` 在不在、模式对不对,以及这台机器有没有可用的硬件根。
+这不会建立 Linux v2 的服务/管理员/Agent 隔离。仅用临时身份和可信进程运行[开发快速体验](/guide/quickstart)。v1 解锁口令经过旧 socket，不能作为受保护管理通道。
 
-**它一个字节的密钥材料都不打印** —— 走 stdout 就是为了让你能放心把输出贴到 issue 里。
+## 可选 feature
 
-## 测试(如果你想从源码验一遍)
+| feature | 范围 |
+|---|---|
+| mcp | 启用 MCP；v2 使用 mcp --config |
+| seed-export | 离线维护导出；默认不编入，启用后不声明保护支持 |
+| hardware-se | macOS SE 后端，发行及持久化仍待专项验收 |
+| hardware-tpm | Linux TPM 后端，实体权限和故障仍待验收 |
+| hardware-software | 测试替身，不是硬件；release 拒绝 |
 
-```bash
-cargo test                    # 单元 + 集成 + 负例 + 外部向量
-cargo test --all-features     # 连导出、MCP 和软件硬件后端一起
-cargo clippy --all-targets --all-features
+指定硬件不可用时拒绝，不静默降级。默认不启用硬件后端。
+
+口令由可信管理 CLI 从控制终端读取，发送前认证 daemon；不会写入 argv、环境变量或 MCP 参数。Agent 能创建 PTY，所以终端不证明人类在场，授权依赖管理员 UID 和管理通道。
+
+## 本地检查
+
+```sh
+RUST_LOG=info cargo test --locked --offline
+RUST_LOG=info cargo test --locked --offline --features mcp,hardware-software
+cargo clippy --locked --offline --all-targets --features mcp,hardware-software -- -D warnings
 ```
 
-六类测试各自失败的含义不一样,那件事在[测试与向量](/advanced/testing)里单独说 —— 尤其是 `tests/vectors/` 那一类:**改一个向量让测试变绿,等于把这个文件存在的理由删掉。**
-
-## 接着看
-
-- [五分钟跑通](/guide/quickstart) —— 从一份规格文件到第一行签名头
-- [不显然的默认值](/reference/defaults) —— 装好了也别急着用,先看这页
+这些是本地软件回归，不能替代 Linux 多 UID/systemd 或实体硬件验收。离线命令要求已有依赖缓存；硬件 feature 按平台单独测试。详见[测试与向量](/advanced/testing)。

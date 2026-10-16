@@ -1,60 +1,45 @@
 # 命令行
 
-命令分成两组,**因为它们的信任关系不一样**。
+先选择部署模式，再选择命令。Linux v2 的管理和数据请求分别使用独立 socket；同 UID 开发命令不具有这个权限边界。完整参数以当前二进制 --help 为准。
 
-## 走 socket 的(给 agent 用)
+## Linux v2
 
-连上守护进程要它做事,**从始至终不碰私钥字节**。
-
-| 命令 | 干什么 |
+| 命令 | 执行者及用途 |
 |---|---|
-| `sign` | 签一条 RFC 9421 请求,把签名头打到 stdout |
-| `list` | 列出这台机器上的钥匙 |
-| `status` | 列出当前已解锁的钥匙,以及各自解锁了多久 |
-| `document` | 打出一份本机发布过的 DID 文档,**原样** —— 不用解锁 |
-| `unlock` | 解锁一把钥匙(这一步是人做的,要敲口令) |
-| `lock` | 上锁 |
+| build-info | 查询构建能力，不表示任意宿主已安全 |
+| serve-protected --config FILE | 专用服务 UID 运行，由安装器生成的 systemd unit 启动 |
+| data --config FILE --file REQUEST.json | Agent 发起单条 v2 数据请求 |
+| admin --config FILE status / catalog / list-principals | 管理员查看服务、钥匙/策略及主体 |
+| admin --config FILE prepare --file CHANGE.json | 管理员准备精确变更，返回摘要和影响 |
+| admin --config FILE commit --operation-id UUID --digest HASH | 提交同一次有效批准 |
+| admin --config FILE unlock --vault-id UUID --did DID --kid KID | 管理员认证 daemon 后读取口令并解锁 |
+| admin --config FILE lock-all | 管理员移除驻留密钥 |
+| admin --config FILE complete-secret-operation --operation-id UUID --digest HASH | 管理员完成注册 proof 或预配置热密钥轮换 |
+| probe --security --config FILE | 检查调用者所属端点、信任配置及支持声明 |
 
-::: info 覆盖面只开放"加",不开放"减"
-`sign --cover NAME` 可以要求**多覆盖**几个组件(可重复)。
+数据请求包含 GET_CAPABILITIES、LIST_AUTHORIZED_KEYS、GET_GRANT_STATUS、GET_DOCUMENT、SIGN_HTTP、GET_REQUEST_STATUS。不存在 Agent 解锁、任意字节签名或根签名操作。
 
-但调用方**减不掉**任何东西 —— 哪些必须被覆盖是守护进程定的,不是请求里说不用就不用。
-:::
+具体管理 JSON、body 格式和 request_id 恢复流程见[Agent 接入](/advanced/agent)及仓库 [ADAPTER](https://github.com/eccstartup/anp-keyd/blob/master/docs/ADAPTER.md)。
 
-## 不走 socket 的(给人用)
+## 开发与离线维护命令
 
-在终端上当场打开信封。它们留在你自己的进程里,**agent 够不着**。
-
-| 命令 | 干什么 |
+| 命令组 | 范围 |
 |---|---|
-| `serve` | 常驻(默认进后台):在 Unix socket 上服务签名请求 |
-| `stop` | 把后台那个守护进程停下来(没在跑也不报错) |
-| `spec` | 写一份文档规格文件(模板),`keygen` / `publish` 读的就是它 |
-| `keygen` | 生成一把新的 did:wba 密钥,把信封写进 `keys/` |
-| `publish` | 按规格构造文档、盖上自签 proof,写出 did.json |
-| `verify-doc` | 校验一份文档确实是它自称的那个 DID 的文档 |
-| `probe` | 体检:这台机器能不能兑现这个工具给出的承诺 |
-| `add-recovery-key` | 给一个 DID 加一把恢复密钥(预授权签一次迁移) |
-| `rotate-hot-key` | 轮换日常签名用的热密钥 |
-| `remove-key` | 从文档里摘掉一把非绑定密钥 |
-| `migrate` | 迁移到一个新 DID:旧文档标记为已注销并指向它 |
-| `deactivate` | 永久注销一个 DID,可以顺手指向一个后继 |
-| `import-mnemonic` | 从 24 个词恢复一把绑定密钥,并重新封进信封 |
-| `import-archive` | 从一个加密归档恢复 |
+| serve / stop | 旧开发 daemon；不是 v2 systemd 服务管理 |
+| sign / list / status / document / unlock / lock | 旧 socket 客户端，同 UID 不承诺隔离，v1 unlock 发送口令 |
+| spec / keygen / publish / verify-doc | 本地身份与公开文档处理 |
+| add-recovery-key / rotate-hot-key / remove-key / migrate / deactivate | 本地生命周期；托管目录拒绝这类直接写入旁路 |
+| import-mnemonic / import-archive | 恢复身份并重新封装，默认构建可用 |
+| probe | 本地开发环境体检；与 probe --security 区分 |
 
-::: tip `--help` 是完整的参数参考
-这一页讲的是**分组和理由**,不是全部开关。
-:::
+控制终端不是人类认证；程序可以创建 PTY。生命周期权限依赖 OS 和受信管理边界，不能因命令“给人用”就推断 Agent 调不到。
 
-## 只在特定构建里存在的几个
+## 可选构建
 
-```bash
-cargo install --path . --features seed-export    # 多出 export-seed
-cargo install --path . --features mcp            # 多出 mcp
-cargo install --path . --features hardware-se    # macOS:钥匙可以绑到 Secure Enclave
-cargo install --path . --features hardware-tpm   # Linux:钥匙可以绑到 TPM 2.0
-```
-
-`export-seed` 把一把钥匙的种子导出来。默认构建里它**不存在** —— 不是"被拒绝",是**没有这段代码**:没有分支、没有环境变量、没有可翻的开关。理由见[导出为什么是缺席的](/design/)。
-
-导入则相反,**默认构建里就有**。
+| feature | 增加能力及限制 |
+|---|---|
+| mcp | MCP 前端；保护模式必须显式传 --config |
+| seed-export | export-seed；默认没有，启用后不声明受保护支持 |
+| hardware-se | macOS Secure Enclave 解封后端；发行和持久化仍待专项验收 |
+| hardware-tpm | Linux TPM 后端；实体权限和故障仍待专项验收 |
+| hardware-software | 测试替身；release 拒绝，不提供硬件保护 |

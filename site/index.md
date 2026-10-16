@@ -19,12 +19,12 @@ hero:
 features:
   - title: 私钥不出进程
     details: agent 通过 Unix socket 说话,请求里可以带方法、URL、头、请求体 —— 唯独没有一个字段能装私钥。守护进程自己重建签名基、自己决定覆盖面,签完把签名头递回来。
-  - title: 挡注入,不挡冒充
-    details: Linux v2 在独立 UID 下执行主体、密钥角色、目标策略、次数、期限和撤销。同 UID 开发模式不提供任意代码隔离；受保护发行门禁仍未开放。
+  - title: 独立主体与有限授权
+    details: Linux v2 在独立 UID 下执行主体、密钥角色、目标策略、次数、期限和撤销。同 UID 开发模式不提供任意代码隔离；正式 Linux release 加显式 linux-protected-v1 已通过 systemd 主机验收。
   - title: 信封与恢复
-    details: 一半的熵来自人给的口令,另一半来自这台机器的 device.secret。整套软件目录加口令可以解封，缺少 device.secret 或所需硬件根时拒绝。
+    details: 口令派生材料与 device.secret 共同保护信封。整套软件目录加口令可以解封，缺少 device.secret 或所需硬件根时拒绝。
   - title: 硬件根可以再插一路
-    details: 第三路熵是不可导出、拷不走的芯片里那 32 字节。要的人开口要,默认是 none;要了而机器上没有,是拒绝生成,不是降级。
+    details: 硬件根参与解封，Ed25519 签名仍在软件中执行。指定硬件不可用时拒绝，正式 SE 发行及实体 TPM 验收仍待完成。
   - title: 导出是缺席的,不是被拒绝的
     details: export-seed 在默认构建里不存在 —— 不是"被拒绝",是没有这段代码:没有分支、没有环境变量、没有可翻的开关。
   - title: 签名核心不联网
@@ -33,7 +33,7 @@ features:
 
 ## 它长什么样
 
-签出来的就是两个 HTTP 头,原样搬运 —— 不解析、不重排、不补引号。
+签名结果包括 Signature-Input、Signature，有 body 时还包括 Content-Digest。客户端保留原 body、使用规范化 URL，并禁用自动重定向。
 
 ```http
 Signature-Input: sig1=("@method" "@target-uri" "@authority");created=1791913177;expires=1791913477;nonce="xUrKXp6Jcvy5Ha-CywsJKA";keyid="did:wba:example.com:agents:mybot:e1_abc…#key-1"

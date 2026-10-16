@@ -1,88 +1,79 @@
-# Agent 接入与模式
+# Agent 接入
 
-Linux v2 请使用仓库 `skills/anp-keyd/SKILL.md`、`adapters/keyd-v2.mjs` 或 `mcp --config`。必须提供管理员配置、grant 和持久 request_id；收到签名后按规范化 URL 与原 body 发送，不跟随重定向。没有普通 Agent challenge/password/raw 操作，错误不触发 v1 回退。正式 Linux 构建且配置 `linux-protected-v1` 时 `protected_supported=true`，其他模式为 false。
+本页介绍 Linux v2。服务须先由管理员部署，Agent 使用独立 UID，获得受保护配置路径、grant_id 和 exact key_id。正式 Linux release 且配置为 `linux-protected-v1` 才声明保护支持。macOS 和同 UID 运行保留开发能力。
 
-以下保留旧开发模式接入说明，同 UID 不提供私钥隔离。
+完整协议、管理变更和恢复说明见仓库 [ADAPTER.md](https://github.com/eccstartup/anp-keyd/blob/master/docs/ADAPTER.md)。
 
-# 接到 agent 上
+## CLI
 
-## 一、MCP
+把公开请求保存为 request.json，以 Agent UID 运行：
 
-`mcp` 子命令在 stdin/stdout 上说 MCP,把几个工具转发给守护进程。**它自己不开密钥库,也不碰密码学。**
-
-```bash
-cargo install --path . --features mcp
+```sh
+anp-keyd data --config /etc/anp-keyd/service.json --file request.json
 ```
-
-MCP 客户端的配置里,那一行 `command` 就指向这个子命令,参数是 `["mcp"]`:
 
 ```json
 {
-  "mcpServers": {
-    "anp-keyd": { "command": "/path/to/anp-keyd", "args": ["mcp"] }
+  "operation": "SIGN_HTTP",
+  "grant_id": "ADMIN_SUPPLIED_GRANT_ID",
+  "request_id": "6b79d06e-33cf-44e2-8209-81938b6a8ed3",
+  "http": {
+    "method": "GET",
+    "url": "https://service.example.com/v1/status",
+    "headers": {},
+    "body": {"state": "absent"},
+    "nonce": null
   }
 }
 ```
 
-| 工具 | 干什么 |
+grant 和目标须与管理员配置一致。每个新操作生成并保存自己的 UUID，重试使用原 ID，不能重复使用此示例 UUID。CLI 自动封装 v2 版本；成功回复的业务数据在 data 字段。
+
+数据操作还有 GET_CAPABILITIES、LIST_AUTHORIZED_KEYS、GET_GRANT_STATUS、GET_DOCUMENT 和 GET_REQUEST_STATUS。数据面没有密码、解锁、根签名、raw、challenge 或生命周期入口。
+
+## 发送与恢复
+
+发送必须使用 daemon 返回的规范化 URL、原始 body 字节和签名头，禁用自动重定向。body 显式区分 absent 与 present；present 空数组也签摘要。当前 body 上限 16384 字节，整帧 65536 字节，URL 仅支持保守 HTTPS DNS 子集。
+
+应用在签名前持久保存 request_id 和精确输入。超时后先查询原 ID，不换 ID 自动重签。completed 表示签名结果持久化，不代表远端业务执行；outcome_unknown 需要结合审计和业务状态处理。撤销、过期或重启后不再交付失效缓存。
+
+## Node 和现有 SDK
+
+仓库 [adapters/keyd-v2.mjs](https://github.com/eccstartup/anp-keyd/blob/master/adapters/keyd-v2.mjs) 提供 KeydV2Client、keydV2Signer 和 keydV2Connector；Node 18+，通过 Rust CLI 认证 daemon。client.fetch 禁用重定向，不自动重试；它不会替应用持久化操作状态。
+
+SDK createConfig/signRequest 接缝已有验收，但已验版本的高层 resolveVerificationKey 错将 hot 指纹与 DID 根指纹比较，尚未兼容。SDK 的 ANP-02 body 与 awiki JSON-RPC envelope 不同；先构造正确 body 再签，不能签后重写。不能自动回退 root grant。
+
+## MCP
+
+启用 mcp feature 后，由 Agent 所属执行域启动：
+
+```json
+{
+  "mcpServers": {
+    "anp-keyd": {
+      "command": "/usr/local/libexec/anp-keyd",
+      "args": ["mcp", "--config", "/etc/anp-keyd/service.json"]
+    }
+  }
+}
+```
+
+| 工具 | 输入 |
 |---|---|
-| `list_my_keys` | 列出这台机器上的钥匙 |
-| `status` | 列出当前已解锁的钥匙 |
-| `sign_request` | 签一条请求 |
-| `get_did_document` | 取回一份本机发布过的文档 |
+| list_my_keys | 空对象 |
+| grant_status | grant_id |
+| get_did_document | key_id |
+| sign_request | grant_id、request_id、http |
+| request_status | request_id |
 
-MCP 不提供解锁工具或密码参数。用户通过本机 CLI 解锁；当前 v1 会经 socket
-发送口令；Linux v2 管理客户端已有独立服务 UID 认证。
+配置在启动时固定，工具参数不能覆盖 socket、root、config、DID 或 kid。口令不经 MCP。stdout 属于协议，诊断走 stderr。不带 --config 的 MCP 是旧开发路径，不是失败后的降级方案。
 
-::: info 有一条明确的"没有"
-那条比 `Raw` 窄的挑战签名路(见[不显然的默认值](/reference/defaults#关于能签任意字节的那两条路))**不进 MCP**。
+当前 MCP 源码部分描述仍含“M4 未启用”的旧文案，服务端事务执行器已经启用；能力判断以 capabilities 和实际结果为准。这处源码文案仍需单独修正。
 
-agent 手里不该有"签这串字节"的工具。
-:::
+## 管理动作
 
-## 二、写给 agent 看的说明
+管理员通过独立 admin 通道 prepare/commit 建权、撤销和角色确认；注册 proof 与轮换用 complete-secret-operation 短期解封根密钥。挑战来源由可信管理适配器校验，普通 Agent 不代办。
 
-仓库里 [`skills/anp-keyd/`](https://github.com/eccstartup/anp-keyd/tree/master/skills/anp-keyd) 是一份 Claude Code skill:告诉 agent 怎么查状态、怎么签、怎么把两个头逐字节挂上去、被拒的那些码各自什么意思。
+daemon 重启使旧 grant 失效并锁定密钥。恢复运行需要管理员重新解锁和建权。文档本地生成不代表远端发布或撤销已生效。
 
-它还写了**三件绝不做的事**:
-
-- 不要口令
-- 不替人跑生命周期命令
-- 24 个词不许进聊天
-
-装上它:
-
-```bash
-cp -r skills/anp-keyd ~/.claude/skills/          # 只给自己用
-cp -r skills/anp-keyd .claude/skills/            # 给这个项目里的会话用
-```
-
-## 三、自己写客户端
-
-线上格式是长度前缀:
-
-```
-u32_be(len) || payload
-```
-
-消息类型只有六种:
-
-| 消息 | 对应命令 |
-|---|---|
-| `LIST_KEYS` | `list` |
-| `SIGN` | `sign` |
-| `UNLOCK` | `unlock` |
-| `LOCK` | `lock` |
-| `STATUS` | `status` |
-| `GET_DOCUMENT` | `document` |
-
-[`src/client/mod.rs`](https://github.com/eccstartup/anp-keyd/blob/master/src/client/mod.rs) 就是一份可以直接抄的最小实现。
-
-## 那几件"agent 不该做的事"
-
-守护进程这边是靠**两条默认关着的路**挡的:
-
-- `sign --raw` —— 任意签名的能力,要 `serve --allow-raw-signing`
-- `sign --challenge` —— 同样签你给的原字节,但输入**有上界**(256 字节)
-
-两条都默认关,理由在[不显然的默认值](/reference/defaults)里。**它们是"给调用方签东西"这件事的全部出口**,不开就等于没有。
+写给 Agent 的操作约束见仓库 [skill](https://github.com/eccstartup/anp-keyd/tree/master/skills/anp-keyd)。skill 不授予管理权限，也不能替代 daemon 策略检查。
