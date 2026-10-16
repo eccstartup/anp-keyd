@@ -328,3 +328,20 @@ instance identity and status. Restart revokes grants and locks keys. Existing
 backup files are refused rather than overwritten. Errors leave artifacts/state
 for inspection; there is no automatic rollback, schema downgrade, or state reset.
 The default plan changes no system files or service state.
+
+
+## Accepted build activated on the local host
+
+The operator applied the updater successfully. Independent read-only checks
+confirmed the installed SHA-256 matches the accepted `453f5aa6...12b7ee` build
+and `bin/anp-keyd.previous` retains the original
+`41e39c6c9ff955422cb285bb8311f4d413157f908e54357eb3582cada595e4b9` build.
+The instance remains `80a37601-db74-44b6-8a17-d3ea5ad9a7ef`; status is OK,
+`boot_epoch=2`, and audit projection and transaction executor are healthy.
+Configuration/state were preserved; no real keys were migrated.
+
+U2 is complete for the operator's selected local-use preview scope.
+`protected_supported=false` remains unchanged. Formal distribution and
+whole-machine reboot acceptance remain separate; the earlier intermittent
+EINVAL remains an observation with unknown root cause. Only Agents actually
+running under the independent Agent UID receive this isolation boundary.
