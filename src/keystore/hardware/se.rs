@@ -51,6 +51,13 @@
 //! 那一段在这里跑不起来。它在下面被单独隔成了
 //! [`create_persistent_se_key`] / [`find_key`] 两个函数 —— 读的人能一眼看出
 //! 截断在哪里,而不是以为整块都验过了。
+//!
+//! # 执行上下文也是前置条件
+//!
+//! Apple TN3137 明确规定数据保护钥匙串只在用户登录上下文可用，系统
+//! LaunchDaemon 不可访问。签名和 provisioning profile 不能消除这个限制。
+//! 本后端不能凭登录会话内的成功探测宣称支持独立服务 UID 的后台部署。
+//! https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains
 
 use core_foundation::base::{TCFType, ToVoid};
 use core_foundation::data::CFData;
@@ -175,10 +182,11 @@ fn create_persistent_se_key(label: &str) -> Result<SecKey> {
                  and on macOS writing a keychain item needs the `application-identifier` / \
                  `keychain-access-groups` entitlement — which only a binary signed with an \
                  Apple-issued certificate can carry.\n\
-                 Fix: sign this binary with a Developer ID / provisioning profile that carries \
-                 that entitlement (`security find-identity -v -p codesigning` lists what this \
-                 machine has). No build flag can work around it: an unsigned or ad-hoc signed \
-                 binary cannot persist a Secure Enclave key, and an SE-bound envelope needs one."
+                 First check execution context: the data protection keychain requires a user \
+                 login context and is unavailable to a system LaunchDaemon (Apple TN3137). \
+                 A certificate cannot fix that deployment mismatch. In a supported login \
+                 context, use an app-like signed bundle with an authorized provisioning profile \
+                 and the required entitlement. No build flag can replace these prerequisites."
             ))
         } else {
             KeydError::HardwareUnavailable(format!(
@@ -490,8 +498,11 @@ pub fn probe() -> RootProbe {
                      survive this process: {error}"
                 ),
                 remedy: Some(
-                    "Sign this binary with an Apple-issued certificate. Only a signed binary can \
-                     be given the entitlement a Secure Enclave key needs to persist."
+                    "Check execution context first: this backend requires the user login data \
+                     protection keychain, unavailable to a system LaunchDaemon (Apple TN3137). \
+                     In a supported login context, check the signed app-like bundle, authorized \
+                     provisioning profile and keychain entitlements. Signing alone does not \
+                     establish persistent service access."
                         .into(),
                 ),
             };

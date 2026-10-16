@@ -1,5 +1,39 @@
 # macOS local UID boundary preview (U2)
 
+## U3 Secure Enclave execution-context gate
+
+The current SE backend uses the data protection keychain. Apple
+[TN3137](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains)
+limits that keychain to a user login context; a system LaunchDaemon cannot use
+it. Signing the existing `_anpkeyd` LaunchDaemon does not resolve this limitation.
+Do not purchase a certificate on the assumption that it makes this deployment
+SE-capable. Non-persistent ECDH tests in a human login session do not demonstrate
+persistent service access. The existing local preview remains usable without SE.
+
+The read-only release prerequisite gate never runs or signs the candidate and
+never touches a keychain, account, service or vault:
+
+```sh
+python3 deploy/macos/se-preflight.py --binary /absolute/path/to/signed/anp-keyd \
+  --sha256 VERIFIED_SIGNED_BINARY_SHA256 --execution-context system-daemon \
+  --team-id APPLE_TEAM_ID --application-id APPLE_TEAM_ID.APP_IDENTIFIER
+```
+
+It requires a verified signature, expected team/application identifiers, a narrow
+keychain group, hardened runtime and no debug/code-loading exceptions. System
+daemon context always fails this gate. `user-session` is an explicit candidate
+architecture, not an accepted replacement for the existing service boundary.
+Even exit 0 covers only the checked signature prerequisites; provisioning
+authorization, distribution assessment, persistent hardware operations, isolation,
+reboot and upgrade remain pending. All reports retain `protected_supported=false`.
+
+Before implementing a login-session helper, define its authenticated IPC, exact
+wrapping-key ownership and allowed operations, handling of logout/locked sessions,
+and separation from untrusted Agent UIDs. It must not expose a general decryption
+oracle or persist an unwrapped secret to bridge logout/reboot. No automatic
+restoration of grants is authorized by a hardware probe. Until that design and
+acceptance exist, U3 SE service acceptance and dependent SE recovery stay open.
+
 This is a local-use implementation, not an accepted protected macOS release.
 `macos-boundary-preview` always reports `protected_supported=false`, including
 release builds. No paid Apple membership is needed to build and test this path.
