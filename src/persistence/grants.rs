@@ -1,4 +1,4 @@
-//! Stateful, exact-key grants. No signatures or quota reservations before M4.
+//! Stateful exact-key grants; reservations and results live in requests.
 use super::*;
 use crate::security::http::CanonicalHttpRequest;
 

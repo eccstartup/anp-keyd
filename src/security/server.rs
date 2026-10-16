@@ -1,4 +1,4 @@
-//! Boundary preview: data cannot sign until the grant executor is available.
+//! Linux v2 transaction signer; production release acceptance remains separate.
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -34,6 +34,7 @@ pub struct Boundary {
     stopped: AtomicBool,
     rates: Mutex<super::limits::RateLimit>,
     projection_healthy: AtomicBool,
+    connections: super::limits::Connections,
 }
 
 impl Boundary {
@@ -54,15 +55,17 @@ impl Boundary {
                 (id.clone(), state)
             })
             .collect();
+        let admin_gate = super::coordinator::Coordinator::new(&config.limits);
         Ok(Self {
             config,
             vaults,
-            admin_gate: super::coordinator::Coordinator::default(),
+            admin_gate,
             kdf_gate: Mutex::new(()),
             database: Mutex::new(database),
             stopped: AtomicBool::new(false),
             rates: Mutex::new(Default::default()),
             projection_healthy: AtomicBool::new(false),
+            connections: Default::default(),
         })
     }
 
@@ -124,6 +127,20 @@ impl Boundary {
                     return Ok(());
                 }
             }
+        };
+        let _principal_slot = if !admin {
+            match self
+                .connections
+                .enter(peer.uid, self.config.limits.principal_connections)
+            {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    protocol::write(&mut io, &Reply::code("RESOURCE_BUSY"))?;
+                    return Ok(());
+                }
+            }
+        } else {
+            None
         };
         let mut reply = if admin {
             match protocol::read::<_, Envelope<AdminRequest>>(&mut io) {
@@ -285,6 +302,33 @@ impl Boundary {
         }
     }
 
+    fn maintenance(&self) {
+        if self.stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        let Ok(_permit) = self.admin_gate.enter(false) else {
+            return;
+        };
+        let count: usize = self
+            .vaults
+            .values()
+            .map(|v| v.sweep_protected(Instant::now()))
+            .sum();
+        if count > 0 && !self.record(json!({"event":"AUTOLOCKED","count":count})) {
+            return;
+        }
+        let result = (|| -> Result<()> {
+            self.database
+                .lock()
+                .map_err(|_| KeydError::Protocol("PERSISTENCE_UNAVAILABLE".into()))?
+                .prune_results(SystemClock.now()?)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.emergency();
+        }
+    }
+
     fn emergency(&self) {
         self.stopped.store(true, Ordering::SeqCst);
         self.lock_all();
@@ -337,6 +381,9 @@ impl Boundary {
                 }
             }
         };
+        if self.stopped.load(Ordering::SeqCst) {
+            return Reply::code("AUDIT_UNAVAILABLE");
+        }
         match request {
             AdminRequest::Capabilities {} => unreachable!(),
             AdminRequest::Catalog {} => {
@@ -660,7 +707,7 @@ pub async fn serve(config: ServiceConfig, mut stop: watch::Receiver<bool>) -> Re
             loop {
                 tokio::select! {
                     changed = sweep_stop.changed() => { if changed.is_err() || *sweep_stop.borrow() { break; } }
-                    _ = timer.tick() => { for vault in boundary.vaults.values() { vault.sweep_all(Instant::now()); } }
+                    _ = timer.tick() => {let worker=boundary.clone();if tokio::task::spawn_blocking(move||worker.maintenance()).await.is_err(){boundary.emergency();}}
                 }
             }
         })

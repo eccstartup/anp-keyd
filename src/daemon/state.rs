@@ -422,6 +422,15 @@ impl DaemonState {
         }
     }
 
+    /// Protected-mode sweeping records only through the SQLite audit owner.
+    pub(crate) fn sweep_protected(&self, now: Instant) -> usize {
+        let mut vaults=match self.vaults.lock(){Ok(v)=>v,Err(p)=>p.into_inner()};
+        vaults.values_mut().map(|vault|{
+            let before=vault.unlocked.len();vault.sweep(self.autolock,now);
+            before-vault.unlocked.len()
+        }).sum()
+    }
+
     /// 后台清扫:把每个 vault 里空闲太久的钥匙放掉。
     ///
     /// 返回被放掉的总数,纯粹是为了让测试和日志看得见。

@@ -1,4 +1,4 @@
-//! Linux protected-boundary preview. No signing or production support yet.
+//! Linux signing boundary. Protected release acceptance remains pending.
 pub mod http;
 pub mod client;
 pub mod json;
@@ -91,7 +91,7 @@ pub fn probe(path: &Path) -> Result<()> {
     );
     println!("signing_available: {}", reply.signing_available);
     Err(KeydError::Misuse(
-        "boundary checks passed; protected release capability is not implemented".into(),
+        "boundary checks passed; Linux protected release acceptance is pending".into(),
     ))
 }
 

@@ -181,7 +181,8 @@ def exact(n):
  while len(b)<n:b+=s.recv(n-len(b))
  return b
 print(exact(struct.unpack('!I',exact(4))[0]).decode())
-assert s.recv(1)==b''
+try:assert s.recv(1)==b''
+except ConnectionResetError:pass  # Early refusal closes with unread request bytes.
 '''
     def prepare_change(change):
         source = Path('/tmp/keyd-management-change.json')
@@ -362,6 +363,19 @@ for s in sockets:s.close()
     started = time.monotonic()
     check(command('boundary-admin', 'admin', 'lock-all').returncode == 0 and time.monotonic() - started < 3, 'authorized slow data clients do not starve management')
     slow.communicate('done\n', timeout=8)
+    # Inject failure after a real backend signature but before its durable result.
+    failed_grant=commit_change({'kind':'Grant','change':{**create_grant,'expiry':int(time.time())+55}})['effect']['effect']['grant']['grant_id']
+    unlock_hot()
+    failed_request={**signing,'grant_id':failed_grant,'request_id':str(uuid.uuid4())}
+    with sqlite3.connect(Path(config['state_dir'])/'state.sqlite') as database:
+        database.execute("CREATE TRIGGER fail_result BEFORE INSERT ON audit_events WHEN CAST(NEW.event_data AS TEXT) LIKE '%SIGN_COMPLETED%' BEGIN SELECT RAISE(ABORT,'result failure'); END")
+    failed=data_as('boundary-agent-a',failed_request)
+    check(failed['code']=='AUDIT_UNAVAILABLE' and failed.get('data') is None,'result audit failure releases no real backend signature and stops signing')
+    with sqlite3.connect(Path(config['state_dir'])/'state.sqlite') as database:
+        check(database.execute('SELECT used_uses FROM grants WHERE grant_id=?',(failed_grant,)).fetchone()[0]==1,'result audit failure preserves consumed quota')
+        database.execute('DROP TRIGGER fail_result')
+    check(data_as('boundary-agent-a',failed_request)['code']=='AUDIT_UNAVAILABLE','repair cannot silently retry a failed result commit')
+
 finally:
     stop(process)
 
@@ -404,6 +418,7 @@ os.chown(config['sign_socket'], service.pw_uid, config['agent_gid'])
 os.chmod(config['sign_socket'], 0o660)
 process = start()
 check(command('boundary-admin', 'admin', 'status').returncode == 0, 'verified stale socket is recovered')
+check(data_as('boundary-agent-a',{'operation':'GET_REQUEST_STATUS','request_id':failed_request['request_id']})['data']['state']=='outcome_unknown','restart recovers real signature with uncommitted result as unknown')
 stop(process)
 # Two-phase persistent management: no config edit can re-enable old principals.
 process = start()
@@ -437,6 +452,42 @@ try:
     check(as_agent('boundary-agent-a')['code'] == 'AUDIT_UNAVAILABLE', 'repair alone cannot clear emergency stop without restart')
 finally:
     stop(process)
+
+# Configure finite rate/connection budgets in the root-owned schema.
+resource_config=dict(config,limits={'frame_seconds':1,'response_seconds':1,'principal_connections':2,'principal_burst':2,'principal_per_second':1})
+config_path.write_text(json.dumps(resource_config))
+process=start()
+try:
+    slow_frames=r"""import socket,sys
+ss=[]
+for _ in range(2):
+ s=socket.socket(socket.AF_UNIX);s.settimeout(3);s.connect(sys.argv[1]);s.sendall(b'\x00');ss.append(s)
+print('ready',flush=True)
+def closed(s):
+ while True:
+  try:data=s.recv(4096)
+  except ConnectionResetError:return True
+  if not data:return True
+print(sum(closed(s) for s in ss),flush=True)
+"""
+    slow=subprocess.Popen([sys.executable,'-c',slow_frames,config['sign_socket']],preexec_fn=identity('boundary-agent-a'),stdout=subprocess.PIPE,text=True)
+    assert slow.stdout.readline().strip()=='ready'
+    time.sleep(.1)  # Allow accepted slow readers to claim their bounded slots.
+    check(as_agent('boundary-agent-a')['code']=='RESOURCE_BUSY','one principal cannot exceed its active connection budget')
+    check(as_agent('boundary-agent-b')['code']=='OK','other principal retains data capacity during slow frames')
+    started=time.monotonic()
+    check(command('boundary-admin','admin','lock-all').returncode==0 and time.monotonic()-started<1,'reserved management capacity survives principal saturation')
+    check(slow.stdout.readline().strip()=='2','whole-frame deadline closes stalled authenticated connections')
+    slow.wait(timeout=4)
+    check(as_agent('boundary-agent-a')['code']=='OK' and as_agent('boundary-agent-a')['code']=='OK','rate budget admits configured initial burst')
+    check(as_agent('boundary-agent-a')['code']=='RESOURCE_BUSY','rate excess yields bounded refusal without emergency stop')
+    check(command('boundary-admin','admin','lock-all').returncode==0,'rate refusal preserves management operation')
+    time.sleep(1.05)
+    check(as_agent('boundary-agent-a')['code']=='OK','principal rate budget recovers monotonically')
+finally:
+    stop(process)
+    config_path.write_text(json.dumps(config))
+
 state_path = Path(config['state_dir']) / 'state.sqlite'
 check(b'temporary-boundary-test-secret' not in state_path.read_bytes(), 'SQLite contains no unlock password')
 check(command('anp-keyd', 'init-protected-state').returncode != 0, 'explicit initialization refuses an existing database')

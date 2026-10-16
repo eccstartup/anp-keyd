@@ -158,6 +158,13 @@ mod tests {
     }
 
     #[test]
+    fn oversized_untrusted_costs_are_rejected_before_derivation() {
+        for (memory,iterations,lanes) in [(u32::MAX,1,1),(262145,1,1),(1024,11,1),(1024,1,5),(0,1,1)] {
+            assert!(argon2id(b"pw",b"salt-salt-salt-1",memory,iterations,lanes).is_err());
+        }
+    }
+
+    #[test]
     fn argon2id_is_deterministic() {
         let a = argon2id(b"correct horse", b"0123456789abcdef", M, T, P).unwrap();
         let b = argon2id(b"correct horse", b"0123456789abcdef", M, T, P).unwrap();

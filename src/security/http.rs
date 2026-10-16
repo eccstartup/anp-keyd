@@ -1,4 +1,4 @@
-//! Conservative v2 HTTP grammar. Policy, digest and future signer share this object.
+//! Conservative v2 HTTP grammar shared by policy, digest and signing.
 use crate::error::{KeydError, Result};
 use crate::sign::rfc9421::SignRequest;
 #[cfg(feature = "mcp")]

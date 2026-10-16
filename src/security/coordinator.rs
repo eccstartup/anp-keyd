@@ -11,21 +11,32 @@ struct State {
 pub struct Coordinator {
     state: Mutex<State>,
     ready: Condvar,
+    data_capacity: usize,
+    admin_capacity: usize,
+    wait: Duration,
 }
 pub struct Permit<'a>(&'a Coordinator);
 impl Default for Coordinator {
     fn default() -> Self {
-        Self {
-            state: Mutex::new(State::default()),
-            ready: Condvar::new(),
-        }
+        Self::new(&super::limits::Limits::default())
     }
 }
 impl Coordinator {
+    pub fn new(limits: &super::limits::Limits) -> Self {
+        Self {
+            state: Mutex::new(State::default()),
+            ready: Condvar::new(),
+            data_capacity: limits.data_queue,
+            admin_capacity: limits.admin_queue,
+            wait: Duration::from_millis(limits.queue_millis),
+        }
+    }
     pub fn enter(&self, admin: bool) -> Result<Permit<'_>> {
         let denied = || KeydError::Misuse("RESOURCE_BUSY".into());
         let mut state = self.state.lock().map_err(|_| denied())?;
-        if (admin && state.admin >= 2) || (!admin && state.data >= 8) {
+        if (admin && state.admin >= self.admin_capacity)
+            || (!admin && state.data >= self.data_capacity)
+        {
             return Err(denied());
         }
         if admin {
@@ -33,7 +44,7 @@ impl Coordinator {
         } else {
             state.data += 1;
         }
-        let end = Instant::now() + Duration::from_secs(2);
+        let end = Instant::now() + self.wait;
         while state.busy || (!admin && state.admin > 0) {
             let remaining = end.saturating_duration_since(Instant::now());
             if remaining.is_zero() {

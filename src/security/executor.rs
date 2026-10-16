@@ -58,23 +58,39 @@ pub(crate) fn execute(
     let expiry = signed
         .expires_at
         .ok_or_else(|| KeydError::Protocol("missing profile expiry".into()))?;
+    let created = signed
+        .created_at
+        .ok_or_else(|| KeydError::Protocol("missing profile creation time".into()))?;
+    let lifetime = expiry
+        .checked_sub(created)
+        .filter(|s| (1..=300).contains(s))
+        .ok_or_else(|| KeydError::Protocol("invalid profile lifetime".into()))?;
     let result = json!({"request_id":request_id,"url":canonical.signing_request().url,"headers":signed.headers,"covered":signed.covered,"expires_at":expiry});
     let digest: String = signed
         .signature_base_digest
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    db.complete_http(
+    if let Err(error) = db.complete_http(
         principal,
         request_id,
         &result,
         (
             expiry,
-            deadline.min(before.monotonic_ms.saturating_add(300_000)),
+            deadline.min(before.monotonic_ms.saturating_add(lifetime * 1000)),
         ),
         &digest,
         after,
-    )?;
+    ) {
+        // Reconcile a possibly committed transaction without releasing its result.
+        // If even the reconciliation audit fails, recovery owns the reservation.
+        if let Ok(status) = db.request_status(principal, request_id, clock.now()?) {
+            if status.state == "reserved" {
+                let _ = db.fail_reserved(principal, request_id, true, clock.now()?);
+            }
+        }
+        return Err(error);
+    }
     // A result-commit failure never releases the in-memory signature. The caller
     // latches emergency stop; restart converts any unresolved reserve to unknown.
     db.request_status(principal, request_id, clock.now()?)

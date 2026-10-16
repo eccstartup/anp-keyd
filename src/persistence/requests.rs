@@ -22,6 +22,23 @@ fn refused(code: &str) -> KeydError {
 }
 type StoredRequest = (String, String, Option<Vec<u8>>, Option<i64>);
 impl Database {
+    /// Bounded maintenance deletes signatures, retaining permanent ID tombstones.
+    pub fn prune_results(&mut self, now: Time) -> Result<usize> {
+        self.refresh_grants(now)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let count=tx.execute("UPDATE requests SET result=NULL WHERE rowid IN (SELECT r.rowid FROM requests r JOIN grants g USING(grant_id) LEFT JOIN grant_deadlines d USING(grant_id) WHERE r.result IS NOT NULL AND (r.result_expiry<=?1 OR g.expiry<=?1 OR d.monotonic_deadline<=?2 OR g.boot_epoch!=?3 OR g.state NOT IN ('active','exhausted') OR json_extract(CAST(r.result AS TEXT),'$.monotonic_expiry')<=?2) LIMIT 256)",params![now.wall,now.monotonic_ms,self.boot_epoch]).map_err(db_error)?;
+        if count > 0 {
+            append(
+                &tx,
+                &json!({"event":"SIGN_RESULTS_PRUNED","count":count,"at":now.wall}),
+            )?;
+        }
+        tx.commit().map_err(db_error)?;
+        Ok(count)
+    }
     /// Existing requests are resolved before quota checks, including the last use.
     pub fn reserve_http(
         &mut self,

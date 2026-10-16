@@ -6,6 +6,10 @@ use std::collections::BTreeMap;
 pub struct Limits {
     pub data_connections: usize,
     pub admin_connections: usize,
+    pub principal_connections: usize,
+    pub data_queue: usize,
+    pub admin_queue: usize,
+    pub queue_millis: u64,
     pub frame_seconds: u64,
     pub response_seconds: u64,
     pub principal_burst: u32,
@@ -17,6 +21,10 @@ impl Default for Limits {
         Self {
             data_connections: 16,
             admin_connections: 4,
+            principal_connections: 4,
+            data_queue: 8,
+            admin_queue: 2,
+            queue_millis: 2000,
             frame_seconds: 5,
             response_seconds: 5,
             principal_burst: 64,
@@ -29,6 +37,10 @@ impl Limits {
     pub fn validate(&self) -> Result<()> {
         if !(1..=64).contains(&self.data_connections)
             || !(3..=16).contains(&self.admin_connections)
+            || !(1..=self.data_connections).contains(&self.principal_connections)
+            || !(1..=64).contains(&self.data_queue)
+            || !(2..=16).contains(&self.admin_queue)
+            || !(1..=5000).contains(&self.queue_millis)
             || !(1..=30).contains(&self.frame_seconds)
             || !(1..=30).contains(&self.response_seconds)
             || !(1..=1024).contains(&self.principal_burst)
@@ -69,9 +81,51 @@ impl RateLimit {
         }
     }
 }
+/// RAII limits cover reading, queueing, execution and response writing.
+#[derive(Default)]
+pub struct Connections(std::sync::Mutex<BTreeMap<u32, usize>>);
+pub struct ConnectionPermit<'a> {
+    owner: &'a Connections,
+    uid: u32,
+}
+impl Connections {
+    pub fn enter(&self, uid: u32, limit: usize) -> Result<ConnectionPermit<'_>> {
+        let mut counts = self
+            .0
+            .lock()
+            .map_err(|_| KeydError::Misuse("RESOURCE_BUSY".into()))?;
+        let count = counts.entry(uid).or_default();
+        if *count >= limit {
+            return Err(KeydError::Misuse("RESOURCE_BUSY".into()));
+        }
+        *count += 1;
+        Ok(ConnectionPermit { owner: self, uid })
+    }
+}
+impl Drop for ConnectionPermit<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut counts) = self.owner.0.lock() {
+            if let Some(count) = counts.get_mut(&self.uid) {
+                *count -= 1;
+                if *count == 0 {
+                    counts.remove(&self.uid);
+                }
+            }
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn slow_principal_cannot_take_other_principal_slots() {
+        let c = Connections::default();
+        let a = c.enter(1001, 1).unwrap();
+        assert!(c.enter(1001, 1).is_err());
+        assert!(c.enter(1002, 1).is_ok());
+        drop(a);
+        assert!(c.enter(1001, 1).is_ok());
+    }
     #[test]
     fn limits_are_finite_and_rates_are_per_principal() {
         let mut l = Limits::default();

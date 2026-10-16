@@ -1509,6 +1509,7 @@ impl clock::Clock for FixedClock {
 }
 fn fake_signed() -> crate::sign::rfc9421::Signed {
     crate::sign::rfc9421::Signed {
+        created_at: Some(1000),
         expires_at: Some(1040),
         headers: std::collections::BTreeMap::from([("Signature".into(), "test-result".into())]),
         covered: vec!["@method".into()],
@@ -1742,4 +1743,118 @@ fn sqlite_full_cannot_reserve_without_durable_audit() {
         0
     );
     verify_audit(&f.db.connection).unwrap();
+}
+
+#[test]
+fn scheduled_result_retention_preserves_tombstones_and_audit_atomicity() {
+    let (mut f, key, policy) = grant_fixture();
+    let g = new_grant(&mut f, &key, &policy);
+    let id = uuid();
+    f.db.reserve_http(&g.principal_id, &g.grant_id, &id, &canonical(), now())
+        .unwrap();
+    f.db.complete_http(
+        &g.principal_id,
+        &id,
+        &json!({"signature":"retained"}),
+        (1040, 45000),
+        "digest",
+        now(),
+    )
+    .unwrap();
+    assert_eq!(f.db.prune_results(now()).unwrap(), 0);
+    f.db.connection.execute_batch("CREATE TRIGGER fail_prune BEFORE INSERT ON audit_events WHEN CAST(NEW.event_data AS TEXT) LIKE '%SIGN_RESULTS_PRUNED%' BEGIN SELECT RAISE(ABORT,'fail'); END").unwrap();
+    let late = Time {
+        wall: 900,
+        monotonic_ms: 45000,
+    };
+    assert!(f.db.prune_results(late).is_err());
+    let retained: bool =
+        f.db.connection
+            .query_row(
+                "SELECT result IS NOT NULL FROM requests WHERE request_id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+    assert!(retained);
+    f.db.connection
+        .execute_batch("DROP TRIGGER fail_prune")
+        .unwrap();
+    assert_eq!(f.db.prune_results(late).unwrap(), 1);
+    assert_eq!(f.db.prune_results(late).unwrap(), 0);
+    assert!(f
+        .db
+        .request_status(&g.principal_id, &id, now())
+        .unwrap()
+        .result
+        .is_none());
+    assert_eq!(
+        grants::get(&f.db.connection, &g.grant_id)
+            .unwrap()
+            .unwrap()
+            .used_uses,
+        1
+    );
+    verify_audit(&f.db.connection).unwrap();
+}
+#[test]
+fn legacy_audit_is_verified_and_bound_to_prepared_enrollment() {
+    use catalog::CatalogChange;
+    let mut f = Fixture::new();
+    let (vault, _, _) = vault_fixture(&mut f);
+    let change = Change::Catalog {
+        change: CatalogChange::EnrollVault {
+            vault_id: vault.clone(),
+        },
+    };
+    let p = f.db.prepare(1002, change, now()).unwrap();
+    let audit = f.dir.join("vaults").join(&vault).join("audit");
+    let original = crate::audit::log::legacy_summary(&audit).unwrap();
+    assert!(original["files_digest"].as_str().is_some());
+    let mut history = crate::audit::AuditLog::open(&audit).unwrap();
+    history
+        .append(&crate::audit::Event::Locked {
+            uid: 1001,
+            did: None,
+            dropped: 0,
+        })
+        .unwrap();
+    drop(history);
+    assert!(f
+        .db
+        .commit(1002, &p.operation_id, &p.digest, now())
+        .is_err());
+    verify_audit(&f.db.connection).unwrap();
+}
+
+#[test]
+fn cached_signature_uses_actual_short_window_after_wall_clock_jump() {
+    let (mut f, key, policy) = grant_fixture();
+    let g = new_grant(&mut f, &key, &policy);
+    let id = uuid();
+    crate::security::executor::execute(
+        &mut f.db,
+        &g.principal_id,
+        &g.grant_id,
+        &id,
+        &canonical(),
+        &FixedClock,
+        |_, _, _| {
+            let mut signed = fake_signed();
+            signed.created_at = Some(1040);
+            signed.expires_at = Some(1041);
+            Ok(signed)
+        },
+    )
+    .unwrap();
+    let late = Time {
+        wall: 1000,
+        monotonic_ms: now().monotonic_ms + 1000,
+    };
+    assert!(f
+        .db
+        .request_status(&g.principal_id, &id, late)
+        .unwrap()
+        .result
+        .is_none());
 }

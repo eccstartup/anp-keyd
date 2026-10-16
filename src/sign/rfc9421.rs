@@ -68,6 +68,7 @@ pub const MAX_NONCE_LEN: usize = 256;
 /// 签完之后的产物。
 #[derive(Debug, Clone)]
 pub struct Signed {
+    pub created_at: Option<i64>,
     /// Explicit service-selected expiry; absent for the legacy profile.
     pub expires_at: Option<i64>,
     /// 要加到请求上的头:`Signature-Input`、`Signature`,有 body 时还有 `Content-Digest`。
@@ -239,6 +240,7 @@ pub(crate) fn sign_request_with_window(
         .map_err(|e| KeydError::Upstream(format!("completing the HTTP signature failed: {e}")))?;
 
     Ok(Signed {
+        created_at: window.map(|v|v.0),
         expires_at: window.map(|v|v.1),
         headers,
         covered,

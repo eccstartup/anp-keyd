@@ -1,5 +1,5 @@
 [Unit]
-Description=ANP signing boundary preview (signing disabled)
+Description=ANP transaction signing service (release acceptance pending)
 After=local-fs.target systemd-tmpfiles-setup.service
 
 [Service]
