@@ -316,6 +316,21 @@ except ConnectionResetError:pass  # Early refusal closes with unread request byt
         result=subprocess.run([sys.executable,'-c',admin_call,config['admin_socket'],json.dumps(op)],preexec_fn=identity('boundary-admin'),capture_output=True,text=True,timeout=12)
         assert result.returncode==0 and json.loads(result.stdout)['code']=='OK', result.stdout+result.stderr
     unlock_hot()
+    if os.environ.get('ANP_KEYD_TEST_SDK'):
+        sdk_policy_id = str(uuid.uuid4())
+        sdk_policy = {**policy, 'name': 'sdk-hot-login', 'methods': ['POST'],
+                      'paths': ['/user-service/v1/did-auth/rpc'],
+                      'body': {'mode': 'bounded', 'max_bytes': 16384}}
+        commit_change({'kind': 'Catalog', 'change': {'action': 'PublishPolicy',
+                      'policy_id': sdk_policy_id, 'version': 1, 'content': sdk_policy}})
+        sdk_grant = commit_change({'kind': 'Grant', 'change': {**create_grant,
+                      'policy_id': sdk_policy_id}})['effect']['effect']['grant']['grant_id']
+        unlock_hot()  # Publishing management state deliberately locks loaded keys.
+        sdk_result = subprocess.run(['node', 'adapters/test-sdk.mjs', os.environ['ANP_KEYD_TEST_SDK'],
+                      sdk_grant, hot_key['key_id'], str(uuid.uuid4()), str(uuid.uuid4())],
+                      preexec_fn=identity('boundary-agent-a'), capture_output=True, text=True, timeout=20)
+        check(sdk_result.returncode == 0, 'SDK high-level hot-key login under independent Agent UID: ' + sdk_result.stderr)
+        check(json.loads(sdk_result.stdout)['sdkHotResolverSupported'], 'SDK hot resolver requires no public-key override')
     first=data_as('boundary-agent-a',signing)
     check(first['code']=='OK' and first['data']['state']=='completed' and first['data']['result']['url']=='https://example.com/test', 'M4 signs canonical target after durable reservation and result commit')
     check(data_as('boundary-agent-a',signing)['data']==first['data'], 'same ID returns identical cached signature without a second use')

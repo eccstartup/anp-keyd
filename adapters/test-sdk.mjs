@@ -20,22 +20,20 @@ assert.equal((await client.grant(grant_id)).used_uses, 1)
 await assert.rejects(connector.signRequest({ ...request, successorDid: 'did:wba:other.example' }), /management/)
 sdk.verifyDidDocument(first.didDocument, first.did)
 assert(first.didDocument.authentication.includes(first.keyid))
-// The current external SDK resolver incorrectly binds every selected key to
-// the DID's root fingerprint. Record that compatibility limit explicitly.
-let sdkHotResolverSupported = true
-try { await sdk.resolveVerificationKey(first.keyid, first.didDocument) }
-catch (error) {
-  if (error.code !== 'did_resolve_invalid_document' || !error.message.includes('fingerprint')) throw error
-  sdkHotResolverSupported = false
-}
+const resolved = await sdk.resolveVerificationKey(first.keyid, first.didDocument)
+assert.deepEqual(resolved.bytes, sdk.decodeMultibaseKey(first.publicKey.publicKeyMultibase).bytes)
 const verification = {
   method: 'POST', path: '/user-service/v1/did-auth/rpc', authority: 'example.com', targetUri: request.url,
   headers: Object.fromEntries(Object.entries(first.headers).map(([k, v]) => [k.toLowerCase(), v])),
-  body: first.body, key: sdk.decodeMultibaseKey(first.publicKey.publicKeyMultibase),
-  expectedNonce: request_id, nonceStore: sdk.createNonceStore(),
+  body: first.body, expectedNonce: request_id, nonceStore: sdk.createNonceStore(),
 }
-assert(await sdk.verifyHttpMessageSignature(verification), 'existing SDK verifies v2 ANP-02 signature')
-assert.equal(await sdk.verifyHttpMessageSignature(verification), false, 'SDK nonce store rejects replay')
+assert.equal((await sdk.verifyAnpLoginRequest(verification)).ok, true, 'high-level SDK resolves and verifies actual keyd hot signature')
+assert.equal((await sdk.verifyAnpLoginRequest(verification)).ok, false, 'high-level SDK rejects replay')
+assert.equal((await sdk.verifyAnpLoginRequest({ ...verification, nonceStore: sdk.createNonceStore(),
+  body: JSON.stringify({ ...JSON.parse(first.body), handle: 'injected' }) })).ok, false, 'high-level SDK rejects replaced body')
+assert.equal((await sdk.verifyAnpLoginRequest({ ...verification, nonceStore: sdk.createNonceStore(),
+  expectedNonce: 'wrong-challenge' })).ok, false, 'high-level SDK rejects wrong server nonce')
+const sdkHotResolverSupported = true
 // awiki's RPC accepts JSON-RPC bodies, not the SDK's ANP-02 login body.
 // Use the v2 structured HTTP client with its actual service envelope.
 assert(rpc_request_id, 'caller must persist a distinct ID for the RPC payload')
