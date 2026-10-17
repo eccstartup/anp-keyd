@@ -1,6 +1,6 @@
 # anp-keyd v2 接入说明
 
-更新日期：2026-10-16。本文面向 CLI、MCP、Node 和 ANP SDK 的接入者，描述当前可用接口、调用顺序及失败恢复。架构与威胁模型见 [DESIGN](DESIGN.md)。旧开发协议不作为受保护接入路径。
+本文面向 CLI、MCP、Node 和 ANP SDK 的接入者，描述当前接口、调用顺序及失败恢复。架构与威胁模型见 [DESIGN](DESIGN.md)。旧开发协议不作为受保护接入路径。
 
 ## 1. 接入结果与兼容范围
 
@@ -13,10 +13,10 @@
 | `keydV2Signer` | `signHttpRequest` 接缝 | 调用方负责稳定 request_id、发送与业务恢复 |
 | `keydV2Connector` | 现有 SDK createConfig/signRequest 接缝 | 生成 ANP-02 登录体；不接生命周期和注册挑战 |
 | 受保护 MCP | 五个 v2 授权工具 | 启动时固定 config，工具参数无密码或端点覆盖 |
-| 外部 SDK 高层热密钥解析 | 公开包 `@connectx-sdk/core` 0.4.2 起兼容 | 旧版本仍不兼容；最低兼容版本 0.4.2 |
-| awiki JSON-RPC | Node v2 client 按实际 RPC body 签名的链路已验收 | SDK 原生 ANP-02 body 不能直接当作 RPC envelope |
+| 外部 SDK 高层热密钥解析 | `@connectx-sdk/core` 0.4.2 起兼容 | 更早版本仍不兼容；最低兼容版本 0.4.2 |
+| awiki JSON-RPC | Node v2 client 可按实际 RPC body 签名 | SDK 原生 ANP-02 body 不能直接当作 RPC envelope |
 
-正式 Linux release 且配置显式为 `linux-protected-v1` 时支持保护声明。调试、preview、macOS、软件硬件替身及 seed-export 不在声明内。同 UID 不受限 Agent 不具有彼此隔离。
+正式 Linux release 且配置显式为 `linux-protected-v1` 时支持保护声明。调试、preview、macOS、软件硬件替身及 seed-export 不在声明内。同 UID 不受限 Agent 之间没有隔离。
 
 ## 2. 管理端与 Agent 分工
 
@@ -32,7 +32,7 @@
 
 管理员通过 `/etc/anp-keyd/service.json` 中的独立管理端点操作；Agent 在独立 UID 下通过签名端点操作。配置、程序、socket 父目录和存储不可被 Agent 修改。不要以 root 或管理员 UID 启动不可信 Agent。
 
-安装器与迁移器位于 `deploy/linux/`。安装 release 需要管理员核对并提供 `--sha256`；安装、更新和迁移应使用一次性测试环境先验证。本文的运行期示例假定服务已经安装并启动，不能用于代替完整部署检查。
+安装器与迁移器位于 `deploy/linux/`。安装 release 需要管理员核对并提供 `--sha256`。本文的运行期示例假定服务已经安装并启动。
 
 ### 2.1 管理准备示例
 
@@ -51,7 +51,7 @@ anp-keyd admin --config /etc/anp-keyd/service.json catalog
 {"kind":"Catalog","change":{"action":"ConfirmRole","key_id":"HOT_KEY_UUID","role":"hot"}}
 ```
 
-对每个管理变更使用以下两步；检查返回的 `prepared.effect`、摘要及期限，再提交该次批准：
+对每个管理变更使用两步；检查返回的 `prepared.effect`、摘要及期限，再提交该次批准：
 
 ```sh
 anp-keyd admin --config /etc/anp-keyd/service.json prepare --file role.json
@@ -105,7 +105,7 @@ anp-keyd admin --config /etc/anp-keyd/service.json commit \
 }
 ```
 
-**`expiry: 0` 必须在执行前替换为未来 Unix 秒数**，且剩余期限不超过策略的 900 秒上限；0 不表示永久有效。提交后使用返回 effect 中的 grant_id，不能把 key_id 当作 grant_id。grant 绑定 exact key 和 principal，不能转交给另一个 UID 使用。
+**`expiry: 0` 必须在执行前替换为未来 Unix 秒数**，且剩余期限不超过策略的 `max_duration_seconds` 上限；0 不表示永久有效。提交后使用返回 effect 中的 grant_id，不能把 key_id 当作 grant_id。grant 绑定 exact key 和 principal，不能转交给另一个 UID 使用。
 
 管理员通过受认证通道解锁指定 hot key：
 
@@ -143,7 +143,7 @@ anp-keyd data --config /etc/anp-keyd/service.json --file request.json
 }
 ```
 
-示例 UUID 只用于展示格式。应用为每个新操作生成 UUID 并持久保存；重试复用原 ID，不能让所有请求使用这个示例值。若业务需要服务端 nonce，先从对端取得，并按应用协议同时放入 body 和签名参数。
+示例 UUID 只用于展示格式。应用为每个新操作生成 UUID 并持久保存；重试复用原 ID。若业务需要服务端 nonce，先从对端取得，并按应用协议同时放入 body 和签名参数。
 
 | 操作 | 字段 | 结果 `reply.data` |
 |---|---|---|
@@ -241,16 +241,15 @@ const signed = await signRequest(config, connector.id, {
 
 connector 从已授权列表选定 exact key，读取公开文档，构造 ANP-02 JSON 登录体并签名。successorDid 等生命周期请求拒绝。若 daemon 返回 URL 与 SDK 请求 URL 不同，connector 在签名后拒绝交付；此时必须查询原 ID，不能直接改 URL 换 ID 再试。
 
-### 6.1 已验收与未兼容的部分
+### 6.1 SDK 版本与热密钥解析
 
-SDK 提交 `4700786` 修复了热密钥解析：DID 指纹绑定根 proof，活动根签署文档通过 exact authentication 方法授权热密钥。缺少可信 proof 的路径保持直接指纹检查，退役文档不获得新增委托能力。
+高层热密钥解析要求 `@connectx-sdk/core` 0.4.2 或更新。DID 指纹绑定根 proof，活动根签署文档通过 exact authentication 方法授权热密钥。缺少可信 proof 的路径保持直接指纹检查，退役文档不获得新增委托能力。更早的 SDK 版本仍会拒绝合法 hot key，没有 root-key 回退。
 
-当前验收使用真实 daemon 的 createConfig/signRequest 结果，直接调用 `resolveVerificationKey` 和 `verifyAnpLoginRequest`，不显式提供热公钥；同时拒绝重放、body 篡改和错误 expectedNonce。SDK 回归另覆盖错误 kid、未授权方法、根 proof 伪造、过期、密钥替换、相对方法与网络解析。旧 SDK 仍有原限制；该修复随 `@connectx-sdk/core@0.4.2`（2026-10-17，`gitHead` `b44cfc8`）公开发布，最低兼容版本即 `0.4.2`；本仓库随后用 registry 安装的产物重跑了 Linux 边界验收（122 项，含 SDK 高层验签），记录在 `docs/validation/sdk-release-0.4.2-2026-10-17/`。
-awiki did-auth RPC 要求 JSON-RPC envelope，SDK signRequest 生成的 ANP-02 `{nonce,did,didDocument,...}` 是另一种 body。已签 body 不能再包装成 RPC；awiki 链路使用同一 v2 client 对正确 RPC 字节请求签名。实际服务验收采用一次性本地服务、逻辑 HTTPS origin 与测试 HTTP 通道，不能据此提供生产 fetch 的目标覆盖能力。
+awiki did-auth RPC 要求 JSON-RPC envelope，SDK signRequest 生成的 ANP-02 `{nonce,did,didDocument,...}` 是另一种 body。已签 body 不能再包装成 RPC；awiki 链路使用同一 v2 client 对正确 RPC 字节请求签名。
 
 ### 6.2 其他 SDK 接缝
 
-`keydV2Signer(client, grant_id)` 只包装 `signHttpRequest(input)`，不会增加注册、文档 proof 或密钥导出能力。接入其他 IdentitySigner 接口时应逐个核对方法；需要“签调用方提供的任意文档”的接口不能直接映射数据面。当前没有宣称 awiki-cli-rs2 全部命令或其他外部工具已完成 v2 接入。
+`keydV2Signer(client, grant_id)` 只包装 `signHttpRequest(input)`，不会增加注册、文档 proof 或密钥导出能力。接入其他 IdentitySigner 接口时应逐个核对方法；需要“签调用方提供的任意文档”的接口不能直接映射数据面。awiki-cli-rs2 的全部命令或其他外部工具没有全部完成 v2 接入。
 
 ## 7. 注册、轮换、撤销与恢复
 
@@ -280,7 +279,7 @@ CLI 读取管理口令，daemon 单次、短期、精确绑定地完成根签名
 
 管理员提前配置下一把合法 hot key，准备 `RotateHotKey`，字段为 root_key_id、old_key_id、next_key_id；使用 complete-secret-operation 完成根签署文档。操作撤销旧授权并退休旧公开方法，但不自动向网络发布。
 
-可信发布者发布返回文档并确认远端可解析、旧方法被拒、新方法认证通过，再创建并交付新 grant。不能把本地文件生成、服务端文档刷新和运行期授权切换当作同一件事。
+可信发布者发布返回文档并确认远端可解析、旧方法被拒、新方法认证通过，再创建并交付新 grant。本地文件生成、服务端文档刷新和运行期授权切换是三件事。
 
 ### 7.3 撤销与重启
 
@@ -306,7 +305,7 @@ CLI 读取管理口令，daemon 单次、短期、精确绑定地完成根签名
 
 同一个 request_id 的摘要包含方法、规范化 URL、headers、body 和 nonce；改变未覆盖的普通请求头也可能造成冲突。保存最终待签输入，不仅保存业务参数。
 
-`GET_REQUEST_STATUS` 只查询本主体。查询返回 completed 也不能证明服务请求已发送；网络响应丢失时，还需业务服务的幂等键或查询接口。签名去重不会提供业务 exactly-once。
+`GET_REQUEST_STATUS` 只查询本主体。查询返回 completed 也不能证明服务请求已发送；网络响应丢失时，还需业务服务的幂等键或查询接口。签名去重不提供业务 exactly-once。
 
 ## 9. MCP 接入
 
@@ -328,7 +327,7 @@ anp-keyd mcp --config /etc/anp-keyd/service.json
 
 工具返回文本 JSON，其内容是完整 Reply，业务结果仍在 data 中。工具不解锁、不批准 grant、不生成根签名，参数不能覆盖 config/socket/root/did/kid/covered。stdout 用于 MCP 协议，诊断走 stderr。
 
-不带 `--config` 的旧 MCP 是开发路径，不能当作自动降级；两种模式必须明确选择。当前 `src/mcp/protected.rs` 的部分工具描述仍含“M4 未启用”的阶段文案，实际服务端已接入事务执行器；接入判断使用 capabilities 和实际结果，后续应单独修正这处源码文案。本文不以修改文档代替修改工具 schema 描述。
+不带 `--config` 的旧 MCP 是开发路径，不能当作自动降级；两种模式必须明确选择。
 
 ## 10. 接入验收
 
@@ -340,8 +339,8 @@ anp-keyd mcp --config /etc/anp-keyd/service.json
 4. 方法、URL、body、必签头改变时策略与签名一致；对端拒绝重放、过期及换 body。
 5. 并发最后一次配额仅成功预留一次；同 ID 同输入不重复签，不同输入冲突。
 6. 响应丢失后查询原 ID；撤销和重启后不交付失效结果、不复活授权。
-7. 注册、轮换、远端发布、新方法认证和恢复分别有证据，SDK 高层 resolver 限制明确保留。
+7. 注册、轮换、远端发布、新方法认证和恢复分别有证据。
 
-现有脚本包括 `deploy/linux/test-boundary.py`、`anp-service-acceptance.py`、`systemd-checks.py`、`systemd-boot-check.py` 及 `adapters/test-sdk.mjs`。后者是实际环境验收驱动，需要 SDK dist、有效 grant/key 和稳定请求 ID，不能当作无需部署的单元测试。
+现有脚本包括 `deploy/linux/test-boundary.py`、`anp-service-acceptance.py`、`systemd-checks.py`、`systemd-boot-check.py` 及 `adapters/test-sdk.mjs`。后者是实际环境验收驱动，需要 SDK dist、有效 grant/key 和稳定请求 ID，不是无需部署的单元测试。
 
-Linux systemd、Node/SDK 签名接缝及一次性真实服务链路已有验收记录；本文没有重新运行这些环境。新增对端、SDK 版本、平台或策略形态时重新验证相应路径，不能沿用历史记录扩大支持范围。
+新增对端、SDK 版本、平台或策略形态时重新验证相应路径，不能沿用历史记录扩大支持范围。
