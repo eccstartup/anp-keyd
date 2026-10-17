@@ -13,7 +13,7 @@
 | `keydV2Signer` | `signHttpRequest` 接缝 | 调用方负责稳定 request_id、发送与业务恢复 |
 | `keydV2Connector` | 现有 SDK createConfig/signRequest 接缝 | 生成 ANP-02 登录体；不接生命周期和注册挑战 |
 | 受保护 MCP | 五个 v2 授权工具 | 启动时固定 config，工具参数无密码或端点覆盖 |
-| 外部 SDK 高层热密钥解析 | 本地 SDK `4700786` 已兼容 | 需重建 SDK；旧版本仍不兼容，未发布 |
+| 外部 SDK 高层热密钥解析 | 公开包 `@connectx-sdk/core` 0.4.2 起兼容 | 旧版本仍不兼容；最低兼容版本 0.4.2 |
 | awiki JSON-RPC | Node v2 client 按实际 RPC body 签名的链路已验收 | SDK 原生 ANP-02 body 不能直接当作 RPC envelope |
 
 正式 Linux release 且配置显式为 `linux-protected-v1` 时支持保护声明。调试、preview、macOS、软件硬件替身及 seed-export 不在声明内。同 UID 不受限 Agent 不具有彼此隔离。
@@ -243,9 +243,9 @@ connector 从已授权列表选定 exact key，读取公开文档，构造 ANP-0
 
 ### 6.1 已验收与未兼容的部分
 
-本地 SDK `4700786` 修复了热密钥解析：DID 指纹绑定根 proof，活动根签署文档通过 exact authentication 方法授权热密钥。缺少可信 proof 的路径保持直接指纹检查，退役文档不获得新增委托能力。
+SDK 提交 `4700786` 修复了热密钥解析：DID 指纹绑定根 proof，活动根签署文档通过 exact authentication 方法授权热密钥。缺少可信 proof 的路径保持直接指纹检查，退役文档不获得新增委托能力。
 
-当前验收使用真实 daemon 的 createConfig/signRequest 结果，直接调用 `resolveVerificationKey` 和 `verifyAnpLoginRequest`，不显式提供热公钥；同时拒绝重放、body 篡改和错误 expectedNonce。SDK 回归另覆盖错误 kid、未授权方法、根 proof 伪造、过期、密钥替换、相对方法与网络解析。旧 SDK 仍有原限制；该修复已 push 到 SDK 仓库 master（远端 `cabb0c9` 以 `4700786` 为祖先），但没有任何 tag、未发布；2026-10-17 更正，核对记录在 `docs/validation/sdk-release-audit-2026-10-17/`。
+当前验收使用真实 daemon 的 createConfig/signRequest 结果，直接调用 `resolveVerificationKey` 和 `verifyAnpLoginRequest`，不显式提供热公钥；同时拒绝重放、body 篡改和错误 expectedNonce。SDK 回归另覆盖错误 kid、未授权方法、根 proof 伪造、过期、密钥替换、相对方法与网络解析。旧 SDK 仍有原限制；该修复随 `@connectx-sdk/core@0.4.2`（2026-10-17，`gitHead` `b44cfc8`）公开发布，最低兼容版本即 `0.4.2`；本仓库随后用 registry 安装的产物重跑了 Linux 边界验收（122 项，含 SDK 高层验签），记录在 `docs/validation/sdk-release-0.4.2-2026-10-17/`。
 awiki did-auth RPC 要求 JSON-RPC envelope，SDK signRequest 生成的 ANP-02 `{nonce,did,didDocument,...}` 是另一种 body。已签 body 不能再包装成 RPC；awiki 链路使用同一 v2 client 对正确 RPC 字节请求签名。实际服务验收采用一次性本地服务、逻辑 HTTPS origin 与测试 HTTP 通道，不能据此提供生产 fetch 的目标覆盖能力。
 
 ### 6.2 其他 SDK 接缝
