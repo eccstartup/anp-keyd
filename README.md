@@ -97,13 +97,19 @@ cargo install --path .
 
 (或者 `cargo build --release`,用 `target/release/anp-keyd`。)
 
-开发模式无需网络或配置文件。Linux 边界预览使用 bundled SQLite 和管理员保护的服务配置；macOS 继续支持开发模式。
+开发模式无需网络或配置文件。Linux 边界预览使用 bundled SQLite 和管理员保护的服务配置；macOS 另有独立 UID 本机预览，仍不声明正式受保护支持。
 
 **一条纪律先说一下:** 凡是需要口令的命令,都要求一个**真的控制终端**。
 cron、CI、systemd 的 `ExecStartPre`、被 agent 拉起来的子进程都在这一条外面
 —— 这是设计,不是遗漏。
 
+## 本机交给 Agent 使用
+
+先读 [本机使用指南](deploy/LOCAL-USE.md) 和对应的 [macOS](deploy/macos/README.md) / [Linux](deploy/linux/README.md) 部署说明。整个不可信 Agent 必须运行在独立非管理员 UID；同管理员 UID 的进程仍是可信管理主体。新安装没有真实身份，临时密钥测试不能代替真实身份导入和授权。
+
 ## 五分钟跑通
+
+以下是开发体验路径，不建立独立 UID 的 Agent 安全边界。
 
 **文档该有什么,由一份文件说了算 —— 不是由命令行的几个开关。** did.json
 里除了密钥之外的东西(挂哪个域名、service 条目、agent description 地址)

@@ -1,202 +1,66 @@
-# Linux v2 signing service and release gate
+# Linux v2 deployment: current software release
 
-Linux v2 provides limited grants and durable signing. Protected release support
-remains false pending actual systemd-host acceptance. The legacy `serve` command
-is a separate development service. See the M5 section below for current migration,
-client and update workflows; earlier command examples require `--sha256` too.
+Start with the [local-use guide](../LOCAL-USE.md) for the trust model and daily
+administrator/Agent workflow. This page describes the Linux service. Ordinary
+use does not require Apple membership, Xcode, SE or TPM.
 
-Build on Linux, then install a **new** instance as root:
+The software boundary has been accepted on an Ubuntu 24.04.4/aarch64 systemd VM,
+including complete VM shutdown/boot. A release build without seed export or
+software hardware, explicitly deployed as `linux-protected-v1`, can report
+`protected_supported=true`. This is a support declaration, not proof that every
+new machine is configured safely. Physical TPM acceptance is still outstanding.
+
+## New installation
+
+Use a human-controlled checkout and a separate non-admin Agent account for each
+security principal. The human must review code/build provenance and the digest;
+computing a hash alone does not establish that the source is trustworthy.
 
 ```sh
-cargo build --locked --release
+cargo build --locked --release --features mcp
+sha256sum target/release/anp-keyd
 sudo python3 deploy/linux/install.py --binary target/release/anp-keyd \
-  --admin-user operator --agent-user agent-a --agent-user agent-b
+  --sha256 VERIFIED_SHA256 --admin-user operator --agent-user agent-a --agent-user agent-b
 sudo systemctl daemon-reload
 sudo systemctl enable --now anp-keyd
-anp-keyd admin status
-anp-keyd probe --security
+/usr/local/libexec/anp-keyd admin --config /etc/anp-keyd/service.json status
+/usr/local/libexec/anp-keyd probe --security --config /etc/anp-keyd/service.json
 ```
 
-The installer refuses existing state, accounts, groups or deployment files. It
-does not migrate keys. It creates a non-login service account, separate socket
-groups/directories, root-owned config/binary and a systemd sandbox. Administrators
-and Agents need fresh sessions after their groups change. Agents must have distinct
-UIDs, no sudo, Docker/host-control socket or access to administrator processes.
-The runtime does not infer this isolation from executable names or TTYs.
+Replace the account names and digest. `--features mcp` is optional for a CLI-only
+installation. The fresh installer creates its own non-login service account,
+socket groups, root-owned executable/configuration, SQLite state and systemd
+unit. It refuses partial/existing installations rather than silently repairing
+or replacing them. It does not migrate user keys. Use the separate offline
+migration/update procedure below for existing installations. Establish fresh
+sessions after group changes.
 
-`admin status`, `admin lock-all` and `admin unlock --vault-id UUID --did DID --kid KID`
-use the independent admin endpoint. Unlock is only usable for vaults explicitly
-staged by an administrator and listed in the root-owned bootstrap config; managed
-migration is available through the offline tool below. Unlock prompts only after a service preflight, and
-re-authenticates the next connection before sending the password. There is no
-`--socket`, password argument or password environment override on this path.
+Agents must have no sudo/admin rights, Docker/host-control sockets, administrator
+credentials, or access to administrator processes. The entire Agent must run under
+its assigned UID, not just its signing subprocess. `cargo install` plus legacy
+`serve` is a development workflow and does not establish this boundary.
 
-`probe --security` prints observed ownership, modes, registry identities and the
-kernel-authenticated service identity. It returns nonzero because full protected
-release support remains unavailable. macOS refuses this mode explicitly.
+## Acceptance on your own installation
 
-Deployment configuration changes require restart. The installer explicitly initializes
-`state.sqlite` once as the service UID; startup refuses a missing, corrupt, linked,
-foreign-instance or newer-schema database. Bootstrap principals are imported only
-at initialization. Editing bootstrap flags cannot restore disabled identities.
-
-List live/history principal metadata and prepare an exact management operation:
-
-```sh
-anp-keyd admin list-principals
-anp-keyd admin prepare-disable-principal --principal-id UUID
-anp-keyd admin commit --operation-id UUID --digest SHA256
-anp-keyd admin prepare-register-principal --uid UID
-```
-
-Inspect the returned effect and digest before committing. Commit accepts only the
-stored operation, bound to the same admin UID, boot epoch, mutation epoch, wall
-expiry and suspend-aware monotonic deadline. It is single use. Disable applies to
-new connections immediately and revokes existing active grants in the same SQLite
-transaction. Reassigning a disabled OS UID creates a new principal UUID/generation.
-
-SQLite uses rollback journal DELETE, synchronous EXTRA, foreign keys and strict
-schema checks. Audit/state changes commit together. Restart increments boot epoch,
-revokes active grants, marks reserved requests outcome_unknown, invalidates pending
-approvals and leaves all keys locked. Audit write failure latches emergency stop;
-a restart is required after repair. These tables/recovery rules are implemented,
-and grants/signing now execute through the v2 transaction coordinator.
-
-M2 adds `admin catalog` and typed `admin prepare --file CHANGE.json` operations.
-The supported catalog actions are `EnrollVault`, `ConfirmRole`, `PublishPolicy`
-and `InstallDocument`, wrapped as `{"kind":"Catalog","change":{...}}`.
-Prepare returns the exact effect/digest; use the existing `admin commit` with that
-operation ID and digest. Only authenticated administrators can access this API.
-
-An administrator must first stage an existing vault under a configured UUID while
-the service is stopped, preserving its encrypted envelopes/device secret and
-protected ownership. `EnrollVault` validates the complete inventory against signed
-DID documents and records every key as `unclassified`. `ConfirmRole` binds an
-explicit role to exact kid, envelope and document digests. It checks the public key
-and relationships; an identity binding key cannot be marked hot/recovery/challenge.
-Re-enrollment revokes grants, preserves key handles and resets roles for confirmation.
-The automated old-vault copy/backup/cutover workflow remains M5.
-
-For example, prepare vault enrollment with this public JSON file:
-
-```json
-{"kind":"Catalog","change":{"action":"EnrollVault","vault_id":"VAULT_UUID"}}
-```
-
-Then inspect `admin catalog` and prepare role confirmation:
-
-```json
-{"kind":"Catalog","change":{"action":"ConfirmRole","key_id":"KEY_UUID","role":"root"}}
-```
-
-`PublishPolicy` accepts a UUID, consecutive positive version and fixed-schema
-policy content (schema 1). Content is canonicalized and immutable; unknown fields,
-ambiguous origins/paths/queries and unsupported profiles are rejected. This stores
-policy versions used by the current request/grant evaluator.
-
-`InstallDocument` accepts a vault UUID and an already signed public DID document.
-It verifies the proof/path binding and existing key roles, binds the previous and
-new document digests, and journals the exact approved bytes in SQLite. It provides
-no caller-supplied signing-input operation. The commit first enters maintenance and
-revokes grants, then atomically installs/fsyncs the document and records completion.
-Restart rolls a durable intent forward only if the file matches the approved old
-or new digest; an unknown file stops startup without overwriting it. Catalog-only
-changes and audit records are atomic; interrupted file completion remains in
-maintenance until recovery succeeds. Broader identity creation/rotation/backup
-adapters remain subsequent lifecycle work.
-
-KDF runs in a separate non-queueing single slot. Lock/metadata commit invalidates
-older unlocks by generation; key installation rechecks catalog/disk state under
-the management gate. Old local CLI commands (including `--root` symlinks, relative
-paths and standalone probe) reject managed state directories. They remain available
-for development vaults. No Agent gains access to protected vault files.
-
-Schema 1 upgrades transactionally to schema 2 after integrity, instance and audit
-validation; failed migration rolls back. Existing roles reset to unclassified.
-Unknown newer versions are refused. New management events use SQLite; existing
-JSONL files are retained without rewriting. Runtime state is not silently imported
-from old M1 preview configurations.
-For a NEW empty deployment only, explicit initialization is also available as
-`anp-keyd init-protected-state` under the configured service UID. Never use deletion
-and reinitialization as a migration or repair procedure.
-
-The dependency is pinned to rusqlite 0.39.0 without default features, using bundled
-SQLite (libsqlite3-sys 0.37.0, SQLite 3.51.3 in this lockfile). See the
-[upstream source](https://github.com/rusqlite/rusqlite). This is not a full dependency
-vulnerability audit.
-
-To remove the service/binary, use `sudo python3 deploy/linux/install.py --uninstall`.
-State, configuration and accounts are retained intentionally. Remove those only
-through a separately reviewed backup/retirement procedure.
-
-For isolated acceptance testing (never run the script on a daily-use host):
+First use a temporary identity and narrow grant, independently verify a real
+signature, check that another Agent cannot use the grant/result or administer the
+service, revoke the grant, and confirm that restart locks keys and invalidates old
+authority. Run destructive fault and systemd sandbox tests only in an explicitly
+marked disposable VM/container, never against daily state. The container harness
+creates disposable accounts and is not a general host installation test:
 
 ```sh
 docker run --rm -v "$PWD:/src:ro" -w /src rust:1.90-bookworm \
   bash deploy/linux/test-container.sh
 ```
 
-The harness requires a root Linux container and creates only disposable accounts
-and files. It builds into `/tmp`, never into the read-only checkout. Tests include
-cross-UID admin rejection through a PTY, v1/password rejection on the data socket,
-service impersonation, unsafe path rejection, and lock/shutdown behavior. A running
-container test does not verify the systemd sandbox; systemd host acceptance remains
-an independent release gate.
+This harness requires dependencies/network or a separately mounted Cargo cache.
+It does not by itself accept the systemd sandbox, physical power loss or TPM.
+Commands for marked disposable systemd VMs are below. Keep actual host acceptance
+separate from unit tests, container results and build capability flags.
 
-## M1 baseline verification recorded on 2026-10-16
+## Management and current implementation
 
-Linux Docker (Rust 1.90): 431 default tests passed, the explicit disposable fixture
-passed, and all 33 multi-UID boundary checks passed. The installer was tested with
-umask 0077. macOS: 444 tests passed with `mcp,hardware-software`. Clippy completed
-with the existing unused import warning in `tests/hardware.rs`. New Rust modules
-pass rustfmt; the repository-wide formatting baseline still has older differences.
-No real user identities or host accounts were modified. The systemd unit has not
-been accepted on a booted systemd host, and no production protected-mode support
-is claimed.
-
-## M2 persistence verification recorded on 2026-10-16
-
-Rust 1.88 and 1.90 Linux Docker: each passed 438 default tests, one explicitly
-requested disposable identity fixture, and all 49 boundary/persistence checks.
-macOS (`mcp,hardware-software`): 451 tests passed. Seven persistence tests cover
-restart invalidation, preserved quota consumption, unknown outcomes, audit failure
-rollback, actor/digest/epoch binding, UID generation replacement, and deadline or
-payload substitution rejection. The container also injects audit insertion failure
-to verify emergency stop, and refuses missing/newer/corrupt/linked databases.
-
-rusqlite 0.39.0 is pinned to preserve the tested Rust 1.88 baseline; future dependency
-updates must pass both toolchain jobs. Clippy completed with the existing hardware
-test import warning at that baseline. No physical power-loss test or systemd host
-acceptance was claimed for that baseline.
-
-## Historical M2 completion verification on 2026-10-16
-
-Rust 1.88 and 1.90 Linux containers each passed 452 default tests, one explicit
-disposable identity fixture and 60 multi-UID boundary/management checks. macOS
-`mcp,hardware-software` passed 465 tests. Eighteen persistence tests include actual
-old/new signed-document replacement with injected completion-audit failure, durable
-intent before the first file write, repeated restart recovery, journal substitution
-rejection, migration rollback, unknown roles and policy immutability. Strict
-all-targets Clippy passed; the prior hardware import warning's feature guard is
-corrected. These are deterministic crash-boundary tests, not physical power-loss
-experiments. At that checkpoint M3/M4 was still pending; the current executor is implemented, while systemd-host acceptance remains open.
-
-## Historical M3 authorization preview verification on 2026-10-16
-
-Rust 1.88 and 1.90 disposable Linux containers each passed 467 default tests and
-one explicit temporary-identity fixture. Their independent-UID harnesses passed
-85 and 89 checks respectively; the 1.90 run also builds MCP and verifies real
-stdio initialization, v2 tool schemas, caller-scoped keys and no legacy fallback.
-Set `ANP_KEYD_TEST_MCP=1` to include those MCP checks in the container harness.
-macOS `mcp,hardware-software` passed 481 tests; strict all-targets Clippy passed.
-
-At the M3 checkpoint, the implementation added exact-hot-key grants, revocation, immutable policy evaluation, dual-clock
-deadlines, schema v3 and authenticated v2 CLI/MCP clients. Valid `SIGN_HTTP`
-requests then returned `SIGNING_UNAVAILABLE`; M4 subsequently supplied transactional quota
-reservation, idempotency, signing and durable result delivery.
-At that historical checkpoint `protected_supported` remained false. The later M5 systemd-host acceptance below supersedes that release status.
-
-## M5 current implementation
 
 v2 now signs through durable reservation/result transactions and exact hot-key
 grants. Restart revokes all old grants and locks keys. Actual Ubuntu 24.04.4/aarch64
