@@ -622,6 +622,6 @@ Apache-2.0。见 [LICENSE](LICENSE)。
 
 ### macOS 连接期限修复与更新
 
-修复 `7392419` 解决对端关闭后设置 socket 超时的间歇性 EINVAL，保持整帧截止时间且不自动重发请求。修复候选已通过 macOS 实机临时密钥签名、跨 UID、撤销、正常重启及 SIGKILL 验收；软件回归 523 项及 Linux 126 项边界检查通过。验收候选不等于已更新每台机器的日常安装。
+修复 `7392419` 解决对端关闭后设置 socket 超时的间歇性 EINVAL，保持整帧截止时间且不自动重发请求。修复候选已通过 macOS 实机临时密钥签名、跨 UID、撤销、正常重启及 SIGKILL 验收；软件回归 523 项及 Linux 126 项边界检查通过。验收机器随后由操作员完成日常安装更新，独立核对程序摘要一致、实例身份不变、boot_epoch=3、服务健康，配置/状态和两代备份保留。其他机器仍须自行验收和更新。
 
 已有安装使用 [更新工具](deploy/macos/README.md#daily-workflow-updates-and-restart)，核对实际二进制摘要后执行；已有 previous 备份可用 `--archive-previous` 完整归档，工具不会覆盖归档。更新重启会锁钥并撤销旧 grant，保留配置及状态。
