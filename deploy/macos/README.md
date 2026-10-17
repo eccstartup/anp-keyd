@@ -25,29 +25,30 @@ covered.
 ## Fresh installation: human terminal
 
 Use a trusted, reviewed checkout. Do not run privileged installation scripts from
-an Agent-controlled working tree. Build without `seed-export` or
-`hardware-software`; SE is not needed for this baseline:
+an Agent-controlled working tree. From the repository root, one command builds,
+provisions the accounts and starts the local preview:
+
+```sh
+./install.sh
+```
+
+The script asks for sudo only after the build. It creates `_anpkeyd` / `_anpagent`,
+four groups, root-owned installation/configuration and a launchd job, starts the
+service and runs limited read-only checks. It refuses existing or partial setup.
+It is not an update or repair command. Do not repeat `launchctl bootstrap` after
+successful setup: the job is already loaded. Log out/in to refresh group
+membership. Initial state contains no user keys. Further Agents need their own
+independently provisioned non-admin UIDs, transport membership and explicit
+principal registration; this setup creates one Agent.
+
+For a manually reviewed release, the same steps are:
 
 ```sh
 cargo build --locked --release --features mcp
 shasum -a 256 target/release/anp-keyd
 python3 deploy/macos/provision-accounts.py --admin-user YOUR_HUMAN_ACCOUNT
-```
-
-Review the printed account plan and exact binary provenance/hash. The next command
-is a host mutation: it creates `_anpkeyd` / `_anpagent`, four groups, root-owned
-installation/configuration and a launchd job, starts the service and runs limited
-read-only installation checks. Enter sudo credentials only in the human terminal:
-
-```sh
 sudo bash deploy/macos/setup-local.sh YOUR_HUMAN_ACCOUNT VERIFIED_SHA256
 ```
-
-It refuses existing or partial setup. It is not an update or repair command. Do not
-repeat `launchctl bootstrap` after successful setup: the job is already loaded.
-Log out/in to refresh group membership. Initial state contains no user keys.
-Further Agents need their own independently provisioned non-admin UIDs, transport
-membership and explicit principal registration; this setup creates one Agent.
 
 Check the installed instance:
 

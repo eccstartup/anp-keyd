@@ -12,24 +12,33 @@ protection is a separate claim; see [TPM.md](TPM.md).
 ## New installation
 
 Use a human-controlled checkout and a separate non-admin Agent account for each
-security principal. The human must review code/build provenance and the digest;
-computing a hash alone does not establish that the source is trustworthy.
+security principal. The human must review code/build provenance. From the
+repository root:
 
 ```sh
-cargo build --locked --release --features mcp
-sha256sum target/release/anp-keyd
-sudo python3 deploy/linux/install.py --binary target/release/anp-keyd \
-  --sha256 VERIFIED_SHA256 --admin-user operator --agent-user agent-a --agent-user agent-b
-sudo systemctl daemon-reload
-sudo systemctl enable --now anp-keyd
-/usr/local/libexec/anp-keyd admin --config /etc/anp-keyd/service.json status
-/usr/local/libexec/anp-keyd probe --security --config /etc/anp-keyd/service.json
+./install.sh
 ```
 
-Replace the account names and digest. `--features mcp` is optional for a CLI-only
-installation. For a TPM root, build with `--features hardware-tpm` and add
-`--tpm-device` to the installer, then run the separate acceptance in
-[TPM.md](TPM.md); the installer grants only `/dev/tpmrm0` and pins the transport.
+This builds a release with the `mcp` feature, computes its SHA-256, creates the
+default `anp-agent` account if it does not exist, installs root-owned files and
+the systemd unit, starts the service, and runs read-only checks. Choose accounts
+or grant a TPM device explicitly:
+
+```sh
+./install.sh --admin-user operator --agent-user agent-a --agent-user agent-b
+./install.sh --tpm-device
+```
+
+Inspect the plan without changing the host:
+
+```sh
+./install.sh --dry-run
+```
+
+`--features mcp` is included by default; a CLI-only build needs the manual
+procedure below. For a TPM root, `--tpm-device` selects the `hardware-tpm`
+feature; the installer grants only `/dev/tpmrm0` and pins the transport. Run the
+separate acceptance in [TPM.md](TPM.md) before claiming hardware protection.
 
 The installer creates its own non-login service account, socket groups,
 root-owned executable/configuration, SQLite state and systemd unit. It refuses
@@ -41,6 +50,22 @@ Agents must have no sudo/admin rights, Docker/host-control sockets, administrato
 credentials, or access to administrator processes. The entire Agent must run under
 its assigned UID, not just its signing subprocess. `cargo install` plus legacy
 `serve` is a development workflow and does not establish this boundary.
+
+## Manual installation with a reviewed release
+
+Use this path when an administrator must independently verify the digest before
+any root write:
+
+```sh
+cargo build --locked --release --features mcp
+sha256sum target/release/anp-keyd
+sudo python3 deploy/linux/install.py --binary target/release/anp-keyd \
+  --sha256 VERIFIED_SHA256 --admin-user operator --agent-user agent-a --agent-user agent-b
+sudo systemctl daemon-reload
+sudo systemctl enable --now anp-keyd
+/usr/local/libexec/anp-keyd admin --config /etc/anp-keyd/service.json status
+/usr/local/libexec/anp-keyd probe --security --config /etc/anp-keyd/service.json
+```
 
 ## Acceptance on your own installation
 

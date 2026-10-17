@@ -18,7 +18,7 @@
 | macOS Secure Enclave | 构建 `hardware-se`，通过登录钥匙串解封 | 芯片 ECDH 路径可用；正式签名、持久化和重启恢复未验收 |
 | `hardware-software` | 文件形式的测试替身 | 不是硬件；release 构建拒绝 |
 
-构建：
+本地生成钥匙时需要对应的构建：
 
 ```bash
 cargo build --locked --release --features hardware-tpm   # Linux
@@ -36,12 +36,10 @@ anp-keyd keygen --spec mybot.spec.json --hardware secure-enclave
 
 ## Linux TPM
 
-安装时把设备交给服务：
+安装时一条命令构建 TPM 后端并把设备交给服务：
 
 ```bash
-sudo python3 deploy/linux/install.py --binary target/release/anp-keyd \
-  --sha256 你核对过的SHA256 --admin-user operator --agent-user agent-a \
-  --tpm-device /dev/tpmrm0
+./install.sh --tpm-device
 ```
 
 安装器只开放 `/dev/tpmrm0`，并把 TPM 工具固定到该设备。

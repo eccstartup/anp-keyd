@@ -1,11 +1,44 @@
 ---
 name: anp-keyd
-description: 使用本机 anp-keyd 的 v2 有限授权签署 did:wba HTTP 请求、查询授权密钥与请求结果，或排查拒绝原因。适用于已有管理端配置和 grant 的 Agent；身份注册、解锁、轮换与迁移属于独立可信管理流程。
+description: 在本机安装 anp-keyd，或使用已安装的 v2 有限授权签署 did:wba HTTP 请求、查询授权密钥与请求结果、排查拒绝原因。安装是管理员动作；身份注册、解锁、轮换与迁移属于独立可信管理流程。
 ---
 
 # anp-keyd
 
 Linux v2 通过独立 OS UID 认证主体，daemon 执行 exact-key grant、目标策略、期限、次数、撤销和持久请求去重。仅正式 Linux 构建且 root 配置为 `linux-protected-v1` 时 `protected_supported=true`；旧 preview、调试、macOS 及敏感测试特性均为 false。同 UID 开发模式不提供抵御任意代码的私钥隔离。
+
+## 首次安装
+
+安装需要 root，属于管理员动作。只有在人类明确批准、并临时提供 sudo 时，Agent 才能执行；否则把下面这一条命令交给人类，在自己的终端里运行。身份口令、解锁口令和 sudo 口令都不进入聊天、MCP、argv 或环境变量。
+
+在人类审阅过的仓库根目录运行一条命令：
+
+```bash
+./install.sh
+```
+
+它会构建 release、计算 SHA-256、创建缺失的 Agent 账号（Linux 默认 `anp-agent`，macOS 为 `_anpagent`）、安装 root 持有的程序和服务，然后启动并做只读检查。先看计划、不改系统：
+
+```bash
+./install.sh --dry-run
+```
+
+指定管理员、Agent 或 TPM：
+
+```bash
+./install.sh --admin-user operator --agent-user agent-a
+./install.sh --tpm-device
+```
+
+安装后确认：
+
+```bash
+sudo systemctl status anp-keyd
+sudo -u ADMIN_USER /usr/local/libexec/anp-keyd admin \
+  --config /etc/anp-keyd/service.json status
+```
+
+macOS 使用同一条命令安装本机预览，始终 `protected_supported=false`。安装只创建空服务；身份、热钥匙、策略、grant 和第一次解锁仍由管理员按 `deploy/LOCAL-USE.md` 完成。安装完成后必须收回 Agent 账号的 sudo，否则受保护边界不成立。
 
 ## 普通 Agent 工作流
 

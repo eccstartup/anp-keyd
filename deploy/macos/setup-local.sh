@@ -2,16 +2,16 @@
 # Explicit local host changes; run by the human from their terminal with sudo.
 set -euo pipefail
 if [ "$(uname -s)" != Darwin ] || [ "$(id -u)" != 0 ]; then
-  echo 'Run in the human terminal: sudo bash deploy/macos/setup-local.sh HUMAN_ACCOUNT VERIFIED_SHA256' >&2
+  echo 'Run in the human terminal: sudo bash deploy/macos/setup-local.sh HUMAN_ACCOUNT VERIFIED_SHA256 [BINARY]' >&2
   exit 1
 fi
-if [ "$#" != 2 ]; then
-  echo 'Expected HUMAN_ACCOUNT and independently reviewed binary SHA-256.' >&2
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+  echo 'Expected HUMAN_ACCOUNT, independently reviewed binary SHA-256, and optional binary path.' >&2
   exit 1
 fi
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd -P)"
 repo_dir="$(cd -- "$script_dir/../.." && pwd -P)"
-local_binary="$repo_dir/target/release/anp-keyd"
+local_binary="${3:-$repo_dir/target/release/anp-keyd}"
 # Validate the digest before account changes. Python and source are trusted
 # operator inputs; do not run this from an Agent-controlled checkout.
 /usr/bin/python3 - "$local_binary" "$2" <<'PY'

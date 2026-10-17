@@ -4,7 +4,43 @@
 
 ## Linux 受保护部署
 
-服务、管理员和 Agent 会用三个系统账号。先构建，再核对二进制摘要，然后安装：
+服务、管理员和 Agent 会用三个系统账号。在人类审阅过的仓库根目录运行一条命令：
+
+```bash
+./install.sh
+```
+
+脚本会构建 release、计算 SHA-256、创建服务账号和默认 Agent 账号 `anp-agent`、安装 root 持有的程序与 systemd 服务，然后启动并做只读检查。
+
+指定管理员和 Agent，或先用 TPM：
+
+```bash
+./install.sh --admin-user operator --agent-user agent-a --agent-user agent-b
+./install.sh --tpm-device
+```
+
+先看计划、不改系统：
+
+```bash
+./install.sh --dry-run
+```
+
+`--agent-user` 可以写多个，每个 Agent 一个账号。安装器拒绝覆盖已有安装，不会自动迁入身份。
+
+装完检查（用管理员账号执行）：
+
+```bash
+sudo systemctl status anp-keyd
+sudo -u operator /usr/local/libexec/anp-keyd admin \
+  --config /etc/anp-keyd/service.json status
+sudo -u operator /usr/local/libexec/anp-keyd probe \
+  --security --config /etc/anp-keyd/service.json
+```
+
+安装成功只说明服务和权限检查通过。此时还没有身份，也还不能签名。接下来要准备身份、发布策略、创建 grant 并解锁，见[本机使用](/guide/local-use)和[接到 Agent 上](/advanced/agent)。
+
+<details>
+<summary>手动安装：自己核对发行包摘要</summary>
 
 ```bash
 cargo build --locked --release --features mcp
@@ -16,18 +52,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now anp-keyd
 ```
 
-不需要 MCP 时去掉 `--features mcp`。`--agent-user` 可以写多个，每个 Agent 一个账号。
-
-安装器会建立服务账号、socket 组、root 所有的程序与配置、SQLite 状态和 systemd 服务。它拒绝覆盖已有安装，不会自动迁入身份。
-
-装完检查：
-
-```bash
-/usr/local/libexec/anp-keyd admin --config /etc/anp-keyd/service.json status
-/usr/local/libexec/anp-keyd probe --security --config /etc/anp-keyd/service.json
-```
-
-安装成功只说明服务和权限检查通过。此时还没有身份，也还不能签名。接下来要准备身份、发布策略、创建 grant 并解锁，见[本机使用](/guide/local-use)和[接到 Agent 上](/advanced/agent)。
+</details>
 
 更新用 `--update`，先停服务：
 
@@ -54,26 +79,20 @@ preview、调试构建和 macOS 都是 false。这个标志是支持范围声明
 
 ### TPM
 
-需要 TPM 后端时：
+需要 TPM 后端时，一条命令完成构建和安装：
 
 ```bash
-cargo build --locked --release --features hardware-tpm
-sudo python3 deploy/linux/install.py --binary target/release/anp-keyd \
-  --sha256 你核对过的SHA256 --admin-user operator --agent-user agent-a \
-  --tpm-device /dev/tpmrm0
+./install.sh --tpm-device
 ```
 
 安装器只授予 `/dev/tpmrm0` 并把传输固定到该设备。验收步骤见[TPM 说明](/advanced/hardware-root)和仓库 `deploy/linux/TPM.md`。
 
 ## macOS 本机预览
 
-macOS 预览不要求完整 Xcode、付费开发者会员或 Secure Enclave。从源码编译需要 Rust 和 Command Line Tools。
+macOS 预览不要求完整 Xcode、付费开发者会员或 Secure Enclave。从源码编译需要 Rust 和 Command Line Tools。同一条命令：
 
 ```bash
-cargo build --locked --release --features mcp
-shasum -a 256 target/release/anp-keyd
-python3 deploy/macos/provision-accounts.py --admin-user 你的账号
-sudo bash deploy/macos/setup-local.sh 你的账号 你核对过的SHA256
+./install.sh
 ```
 
 安装器建立独立账号和 launchd 服务，拒绝覆盖已有安装。它始终报告 `protected_supported=false`。

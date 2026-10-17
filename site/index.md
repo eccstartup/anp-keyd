@@ -65,7 +65,7 @@ anp-keyd --root /tmp/keyd-lab sign --did 你的DID \
 
 Linux 上把服务、管理员和 Agent 分成三个系统账号，Agent 读不到私钥和状态。步骤：
 
-1. [安装服务](/guide/install)
+1. [一条命令安装服务](/guide/install)
 2. 准备 did:wba 身份
 3. 登记身份、确认热钥匙、发布策略
 4. 创建 grant

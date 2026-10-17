@@ -58,31 +58,45 @@ Signature: sig1=:...:
 anp-keyd --root /tmp/keyd-lab stop
 ```
 
-## 正式部署（Linux）
+## 正式安装
 
-正式使用时，服务、管理员、Agent 分别是三个系统账号。Agent 账号读不到私钥、配置和状态。
-
-安装由人类管理员执行：
+Linux 一条命令完成构建、校验、建账号、装服务和启动：
 
 ```bash
-cargo build --locked --release --features mcp
-sha256sum target/release/anp-keyd
-sudo python3 deploy/linux/install.py --binary target/release/anp-keyd \
-  --sha256 你核对过的SHA256 --admin-user operator --agent-user agent-a
-sudo systemctl daemon-reload
-sudo systemctl enable --now anp-keyd
+git clone https://github.com/eccstartup/anp-keyd.git && cd anp-keyd && ./install.sh
 ```
 
-装好后还没有身份。接下来：
+如果仓库已经在本机：
 
-1. 准备一个 did:wba 身份（新生成，或从旧机器迁入）。
-2. 管理员登记身份，确认哪把钥匙是热钥匙。
+```bash
+./install.sh
+```
+
+脚本会：
+
+- 构建 release（只需要 Rust；其余用系统自带工具）
+- 创建服务账号和默认 Agent 账号 `anp-agent`
+- 安装 root 持有的程序、配置和 systemd 服务
+- 启动服务，打印只读检查结果
+
+指定账号、使用 TPM，或先看计划：
+
+```bash
+./install.sh --admin-user operator --agent-user agent-a
+./install.sh --tpm-device
+./install.sh --dry-run
+```
+
+macOS 用同一条命令安装本机预览，始终 `protected_supported=false`。
+
+安装脚本只创建空服务。装好后还要做一次身份和授权：
+
+1. 准备身份：新建，或从旧机器迁入。
+2. 管理员登记身份，确认热钥匙。
 3. 发布策略：允许访问哪个网站、哪个路径、哪些 HTTP 方法。
-4. 创建 grant：给哪个 Agent、用哪把钥匙、用到什么时候、最多几次。
-5. 管理员输入口令解锁热钥匙。
-6. Agent 开始请求签名。
+4. 创建 grant，解锁热钥匙，把 grant 交给 Agent。
 
-完整命令和 JSON 见[本机使用指南](deploy/LOCAL-USE.md)和 [Agent 接入说明](docs/ADAPTER.md)。
+完整命令见[本机使用指南](deploy/LOCAL-USE.md)，手动校验发行包和更新见 [Linux 部署](deploy/linux/README.md)。
 
 ## Agent 怎么用
 

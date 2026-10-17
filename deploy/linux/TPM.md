@@ -14,7 +14,15 @@ device, a non-virtual TPM driver and `systemd-detect-virt` reporting `none`.
 
 ## Installation
 
-Build a release with the TPM backend, then install with an explicit device grant:
+From the repository root, one command builds with the TPM backend and installs
+with an explicit device grant:
+
+```sh
+./install.sh --tpm-device
+```
+
+Use `--tpm-device /dev/tpmrm0` to name the device explicitly. The manual
+reviewed-release path is:
 
 ```sh
 cargo build --locked --release --features hardware-tpm

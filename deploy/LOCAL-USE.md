@@ -14,18 +14,28 @@
 
 ## 1. 安装
 
-Linux 按[仓库安装说明](linux/README.md)部署 systemd 服务：
+在仓库根目录执行一条命令：
 
 ```bash
-cargo build --locked --release --features mcp
-sha256sum target/release/anp-keyd
-sudo python3 deploy/linux/install.py --binary target/release/anp-keyd \
-  --sha256 你核对过的SHA256 --admin-user operator --agent-user agent-a
-sudo systemctl daemon-reload
-sudo systemctl enable --now anp-keyd
+./install.sh
 ```
 
-macOS 按[macOS 说明](macos/README.md)安装本机预览。安装后用一次性身份和公开口令做验收，不要用真实密钥试错。
+脚本会构建 release、校验摘要、创建服务账号和默认 Agent 账号 `anp-agent`、安装 systemd 服务并启动。要指定账号或 TPM：
+
+```bash
+./install.sh --admin-user operator --agent-user agent-a
+./install.sh --tpm-device
+```
+
+先看计划、不改系统：
+
+```bash
+./install.sh --dry-run
+```
+
+手动校验发行包、更新和离线迁移见 [Linux 部署](linux/README.md)。
+
+macOS 用同一条命令安装本机预览。安装后用一次性身份和公开口令做验收，不要用真实密钥试错。
 
 ## 2. 准备身份
 
