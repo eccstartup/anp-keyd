@@ -669,6 +669,79 @@ fn evict_probe(ctx: &mut Context) -> Result<()> {
 }
 
 // ————————————————————————————————————————————————————————————————————————
+// 验收专用入口(默认构建里不存在)
+// ————————————————————————————————————————————————————————————————————————
+
+/// 这三条只给 `examples/tpm-persistence.rs` 用:让"进程 A 封、进程 B 开、
+/// 再删掉"成为一次真实的跨进程验收。
+///
+/// 它们不是发行接口。`tpm-acceptance` 特性默认关闭,关着的时候这段代码连
+/// 同删除动作都不在二进制里;而就算打开,名字也必须以 `acceptance-` 开头,
+/// 句柄还必须正好是这个名字散列出来的那个 —— 碰不到任何真实信封的对象。
+#[cfg(feature = "tpm-acceptance")]
+const ACCEPTANCE_TAG_PREFIX: &str = "acceptance-";
+
+#[cfg(feature = "tpm-acceptance")]
+fn acceptance_handle(tag_hint: &str) -> Result<u32> {
+    if !tag_hint.starts_with(ACCEPTANCE_TAG_PREFIX) {
+        return Err(KeydError::Misuse(format!(
+            "TPM acceptance tag must begin with {ACCEPTANCE_TAG_PREFIX:?}"
+        )));
+    }
+    handle_for(tag_hint)
+}
+
+#[cfg(feature = "tpm-acceptance")]
+fn acceptance_root_handle(tag_hint: &str, root: &HardwareRoot) -> Result<u32> {
+    let expected = acceptance_handle(tag_hint)?;
+    let HardwareRoot::Tpm { handle } = root else {
+        return Err(KeydError::Misuse(
+            "TPM acceptance only operates on a tpm root".into(),
+        ));
+    };
+    if *handle != expected {
+        return Err(KeydError::Misuse(format!(
+            "TPM acceptance refuses {handle:#010x} for tag {tag_hint:?}; that tag owns \
+             {expected:#010x}"
+        )));
+    }
+    Ok(expected)
+}
+
+#[cfg(feature = "tpm-acceptance")]
+pub fn acceptance_create(tag_hint: &str) -> Result<SealedHardware> {
+    acceptance_handle(tag_hint)?;
+    TPM.seal(tag_hint)
+}
+
+#[cfg(feature = "tpm-acceptance")]
+pub fn acceptance_open(
+    tag_hint: &str,
+    root: &HardwareRoot,
+    ciphertext: &[u8],
+) -> Result<LockedBytes> {
+    acceptance_root_handle(tag_hint, root)?;
+    TPM.open(root, ciphertext)
+}
+
+#[cfg(feature = "tpm-acceptance")]
+pub fn acceptance_delete(tag_hint: &str) -> Result<()> {
+    let handle = acceptance_handle(tag_hint)?;
+    let mut ctx = context()?;
+    if !object_is_there(&mut ctx, handle) {
+        return Ok(());
+    }
+    let persistent = PersistentTpmHandle::new(handle)
+        .map_err(|error| tpm_failed("address the acceptance handle", error))?;
+    let object = attach(&mut ctx, persistent)
+        .map_err(|error| tpm_failed("attach the acceptance object in order to remove it", error))?;
+    // 和 `evict_probe` 同一个写法:同名句柄传回去就是"抹掉这个持久对象"。
+    ctx.evict_control(Provision::Owner, object, Persistent::Persistent(persistent))
+        .map_err(|error| tpm_failed("remove the acceptance object", error))?;
+    Ok(())
+}
+
+// ————————————————————————————————————————————————————————————————————————
 
 #[cfg(test)]
 mod tests {

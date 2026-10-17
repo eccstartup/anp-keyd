@@ -79,6 +79,22 @@ hardware-se = [
 ]
 # Linux TPM 2.0。没有上面那道门槛:不需要 entitlement,`swtpm` 还能本地模拟。
 hardware-tpm = ["dep:tss-esapi"]
+# **仅限验收**:让 `examples/se-persistence.rs` 用真 SE 做"进程 A 建、进程 B 开"。
+# 不开这个特性,那段代码连同删除动作都不在二进制里;正式发行构建不要带它。
+se-acceptance = ["hardware-se"]
+# **仅限验收**:让 `examples/tpm-persistence.rs` 用真 TPM 做"进程 A 封、进程 B 开"。
+# 和 `se-acceptance` 一样默认关闭,正式发行构建不要带它。
+tpm-acceptance = ["hardware-tpm"]
+
+# 验收工具不是发行命令:只在明确要跑 SE 持久化验收时构建。
+[[example]]
+name = "se-persistence"
+required-features = ["hardware-se", "se-acceptance"]
+
+# TPM 的跨进程验收工具,同样不是发行命令。
+[[example]]
+name = "tpm-persistence"
+required-features = ["hardware-tpm", "tpm-acceptance"]
 
 # ————————————————————————————————————————————————————————————————————————
 # 平台相关的依赖。**放在文件末尾是有意的** —— TOML 的 `[table]` 一直管到

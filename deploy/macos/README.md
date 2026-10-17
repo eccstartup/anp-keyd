@@ -140,9 +140,10 @@ The current SE backend needs the user's data protection keychain; signing a
 system LaunchDaemon cannot give it that login context. The foreground
 `admin se-session` bridge is implemented, but formal signing/profile authorization,
 persistent SE keys, real logout/relogin/sleep/reboot and upgrade acceptance remain
-outstanding. The [SE guide](SE-SESSION.md) explains the limits and read-only
-`se-preflight.py` check. There is no requirement to buy membership or install full
-Xcode to use the ordinary local preview. A CSR alone does not authorize entitlements.
+outstanding. The [SE guide](SE-SESSION.md) explains the limits, the
+`se-release.py` bundle tool, the cross-process `se-persistence.py` probe and the
+read-only `se-preflight.py` check. There is no requirement to buy membership or
+install full Xcode to use the ordinary local preview. A CSR alone does not authorize entitlements.
 
 Historical per-stage results, older pending messages and local installation hashes
 are preserved in [HISTORY.md](HISTORY.md); they are not acceptance of your machine.

@@ -1,0 +1,11 @@
+# Installed by `install.py --tpm-device` — do not edit by hand.
+#
+# A TPM is not a private device: the service must see /dev/tpmrm0, but nothing
+# else from /dev. `PrivateDevices=no` only removes the private mount; the
+# allow-list below is what keeps the rest of /dev out.
+[Service]
+PrivateDevices=no
+DevicePolicy=closed
+DeviceAllow=@TPM_DEVICE@ rw
+SupplementaryGroups=@SUPPLEMENTARY_GROUPS@
+Environment=TPM2TOOLS_TCTI=device:@TPM_DEVICE@

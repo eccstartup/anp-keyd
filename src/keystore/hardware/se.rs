@@ -541,6 +541,63 @@ pub fn probe() -> RootProbe {
     }
 }
 
+// ————————————————————————————————————————————————————————————————————————
+// 验收专用入口(默认构建里不存在)
+// ————————————————————————————————————————————————————————————————————————
+
+/// 这三条只给 `examples/se-persistence.rs` 用:让"进程 A 建、进程 B 开、
+/// 再删掉"成为一次真实的跨进程验收。
+///
+/// 它们不是发行接口。`se-acceptance` 特性默认关闭,关着的时候这段代码连
+/// 同删除动作都不在二进制里;而就算打开,标签也必须以 `acceptance-` 开头,
+/// 碰不到任何真实信封的钥匙。
+#[cfg(feature = "se-acceptance")]
+const ACCEPTANCE_TAG_PREFIX: &str = "acceptance-";
+
+#[cfg(feature = "se-acceptance")]
+fn acceptance_label(root: &HardwareRoot) -> Result<&str> {
+    let HardwareRoot::SecureEnclave { tag } = root else {
+        return Err(KeydError::Misuse(
+            "SE acceptance only operates on a secure-enclave root".into(),
+        ));
+    };
+    let prefix = format!("{LABEL_PREFIX}{ACCEPTANCE_TAG_PREFIX}");
+    if !tag.starts_with(&prefix) {
+        return Err(KeydError::Misuse(format!(
+            "SE acceptance refuses label {tag:?}; it only touches labels beginning with {prefix:?}"
+        )));
+    }
+    Ok(tag)
+}
+
+#[cfg(feature = "se-acceptance")]
+pub fn acceptance_create(tag_hint: &str) -> Result<SealedHardware> {
+    if !tag_hint.starts_with(ACCEPTANCE_TAG_PREFIX) {
+        return Err(KeydError::Misuse(format!(
+            "SE acceptance tag must begin with {ACCEPTANCE_TAG_PREFIX:?}"
+        )));
+    }
+    SECURE_ENCLAVE.seal(tag_hint)
+}
+
+#[cfg(feature = "se-acceptance")]
+pub fn acceptance_open(root: &HardwareRoot, ciphertext: &[u8]) -> Result<LockedBytes> {
+    acceptance_label(root)?;
+    SECURE_ENCLAVE.open(root, ciphertext)
+}
+
+#[cfg(feature = "se-acceptance")]
+pub fn acceptance_delete(root: &HardwareRoot) -> Result<()> {
+    let label = acceptance_label(root)?;
+    let key = find_key(label)?;
+    key.delete().map_err(|error| {
+        KeydError::HardwareUnavailable(format!(
+            "could not delete the acceptance key {label:?}: {error} (code {})",
+            error.code()
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

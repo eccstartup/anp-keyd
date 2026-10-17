@@ -97,6 +97,28 @@ Both helper and daemon must contain the bridge:
 cargo build --locked --release --features mcp,hardware-se
 ```
 
+`se-release.py` turns that executable into the helper bundle once the operator
+has a real Apple-issued identity and provisioning profile. `plan` is the default
+and changes nothing:
+
+```sh
+python3 deploy/macos/se-release.py plan --team-id TEAMID --application-id TEAMID.org.example.keyd
+python3 deploy/macos/se-release.py build --team-id TEAMID \
+  --application-id TEAMID.org.example.keyd --identity 'Developer ID Application: ...' \
+  --profile /path/to/helper.provisionprofile
+python3 deploy/macos/se-release.py verify --bundle target/se-release/ANPKeyd.app \
+  --team-id TEAMID --application-id TEAMID.org.example.keyd --require-notarized
+sudo python3 deploy/macos/se-release.py install --bundle target/se-release/ANPKeyd.app \
+  --team-id TEAMID --application-id TEAMID.org.example.keyd --upgrade
+```
+
+`build` signs with hardened runtime and a timestamp, embeds the exact
+provisioning profile and verifies the resulting bundle before reporting success.
+`install` requires root, refuses an existing destination without `--upgrade`,
+checks the Team/application identity and designated-requirement continuity, and
+replaces the root-owned bundle atomically. No step claims hardware or
+distribution acceptance.
+
 Do not add `seed-export` or `hardware-software`. Run the signed helper from an
 app-like bundle containing its authorized provisioning profile; use a narrow,
 exact application/keychain group identity. Review the signed bytes with
@@ -125,6 +147,28 @@ The command opens the native prompt and stays in the foreground after unlock.
 Closing its terminal/process ends the session. Approve a narrowly scoped grant
 through the existing management workflow in a separate terminal. There is no
 LaunchAgent auto-start or unattended passphrase storage in this initial version.
+
+The cross-process persistence probe is a separate test example, not the helper
+binary and not a release command:
+
+```sh
+cargo build --locked --release --features mcp,hardware-se,se-acceptance \
+  --example se-persistence
+python3 deploy/macos/se-persistence.py \
+  --binary target/release/examples/se-persistence \
+  --sha256 VERIFIED_SHA256 --team-id TEAMID \
+  --application-id TEAMID.org.example.keyd \
+  --other-uid 501 \
+  --unsigned-binary /path/to/an-unsigned-se-persistence \
+  --unsigned-sha256 VERIFIED_UNSIGNED_SHA256
+```
+
+It creates a persistent SE key in process A, reopens it in a new process B,
+proves another UID is denied by the keychain, deletes the key and proves the old
+envelope no longer opens. The `--unsigned-binary` phase proves that a build
+without the entitlement cannot create a persistent key; an unsigned build is
+expected to fail with `errSecMissingEntitlement` (`-34018`). Passing this tool
+does not prove logout/relogin, sleep, reboot, upgrade or distribution.
 
 ## Verification boundaries
 

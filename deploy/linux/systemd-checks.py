@@ -10,8 +10,9 @@ def run(config, check):
     def prop(name):
         return subprocess.check_output(['systemctl','show','anp-keyd.service','-p',name,'--value'], text=True).strip()
     check(Path('/proc/1/comm').read_text().strip() == 'systemd', 'VM PID 1 is actual systemd')
+    tpm = Path('/etc/systemd/system/anp-keyd.service.d/10-tpm.conf').is_file()
     expected = {'User':'anp-keyd','Group':'anp-keyd','NoNewPrivileges':'yes',
-        'PrivateTmp':'yes','PrivateDevices':'yes','ProtectSystem':'strict',
+        'PrivateTmp':'yes','PrivateDevices':'no' if tpm else 'yes','ProtectSystem':'strict',
         'ProtectHome':'yes','ProtectKernelTunables':'yes','ProtectKernelModules':'yes',
         'ProtectControlGroups':'yes','RestrictSUIDSGID':'yes','RestrictNamespaces':'yes',
         'LockPersonality':'yes','RestrictAddressFamilies':'AF_UNIX',
@@ -24,6 +25,12 @@ def run(config, check):
     check(all(int(uid) == config['service_uid'] for uid in fields['Uid'].split()), 'running daemon has only dedicated service UID')
     groups = set(map(int, fields['Groups'].split()))
     check({config['agent_gid'],config['admin_gid']} <= groups, 'running daemon has separate socket connection groups')
+    if tpm:
+        check(prop('DevicePolicy') == 'closed', 'TPM deployment keeps the closed device policy')
+        check('/dev/tpmrm0 rw' in prop('DeviceAllow'), 'TPM deployment allows only /dev/tpmrm0 rw')
+        check('TPM2TOOLS_TCTI=device:/dev/tpmrm0' in prop('Environment'),
+              'TPM deployment pins the transport to the kernel device')
+        check(os.stat('/dev/tpmrm0').st_gid in groups, 'running daemon belongs to the TPM device group')
     report = json.loads((Path(config['state_dir'])/'systemd-sandbox-report.json').read_text())
     for name, passed in report.items():
         check(passed is True, 'sandbox effect ' + name)

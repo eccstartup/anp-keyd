@@ -28,7 +28,10 @@ sudo systemctl enable --now anp-keyd
 ```
 
 Replace the account names and digest. `--features mcp` is optional for a CLI-only
-installation. The fresh installer creates its own non-login service account,
+installation. For a physical TPM root, build with `--features hardware-tpm` and
+add `--tpm-device` to the installer, then run the separate acceptance in
+[TPM.md](TPM.md); the installer grants only `/dev/tpmrm0` and pins the transport.
+The fresh installer creates its own non-login service account,
 socket groups, root-owned executable/configuration, SQLite state and systemd
 unit. It refuses partial/existing installations rather than silently repairing
 or replacing them. It does not migrate user keys. Use the separate offline
@@ -57,7 +60,9 @@ docker run --rm -v "$PWD:/src:ro" -w /src rust:1.90-bookworm \
 This harness requires dependencies/network or a separately mounted Cargo cache.
 It does not by itself accept the systemd sandbox, physical power loss or TPM.
 Commands for marked disposable systemd VMs are below. Keep actual host acceptance
-separate from unit tests, container results and build capability flags.
+separate from unit tests, container results and build capability flags. Physical
+TPM grants and acceptance are covered separately in [TPM.md](TPM.md); an
+`swtpm` result there is emulator evidence, not physical acceptance.
 
 ## Management and current implementation
 

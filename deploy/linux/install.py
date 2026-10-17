@@ -3,6 +3,7 @@
 import argparse
 import grp
 import hashlib
+import importlib.util
 import tempfile
 import fcntl
 import socket
@@ -20,6 +21,18 @@ ADMINS = "anp-keyd-admin"
 CONFIG = Path("/etc/anp-keyd/service.json")
 STATE = Path("/var/lib/anp-keyd")
 BINARY = Path("/usr/local/libexec/anp-keyd")
+SYSTEMD = Path("/etc/systemd/system/anp-keyd.service")
+TPM_DROPIN = Path("/etc/systemd/system/anp-keyd.service.d/10-tpm.conf")
+
+
+def load(name, filename):
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(filename))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+TPM_DEVICE = load('tpm_device', 'tpm-device.py')
 
 
 def run(*args):
@@ -114,9 +127,17 @@ def install(args):
         raise RuntimeError("existing installation/state detected; refusing overwrite or implicit migration")
     for path in [CONFIG.parent, STATE.parent, BINARY.parent, Path('/etc/systemd/system'), Path('/etc/tmpfiles.d'), Path('/run/anp-keyd')]:
         trusted_parent(path)
-    for path in [Path('/etc/tmpfiles.d/anp-keyd.conf'), Path('/etc/systemd/system/anp-keyd.service')]:
+    tpm = None
+    if args.tpm_device:
+        # Validate the device before creating any account, group or file: a
+        # failed deployment must not leave half a TPM grant behind.
+        tpm = TPM_DEVICE.report(args.tpm_device)
+        trusted_parent(TPM_DROPIN.parent)
+    for path in [Path('/etc/tmpfiles.d/anp-keyd.conf'), SYSTEMD]:
         if path.exists() or path.is_symlink():
             raise RuntimeError(f"existing deployment file: {path}")
+    if tpm and (TPM_DROPIN.exists() or TPM_DROPIN.is_symlink()):
+        raise RuntimeError(f"existing deployment file: {TPM_DROPIN}")
     admins = [pwd.getpwnam(name) for name in args.admin_user]
     agents = [pwd.getpwnam(name) for name in args.agent_user]
     admin_uids = {p.pw_uid for p in admins}
@@ -124,6 +145,8 @@ def install(args):
     if len(agent_uids) != len(agents) or len(admin_uids) != len(admins) or 0 in agent_uids or admin_uids & agent_uids:
         raise RuntimeError("administrators and distinct Agent UIDs must not overlap")
     content, build_info = verified_binary(args)
+    if tpm and not build_info.get("hardware_tpm"):
+        raise RuntimeError("--tpm-device requires a build compiled with the hardware-tpm feature")
     for name in [SERVICE, AGENTS, ADMINS]:
         try:
             grp.getgrnam(name)
@@ -144,6 +167,8 @@ def install(args):
         run("groupadd", "--system", name)
     run("useradd", "--system", "--user-group", "--home-dir", str(STATE), "--no-create-home", "--shell", "/usr/sbin/nologin", SERVICE)
     run("usermod", "-a", "-G", f"{AGENTS},{ADMINS}", SERVICE)
+    if tpm and tpm['group'] not in (AGENTS, ADMINS):
+        run("usermod", "-a", "-G", tpm['group'], SERVICE)
     for user in agents:
         run("usermod", "-a", "-G", AGENTS, user.pw_name)
     for user in admins:
@@ -181,8 +206,33 @@ def install(args):
         os.initgroups(SERVICE, service.pw_gid)
         os.setgid(service.pw_gid)
         os.setuid(service.pw_uid)
+    if tpm:
+        groups = set(os.getgrouplist(SERVICE, service.pw_gid))
+        if tpm['gid'] not in groups:
+            raise RuntimeError(f"service account did not receive group {tpm['group']!r}")
+        # A group entry is not access: open the device exactly the way the
+        # daemon will, before the unit is enabled.
+        opened = subprocess.run(
+            [sys.executable, '-I', '-c',
+             'import os, sys; os.close(os.open(sys.argv[1], os.O_RDWR))', tpm['path']],
+            preexec_fn=service_identity, capture_output=True, text=True)
+        if opened.returncode:
+            raise RuntimeError(
+                f"service user cannot open {tpm['path']}: "
+                f"{(opened.stderr or opened.stdout).strip()}")
+        supplementary = [AGENTS, ADMINS]
+        if tpm['group'] not in supplementary:
+            supplementary.append(tpm['group'])
+        template = Path(__file__).with_name('anp-keyd-tpm.conf.in').read_text()
+        rendered = (template.replace('@TPM_DEVICE@', tpm['path'])
+                    .replace('@SUPPLEMENTARY_GROUPS@', ' '.join(supplementary)))
+        directory(TPM_DROPIN.parent)
+        write(TPM_DROPIN, rendered)
     subprocess.run([str(BINARY), 'init-protected-state', '--config', str(CONFIG)], preexec_fn=service_identity, check=True)
     print(f"Installed v2 transaction signer; mode: {config['mode']}. Migration requires the separate offline tool.")
+    if tpm:
+        print(f"TPM device {tpm['path']} granted through {TPM_DROPIN} (group {tpm['group']}).")
+        print("Run the separate physical-TPM acceptance before claiming hardware protection.")
     print("Review config, then run: systemctl daemon-reload && systemctl enable --now anp-keyd")
     print("Agents/admins need fresh login sessions for group membership. Keep Agents away from sudo, Docker and admin IPC.")
 
@@ -200,6 +250,14 @@ def uninstall():
         if path.is_symlink():
             raise RuntimeError(f"unexpected symlink: {path}")
         path.unlink()
+    if TPM_DROPIN.exists() or TPM_DROPIN.is_symlink():
+        if TPM_DROPIN.is_symlink():
+            raise RuntimeError(f"unexpected symlink: {TPM_DROPIN}")
+        TPM_DROPIN.unlink()
+        try:
+            TPM_DROPIN.parent.rmdir()
+        except OSError:
+            pass
     run("systemctl", "daemon-reload")
     print("Service/binary removed. Config, state, accounts and groups retained to prevent UID reuse or identity loss.")
 
@@ -213,10 +271,15 @@ if __name__ == "__main__":
     parser.add_argument("--update", action="store_true")
     parser.add_argument("--sha256")
     parser.add_argument("--allow-development-build", action="store_true", help="explicit preview testing only")
+    parser.add_argument("--tpm-device", nargs="?", const="/dev/tpmrm0", default=None,
+                        help="grant the service access to this TPM 2.0 resource-manager device "
+                             "(default /dev/tpmrm0); requires a hardware-tpm build")
     args = parser.parse_args()
     try:
         if args.uninstall and args.update:
             parser.error('choose uninstall or update')
+        if (args.uninstall or args.update) and args.tpm_device:
+            parser.error('--tpm-device applies only to a new installation')
         if args.update:
             if not args.binary:
                 parser.error('--update requires --binary and --sha256')
@@ -227,5 +290,6 @@ if __name__ == "__main__":
             install(args)
         else:
             parser.error("new installation requires --binary, --admin-user and --agent-user")
-    except (RuntimeError, KeyError, OSError, subprocess.CalledProcessError) as error:
+    except (RuntimeError, KeyError, OSError, subprocess.CalledProcessError,
+            TPM_DEVICE.DeviceError) as error:
         sys.exit(str(error))
