@@ -157,6 +157,59 @@ class BundleVerification(unittest.TestCase):
                 self.verify(new, previous=old, requirement=requirement)
 
 
+class SignExample(unittest.TestCase):
+    def args(self, directory, digest='correct'):
+        binary = Path(directory) / 'se-persistence'
+        binary.write_bytes(b'example')
+        actual = release.hashlib.sha256(b'example').hexdigest()
+        return SimpleNamespace(
+            team_id=TEAM, application_id=APP, identity='Developer ID Application',
+            profile=None, binary=binary, out=Path(directory) / 'se-persistence.signed',
+            sha256=actual if digest == 'correct' else '0' * 64)
+
+    def test_digest_mismatch_is_refused_before_signing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.args(directory, digest='wrong')
+            with patch.object(release, 'resolve_identity',
+                              return_value={'sha1': 'A' * 40}):
+                with self.assertRaisesRegex(release.ReleaseError, 'digest mismatch'):
+                    release.sign_example(args)
+            self.assertFalse(args.out.exists())
+
+    def test_signs_with_hardened_runtime_and_the_exact_entitlements(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.args(directory)
+            signed = SimpleNamespace(returncode=0, stdout=b'', stderr=b'')
+            report = {'signature_prerequisites_passed': True, 'blockers': []}
+            with patch.object(release, 'resolve_identity',
+                              return_value={'sha1': 'A' * 40}):
+                with patch.object(release, 'run', return_value=signed) as started:
+                    with patch.object(release.PREFLIGHT, 'inspect', return_value=report):
+                        result = release.sign_example(args)
+            command = started.call_args[0][0]
+            self.assertIn('--options', command)
+            self.assertEqual(command[command.index('--options') + 1], 'runtime')
+            self.assertIn('--timestamp', command)
+            entitlement = Path(command[command.index('--entitlements') + 1])
+            self.assertEqual(plistlib.loads(entitlement.read_bytes()),
+                             release.entitlements(TEAM, APP))
+            self.assertFalse(result['hardware_acceptance_complete'])
+            self.assertFalse(result['protected_supported'])
+            self.assertEqual(result['source_sha256'], args.sha256)
+            self.assertTrue(args.out.is_file())
+
+    def test_failed_signing_leaves_no_candidate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.args(directory)
+            failed = SimpleNamespace(returncode=1, stdout=b'', stderr=b'rejected')
+            with patch.object(release, 'resolve_identity',
+                              return_value={'sha1': 'A' * 40}):
+                with patch.object(release, 'run', return_value=failed):
+                    with self.assertRaisesRegex(release.ReleaseError, 'codesign failed'):
+                        release.sign_example(args)
+            self.assertFalse(args.out.exists())
+
+
 class InstallSafety(unittest.TestCase):
     def test_upgrade_requires_root_before_touching_anything(self):
         args = SimpleNamespace(bundle=Path('/nonexistent'), team_id=TEAM, application_id=APP,
