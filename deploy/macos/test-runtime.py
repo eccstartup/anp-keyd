@@ -43,6 +43,9 @@ def main():
     parser.add_argument('--signing-helper', type=Path, help='digest-pinned local-preview-fixture example; enables full temporary signing checks')
     parser.add_argument('--helper-sha256')
     parser.add_argument('--interactive-ui', action='store_true', help='human window checks: cancel, 120-second timeout, masked temporary-password unlock')
+    parser.add_argument('--migrate-fixture', action='store_true', help='install only the disposable fixture through the supported offline migrator and verify recovery/resume')
+    parser.add_argument('--claude-binary', type=Path, help='reviewed standalone Claude Code binary; enables complete framework/tool execution with a local API fixture')
+    parser.add_argument('--claude-sha256', help='SHA-256 of the reviewed framework binary')
     parser.add_argument('--container-regression', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
     args.config = args.config.absolute()
@@ -55,6 +58,14 @@ def main():
         args.signing_helper = args.signing_helper.absolute()
     elif (args.interactive_ui and not args.ui_preflight_only) or args.helper_sha256:
         raise ValueError('UI/digest options require --signing-helper')
+    if args.migrate_fixture and not args.signing_helper:
+        raise ValueError('--migrate-fixture requires --signing-helper')
+    if args.claude_binary:
+        args.claude_binary = args.claude_binary.absolute()
+        if not args.claude_sha256 or not args.signing_helper:
+            raise ValueError('--claude-binary requires --claude-sha256 and --signing-helper')
+    elif args.claude_sha256:
+        raise ValueError('--claude-sha256 requires --claude-binary')
     portable = args.container_regression
     if os.geteuid() != 0:
         raise ValueError('requires root; run in the human terminal')
@@ -141,6 +152,9 @@ print(json.dumps({'uid':os.getuid(),'euid':os.geteuid(),'gid':os.getgid(),'kerne
         result = run(service, args.binary, 'init-protected-state', '--config', path)
         assert result.returncode == 0, 'init-protected-state failed: ' + result.stderr
         print('PASS temporary state initialized', flush=True)
+        if args.migrate_fixture:
+            import acceptance_migration
+            acceptance_migration.install(base, config, path, args, fixture)
         process = None
         def start():
             print('CHECK starting temporary daemon', flush=True)
@@ -187,6 +201,10 @@ print(json.dumps({'uid':os.getuid(),'euid':os.geteuid(),'gid':os.getgid(),'kerne
             if fixture:
                 checks = acceptance_signing.Checks(base, config, path, args, fixture, admin, agent, credentials, env, cli)
                 checks.before_restart()
+                if args.claude_binary:
+                    import acceptance_agent
+                    acceptance_agent.Framework(checks).run()
+                    checks.unlock()  # framework policy changes lock the shared test key
             # task_for_pid queries a task port, never attaches a debugger or reads
             # memory. Root performs only the UID switch; the Agent makes the call.
             script = '''import ctypes,sys

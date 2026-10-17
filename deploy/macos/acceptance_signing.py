@@ -34,27 +34,28 @@ def prepare(base, config, args, admin, service, run):
     made = run(admin, helper, 'generate', source)
     assert made.returncode == 0, made.stderr
     manifest = json.loads(made.stdout)
-    vault_id = str(uuid.uuid4())
     parent = Path(config['state_dir']) / 'vaults'
     parent.mkdir(mode=0o700)
     os.chown(parent, service.pw_uid, service.pw_gid)
-    vault = parent / vault_id
-    # Helper output is trusted test data, but refuse links/special files and bound
-    # the copy so a bad fixture can never redirect a privileged filesystem walk.
-    count, size = 0, 0
-    for path in [source, *source.rglob('*')]:
-        meta = path.lstat()
-        if not (stat.S_ISREG(meta.st_mode) or stat.S_ISDIR(meta.st_mode)):
-            raise ValueError('fixture contains a link or special file')
-        count += 1
-        size += meta.st_size
-    if count > 128 or size > 4 * 1024 * 1024:
-        raise ValueError('fixture exceeds bound')
-    shutil.copytree(source, vault)
-    for path in [vault, *vault.rglob('*')]:
-        os.chown(path, service.pw_uid, service.pw_gid)
-        path.chmod(0o700 if path.is_dir() else 0o600)
-    config['vault_ids'] = [vault_id]
+    if not args.migrate_fixture:
+        vault_id = str(uuid.uuid4())
+        vault = parent / vault_id
+        # Helper output is trusted test data, but refuse links/special files and bound
+        # the copy so a bad fixture can never redirect a privileged filesystem walk.
+        count, size = 0, 0
+        for path in [source, *source.rglob('*')]:
+            meta = path.lstat()
+            if not (stat.S_ISREG(meta.st_mode) or stat.S_ISDIR(meta.st_mode)):
+                raise ValueError('fixture contains a link or special file')
+            count += 1
+            size += meta.st_size
+        if count > 128 or size > 4 * 1024 * 1024:
+            raise ValueError('fixture exceeds bound')
+        shutil.copytree(source, vault)
+        for path in [vault, *vault.rglob('*')]:
+            os.chown(path, service.pw_uid, service.pw_gid)
+            path.chmod(0o700 if path.is_dir() else 0o600)
+        config['vault_ids'] = [vault_id]
     # A real second OS UID, with transport membership applied ONLY to the child
     # process. No Directory Services account/group changes are made.
     other = pwd.getpwnam('_www' if os.uname().sysname == 'Darwin' else 'nobody')
@@ -63,7 +64,7 @@ def prepare(base, config, args, admin, service, run):
     config['principals'] = [*config['principals'], {'principal_id': str(uuid.uuid4()),
                             'uid': other.pw_uid, 'generation': 1, 'enabled': True}]
     print(f'PASS disposable fixture prepared; second kernel subject UID={other.pw_uid}', flush=True)
-    return {'helper': helper, 'manifest': manifest, 'vault_id': vault_id, 'other': other}
+    return {'helper': helper, 'manifest': manifest, 'source': source, 'vault_id': None if args.migrate_fixture else vault_id, 'other': other}
 
 
 # Client authenticates kernel UID before sending the test-only binary password.

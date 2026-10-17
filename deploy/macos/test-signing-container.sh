@@ -15,7 +15,12 @@ cargo build --locked --release --example local-preview-fixture
 python3 deploy/linux/install.py --binary "$CARGO_TARGET_DIR/debug/anp-keyd" \
   --sha256 "$(sha256sum "$CARGO_TARGET_DIR/debug/anp-keyd" | cut -d' ' -f1)" \
   --allow-development-build --admin-user signing-admin --agent-user signing-agent
-python3 deploy/macos/test-runtime.py --container-regression \
+framework_args=()
+if [ -n "${ANP_KEYD_TEST_CLAUDE:-}" ]; then
+  framework_args=(--claude-binary "$ANP_KEYD_TEST_CLAUDE" --claude-sha256 "$(sha256sum "$ANP_KEYD_TEST_CLAUDE" | cut -d' ' -f1)")
+fi
+python3 deploy/macos/test-runtime.py "${framework_args[@]}" --container-regression \
   --binary /usr/local/libexec/anp-keyd --config /etc/anp-keyd/service.json \
+  --migrate-fixture \
   --signing-helper "$CARGO_TARGET_DIR/release/examples/local-preview-fixture" \
   --helper-sha256 "$(sha256sum "$CARGO_TARGET_DIR/release/examples/local-preview-fixture" | cut -d' ' -f1)"

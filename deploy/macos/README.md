@@ -59,7 +59,7 @@ sudo /usr/bin/python3 deploy/macos/test-install.py
 Continue with temporary-key acceptance below. Do not manually copy into managed
 state or loosen ownership to make an Agent work. macOS fresh deployment does not
 promise the Linux offline vault-migration tool as a supported macOS workflow;
-existing-identity enrollment/migration needs a separately reviewed procedure.
+the operator-run [Agent and migration procedure](AGENT.md) now provides an offline cutover. Validate it with temporary identities before any real migration.
 
 ## Temporary-key acceptance: existing installation stays unchanged
 
@@ -95,6 +95,10 @@ public password `temporary-boundary-test-secret`. Use that password only for the
 fixture, never for real identities. The human must confirm the exact displayed
 target and masking. Whole-machine reboot, sleep/logout, and persistent SE tests
 are separate; default driver success does not complete those gates.
+
+Complete-framework Claude Code acceptance and the offline identity cutover are
+described in [AGENT.md](AGENT.md). Its deterministic local API fixture is separate
+from live model-provider acceptance. Run its human UI steps on the current build.
 
 ## Daily workflow, updates and restart
 

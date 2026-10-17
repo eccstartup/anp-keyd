@@ -87,7 +87,10 @@ def inventory(source, owners=None):
         if m.st_size > 64 * 1024 * 1024 or total > MAX_TOTAL:
             raise RuntimeError('migration inventory exceeds bounds')
         with path.open('rb') as stream:
-            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+            hasher = hashlib.sha256()
+            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                hasher.update(chunk)
+            digest = hasher.hexdigest()
         result[str(path.relative_to(source))] = {'sha256': digest, 'size': m.st_size}
     return result
 
@@ -128,39 +131,55 @@ def offline(config):
             raise RuntimeError('stop protected service before migration')
 
 
-def run(args):
-    if sys.platform != 'linux' or os.geteuid() != 0:
-        raise RuntimeError('offline migration requires Linux root')
-    trusted(args.config, False)
+def run(args, platform='linux', path_check=None):
+    if sys.platform != platform or platform not in ('linux', 'darwin') or os.geteuid() != 0:
+        raise RuntimeError('offline migration requires ' + platform + ' root')
+    def check(path, directory=True, owners=(0,)):
+        trusted(path, directory, owners)
+        if path_check:
+            for node in [*reversed(path.parents), path]:
+                path_check(node)
+    check(args.config, False)
     config = json.loads(args.config.read_text())
-    trusted(args.binary, False)
+    if platform == 'darwin' and config['mode'] != 'macos-boundary-preview':
+        raise RuntimeError('explicit macOS boundary preview required')
+    check(args.binary, False)
     state = Path(config['state_dir'])
-    trusted(state, owners=(0, config['service_uid']))
-    trusted(state / 'vaults', owners=(0, config['service_uid']))
-    trusted(args.source, owners=(0, args.source.lstat().st_uid))
+    check(state, owners=(0, config['service_uid']))
+    check(state / 'vaults', owners=(0, config['service_uid']))
+    check(args.source, owners=(0, args.source.lstat().st_uid))
     if args.source == state or args.source.is_relative_to(state) or state.is_relative_to(args.source):
         raise RuntimeError('source and protected state must be disjoint')
     subprocess.run([str(args.binary), 'inspect-vault', '--path', str(args.source)], check=True)
     manifest = inventory(args.source)
+    if path_check:
+        for rel in manifest:
+            path_check(args.source / rel)
+        for name in ('keys', 'dids', 'audit'):
+            if (args.source / name).exists():
+                path_check(args.source / name)
     if not args.apply:
         print(json.dumps({'dry_run': True, 'files': manifest, 'next': 'stop writers; rerun --apply --recovery-dir ROOT_OWNED_NEW_PATH'}))
         return
     # Apply accepts only a root-controlled offline source, including parents.
     # This closes symlink/rename races with the former Agent UID. Stop old
     # processes, move/chown the source into an administrator-owned directory first.
-    trusted(args.source)
+    check(args.source)
     if args.source.lstat().st_uid != 0:
         raise RuntimeError('apply requires a root-owned frozen source')
     if not args.recovery_dir:
         raise RuntimeError('--apply requires --recovery-dir')
-    trusted(args.recovery_dir.parent)
+    check(args.recovery_dir.parent)
     if args.recovery_dir == args.source or args.recovery_dir.is_relative_to(args.source) or args.source.is_relative_to(args.recovery_dir):
         raise RuntimeError('recovery and source paths must be disjoint')
+    if args.recovery_dir == state or args.recovery_dir.is_relative_to(state) or state.is_relative_to(args.recovery_dir):
+        raise RuntimeError('recovery and protected state must be disjoint')
     # Root-controlled recovery location is required before source ownership changes.
     offline(config)
     fd = os.open(state / 'service.lock', os.O_RDWR | os.O_NOFOLLOW)
     with os.fdopen(fd, 'r+b') as lock:
-        if os.fstat(lock.fileno()).st_uid != config['service_uid']:
+        meta = os.fstat(lock.fileno())
+        if not stat.S_ISREG(meta.st_mode) or meta.st_uid != config['service_uid'] or meta.st_nlink != 1 or meta.st_mode & 0o777 != 0o600:
             raise RuntimeError('unsafe service lock')
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         legacy_fd = os.open(args.source / '.maintenance.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -171,7 +190,13 @@ def run(args):
             pidfile = args.source / 'run/keyd.pid'
             if pidfile.exists():
                 pid = int(pidfile.read_text().strip())
-                if Path(f'/proc/{pid}').exists():
+                if pid <= 0:
+                    raise RuntimeError('invalid legacy daemon PID')
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    pass
+                else:
                     raise RuntimeError('legacy daemon is still running')
             sock = args.source / 'run/keyd.sock'
             if sock.exists():
@@ -190,11 +215,14 @@ def run(args):
                           'vault_id': str(uuid.uuid4()), 'files': manifest, 'phase': 'prepared'}
                 atomic(journal, encoded(record))
             else:
-                trusted(args.recovery_dir)
-                trusted(journal, False)
+                check(args.recovery_dir)
+                check(journal, False)
                 record = json.loads(journal.read_text())
                 if record['source'] != str(args.source) or record['instance_id'] != config['instance_id'] or record['files'] != manifest:
                     raise RuntimeError('recovery journal does not match source/installation')
+            if path_check:
+                for node in [args.recovery_dir, *args.recovery_dir.rglob('*')]:
+                    path_check(node)
             vault_id = str(uuid.UUID(record['vault_id']))
             # Freeze the old location. New legacy commands detect the marker;
             # ownership prevents old non-root binaries from reopening files.
@@ -223,6 +251,9 @@ def run(args):
                 copy_checked(backup, stage, manifest)
                 os.rename(stage, target)
                 sync_dir(target.parent)
+            if path_check:
+                for node in [target, *target.rglob('*')]:
+                    path_check(node)
             if inventory(target, owners=(0, config['service_uid'])) != manifest:
                 raise RuntimeError('staged vault differs from verified backup')
             # Before any DB/config mutation, record the exact backup and vault ID.

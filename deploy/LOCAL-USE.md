@@ -23,7 +23,7 @@ Linux 正式 release 的 `linux-protected-v1` 提供受保护部署；macOS 提�
 
 新安装初始没有真实身份。管理员先确认身份来源、备份和恢复要求，再使用受支持的管理流程注册主体、安装文档、划分 hot/root/recovery 角色、配置策略并审批有限 grant。使用 `admin --help` 查看当前命令和 schema，不要直接向托管目录复制文件或用开发 CLI 绕过管理接口。
 
-Linux 提供经检查的离线迁移流程，见平台说明；macOS 尚没有已验收的通用真实身份自助迁移流程，需要单独审核配置/导入步骤。临时 fixture 不是生产身份导入工具。因此“空服务健康”不等于已经可以替现有身份签名。
+Linux 提供经检查的离线迁移流程，见平台说明；macOS 提供显式离线迁入工具和[完整 Agent 演练流程](macos/AGENT.md)，须先完成当前主机的临时身份与 UI 验收，再由管理员操作真实迁入；不能把容器回归当作 macOS 实机验收。临时 fixture 不是生产身份。因此“空服务健康”不等于已经可以替现有身份签名。
 
 grant 应固定主体和 exact hot key，限制目标、HTTP 方法、路径、query、body、期限和次数。普通 Agent 不使用 root/recovery key。人类确认准确目标后通过可信解锁 UI 输入口令；口令不经过模型、聊天或 MCP。解锁与授权是两个操作，解锁本身不会生成 grant。
 
