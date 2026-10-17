@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -61,6 +62,19 @@ class DeviceFacts(unittest.TestCase):
             with self.assertRaisesRegex(device.DeviceError, 'symlink'):
                 device.report(link)
 
+    def test_root_owned_device_group_is_refused(self):
+        # udev's raw-device rule leaves /dev/tpm0 in the root group. Adding the
+        # service to root to reach it would widen every other root-file grant.
+        meta = SimpleNamespace(st_mode=stat.S_IFCHR | 0o660, st_uid=0, st_gid=0,
+                               st_rdev=os.makedev(10, 224))
+        with patch.object(Path, 'is_symlink', return_value=False):
+            with patch.object(Path, 'exists', return_value=True):
+                with patch.object(Path, 'stat', return_value=meta):
+                    with patch.object(device.grp, 'getgrgid',
+                                      return_value=SimpleNamespace(gr_name='root')):
+                        with self.assertRaisesRegex(device.DeviceError, 'root group'):
+                            device.report(Path('/dev/tpm0'))
+
     def test_resource_manager_device_maps_by_name(self):
         # /dev/tpmrm0 is a misc device whose major:minor does not match
         # /sys/class/tpm/tpm0/dev, so the name mapping has to come first.
@@ -81,6 +95,20 @@ class DeviceFacts(unittest.TestCase):
             meta = SimpleNamespace(st_rdev=os.makedev(253, 0))
             self.assertEqual(device._sysfs(meta, Path('/dev/tpm0'), root),
                              root / 'tpm0')
+
+    def test_driver_and_virtual_device_detection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / 'tpm0'
+            (entry / 'device').mkdir(parents=True)
+            (entry / 'device' / 'driver').symlink_to('../../../bus/tpm/drivers/tpm_vtpm_proxy')
+            self.assertEqual(device._driver(entry), 'tpm_vtpm_proxy')
+            self.assertTrue(device._virtual(entry, 'tpm_vtpm_proxy', ''))
+            self.assertFalse(device._virtual(entry, 'tpm_tis', 'DRIVER=tpm_tis'))
+            bare = root / 'virtual' / 'tpm' / 'tpm0'
+            bare.mkdir(parents=True)
+            self.assertIsNone(device._driver(bare))
+            self.assertTrue(device._virtual(bare, '', ''))
 
 
 class StateFile(unittest.TestCase):
@@ -112,6 +140,23 @@ class StateFile(unittest.TestCase):
             os.chmod(path, 0o644)
             with self.assertRaisesRegex(harness.AcceptanceError, 'private regular file'):
                 harness.read_state(path)
+
+
+class ProbeOutput(unittest.TestCase):
+    def test_stdout_json_survives_later_stderr_noise(self):
+        result = SimpleNamespace(
+            returncode=0, stdout=b'{"usable":true,"detail":"ok"}\n',
+            stderr=b'ERROR:esys:TR_FromTPMPublic failed\n')
+        with patch.object(harness, 'run', return_value=result):
+            report = harness.probe(Path('/binary'), 999, 'device:/dev/tpmrm0')
+        self.assertTrue(report['usable'])
+
+    def test_an_unusable_probe_is_refused(self):
+        result = SimpleNamespace(returncode=0, stdout=b'{"usable":false,"detail":"none"}\n',
+                                 stderr=b'')
+        with patch.object(harness, 'run', return_value=result):
+            with self.assertRaisesRegex(harness.AcceptanceError, 'not usable'):
+                harness.probe(Path('/binary'), 999, 'device:/dev/tpmrm0')
 
 
 class AcceptanceFlow(unittest.TestCase):

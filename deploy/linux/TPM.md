@@ -112,6 +112,27 @@ against `swtpm` as part of the earlier hardware-root work. On 2026-10-17 the
 cross-process probe was also run end to end against `swtpm` in a Linux
 container: `probe` reported usable, process A created a sealed object, process B
 reopened it with the same HS digest, and after `delete` the old envelope was
-refused with `HardwareMissing`. That is emulator evidence only. No physical TPM
-device was attached to this repository's acceptance, so `protected_supported=false`
-and the pending list above remain in force.
+refused with `HardwareMissing`.
+
+The same day, the full deployment acceptance scope ran in a privileged systemd
+container with `swtpm` exposed through the kernel's `tpm_vtpm_proxy`, so the
+device under test was a kernel `/dev/tpmrm0` character device rather than a TPM
+socket. `install.py` created the service accounts and the drop-in; the service
+started with `PrivateDevices=no`, `DevicePolicy=closed` and only `/dev/tpmrm0`
+allowed; the service UID opened the device; the cross-process probe passed; a
+second UID was denied; `delete` made the old envelope unopenable. The report
+recorded `virtualization=docker`, `virtual_device_hint=true`,
+`acceptance_scope_complete=true`, and both physical/protected flags false.
+
+That run found three tooling defects, now fixed and regression-tested:
+
+- a device owned by the root group would have added the service to `root`
+  (the shared device policy now refuses it);
+- the probe parser read trailing tss2 stderr as the JSON line;
+- a TPM class entry without a `device` link was reported as driver `"driver"`
+  instead of being flagged virtual; the resolved sysfs path is now checked too.
+
+This is emulator evidence only. No physical TPM device was attached to this
+repository's acceptance, so `protected_supported=false`, the physical flag stays
+false, and the pending list above remains in force.
+

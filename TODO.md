@@ -4,7 +4,7 @@
 
 - [x] Linux systemd 真实主机验收已完成；仅正式 Linux release 且显式受保护模式声明支持。
 - [ ] macOS 受保护运行环境、可信管理 UI、SE 正式签名分发和持久化。发布包与跨进程持久化工具已备（`se-release.py`、`se-persistence.py`，验收特性默认关）；仍缺 Apple 签发身份/配置文件、真机登录会话与生命周期验收、分发审核。
-- [ ] 实体 TPM 的权限、故障与恢复专项验收；软件替身不等于硬件结果。部署与验收工具已备（`install.py --tpm-device`、`tpm-acceptance.py`、跨进程探针）；仍缺实体设备，`swtpm` 结果不得当作物理验收。
+- [ ] 实体 TPM 的权限、故障与恢复专项验收；软件替身不等于硬件结果。部署与验收工具已备（`install.py --tpm-device`、`tpm-acceptance.py`、跨进程探针）；2026-10-17 已在 Docker + 内核 `tpm_vtpm_proxy` 上跑过完整部署范围（安装、systemd 沙箱、服务 UID、跨进程、跨 UID、删除），`acceptance_scope_complete=true`，但 `virtualization=docker`、physical=false；仍缺实体设备，`swtpm` 结果不得当作物理验收。
 - [x] U4 独立审计采集器、SSH 固定端点、原子保管、回滚/分叉/崩溃/断网验收；交付部署模板与两容器验收。保持本地审计签名继续策略，不承诺在线强制锚定或非审计状态保护。
 - [ ] 受限无人值守恢复（须先指定 workload 与可信解封机制）。
 - [ ] 按实际需求扩展注册 challenge 格式；当前仅支持管理端精确批准的 awiki 32 位小写 hex 格式。

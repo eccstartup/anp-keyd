@@ -162,16 +162,24 @@ def open_device(path, uid):
 
 
 def probe(binary, uid, tcti):
-    text = require_success(
-        run(binary, 'probe', uid=uid, environment={'TPM2TOOLS_TCTI': tcti}),
-        'TPM probe')
-    try:
-        report = json.loads(text.splitlines()[-1])
-    except (ValueError, IndexError) as error:
-        raise AcceptanceError(f'TPM probe did not print JSON: {text}') from error
+    result = run(binary, 'probe', uid=uid, environment={'TPM2TOOLS_TCTI': tcti})
+    require_success(result, 'TPM probe')
+    text = output(result)
+    # The example prints one JSON object on stdout; tss2 may still log
+    # warnings on stderr after it. Parse the JSON line, not the last line.
+    for line in reversed(result.stdout.decode(errors='replace').splitlines()):
+        try:
+            report = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(report, dict) and 'usable' in report:
+            break
+    else:
+        raise AcceptanceError(f'TPM probe did not print JSON: {text}')
     if not report.get('usable'):
         raise AcceptanceError(f"TPM probe says it is not usable: {report.get('detail')}")
     return report
+
 
 
 def systemd_report(device):

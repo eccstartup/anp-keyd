@@ -54,6 +54,25 @@ def _read(path):
         return None
 
 
+def _driver(sysfs):
+    """The driver name, or None when this TPM class device has no parent driver."""
+    link = sysfs / 'device' / 'driver'
+    try:
+        return Path(os.readlink(link)).name
+    except OSError:
+        return None
+
+
+def _virtual(sysfs, driver, uevent):
+    text = (driver or '') + ' ' + (uevent or '')
+    if any(marker in text.lower() for marker in ('vtpm', 'xen', 'ibmvtpm')):
+        return True
+    try:
+        return 'virtual' in sysfs.resolve().parts
+    except OSError:
+        return False
+
+
 def report(device=DEVICE):
     """Return the device facts or raise DeviceError with an actionable reason."""
     device = Path(device)
@@ -80,6 +99,11 @@ def report(device=DEVICE):
             f'{device} is owned by gid {meta.st_gid}, which has no group name; create the '
             'group (usually `tss`) before deploying'
         ) from None
+    if meta.st_gid == 0 or group == 'root':
+        raise DeviceError(
+            f'{device} is owned by the root group; the service must not be added to root '
+            'to reach a TPM. Use a dedicated group (usually `tss`) via udev'
+        )
     sysfs = _sysfs(meta, device)
     if sysfs is None:
         raise DeviceError(f'{device} has no matching /sys/class/tpm entry; it is not a TPM')
@@ -89,15 +113,8 @@ def report(device=DEVICE):
             f'{device} reports TPM version {version!r}, not 2; this backend only supports TPM 2.0'
         )
     uevent = _read(sysfs / 'device' / 'uevent') or ''
-    driver = _read(sysfs / 'device' / 'driver') if (sysfs / 'device' / 'driver').exists() else None
-    if driver is None:
-        link = sysfs / 'device' / 'driver'
-        try:
-            driver = link.resolve().name
-        except OSError:
-            driver = None
-    driver = driver or ''
-    virtual = any(marker in (driver + uevent).lower() for marker in ('vtpm', 'xen', 'ibmvtpm'))
+    driver = _driver(sysfs) or ''
+    virtual = _virtual(sysfs, driver, uevent)
     return {
         'path': str(device),
         'exists': True,
