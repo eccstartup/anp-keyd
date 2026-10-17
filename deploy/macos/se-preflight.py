@@ -28,6 +28,9 @@ def policy(context, team, application, metadata, entitlements):
         blockers.append('expected an exact team-prefixed application identifier')
     if metadata.get('TeamIdentifier') != team or not metadata.get('Authority'):
         blockers.append('signature must have the expected team and a certificate authority chain')
+    if not any(name.startswith('Apple Root CA')
+               for name in metadata.get('authorities', [])):
+        blockers.append('certificate chain does not anchor at an Apple root CA')
     if metadata.get('Signature') == 'adhoc':
         blockers.append('ad-hoc signatures are not accepted')
     if 'runtime' not in metadata.get('flags', '').split(','):
@@ -73,10 +76,14 @@ def inspect(binary, digest, context, team, application):
     command(['/usr/bin/codesign', '--verify', '--strict', '--verbose=2', str(binary)])
     details = command(['/usr/bin/codesign', '-d', '--verbose=4', str(binary)])
     metadata = {}
+    authorities = []
     for line in details.stderr.decode().splitlines():
         if '=' in line:
             key, value = line.split('=', 1)
             metadata[key] = value
+            if key == 'Authority':
+                authorities.append(value)
+    metadata['authorities'] = authorities
     # codesign includes runtime in the parenthesized flag description.
     flags = re.search(r'flags=0x[0-9a-f]+\(([^)]*)\)', details.stderr.decode())
     metadata['flags'] = flags.group(1) if flags else ''

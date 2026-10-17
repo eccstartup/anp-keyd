@@ -193,10 +193,14 @@ def code_signature(path):
     result = checked(['/usr/bin/codesign', '-d', '--verbose=4', str(path)], env=ENV)
     text = result.stderr.decode(errors='replace')
     metadata = {}
+    authorities = []
     for line in text.splitlines():
         if '=' in line:
             key, value = line.split('=', 1)
             metadata[key] = value
+            if key == 'Authority':
+                authorities.append(value)
+    metadata['authorities'] = authorities
     flags = re.search(r'flags=0x[0-9a-f]+\(([^)]*)\)', text)
     metadata['flags'] = flags.group(1) if flags else ''
     return metadata
@@ -295,6 +299,7 @@ def verify_bundle(bundle, team, application, *, installed=False, expected_profil
         'profile': profile,
         'signature': {'team_identifier': metadata.get('TeamIdentifier'),
                       'authority': metadata.get('Authority'),
+                      'authorities': metadata.get('authorities', []),
                       'flags': metadata.get('flags'),
                       'designated_requirement': designated_requirement(executable)},
         'upgrade_continuity': continuity,

@@ -14,7 +14,11 @@ class ReleaseGate(unittest.TestCase):
     def setUp(self):
         self.team = 'ABCDEFGHIJ'
         self.app = self.team + '.org.anp.keyd'
-        self.metadata = {'TeamIdentifier': self.team, 'Authority': 'Developer ID Application', 'flags': 'runtime'}
+        self.metadata = {'TeamIdentifier': self.team, 'Authority': 'Apple Root CA',
+                         'authorities': ['Developer ID Application',
+                                         'Developer ID Certification Authority',
+                                         'Apple Root CA'],
+                         'flags': 'runtime'}
         self.entitlements = {'com.apple.application-identifier': self.app,
                              'com.apple.developer.team-identifier': self.team,
                              'keychain-access-groups': [self.app]}
@@ -76,6 +80,8 @@ class ReleaseGate(unittest.TestCase):
             digest = gate.hashlib.sha256(binary.read_bytes()).hexdigest()
             responses = [NS(stdout=b'', stderr=b''),
                          NS(stdout=b'', stderr=(f'TeamIdentifier={self.team}\nAuthority=Developer ID Application\n'
+                                                'Authority=Developer ID Certification Authority\n'
+                                                'Authority=Apple Root CA\n'
                                                 'CodeDirectory v=20500 flags=0x10000(runtime)\n').encode()),
                          NS(stdout=gate.plistlib.dumps(self.entitlements), stderr=b'')]
             with patch.object(gate.sys, 'platform', 'darwin'), patch.object(gate, 'command', side_effect=responses) as command:

@@ -40,10 +40,21 @@ class ReleasePolicy(unittest.TestCase):
             'com.apple.developer.team-identifier': TEAM,
             'keychain-access-groups': [APP],
         })
-        metadata = {'TeamIdentifier': TEAM, 'Authority': 'Developer ID Application',
+        metadata = {'TeamIdentifier': TEAM, 'Authority': 'Apple Root CA',
+                    'authorities': ['Developer ID Application: Example',
+                                    'Developer ID Certification Authority',
+                                    'Apple Root CA'],
                     'flags': 'runtime'}
         self.assertEqual(preflight.policy('user-session', TEAM, APP, metadata,
                                          release.entitlements(TEAM, APP)), [])
+
+    def test_a_non_apple_signing_chain_is_refused(self):
+        metadata = {'TeamIdentifier': TEAM, 'Authority': 'Self-Signed Root',
+                    'authorities': ['Self-Signed Leaf', 'Self-Signed Root'],
+                    'flags': 'runtime'}
+        blockers = preflight.policy('user-session', TEAM, APP, metadata,
+                                    release.entitlements(TEAM, APP))
+        self.assertTrue(any('Apple root CA' in blocker for blocker in blockers))
 
     def test_info_plist_matches_bundle_identity(self):
         plist = release.info_plist(APP, '0.1.0')
