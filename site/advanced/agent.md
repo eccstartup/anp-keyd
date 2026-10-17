@@ -1,6 +1,6 @@
 # Agent 接入
 
-本页介绍 Linux v2。服务须先由管理员部署，Agent 使用独立 UID，获得受保护配置路径、grant_id 和 exact key_id。正式 Linux release 且配置为 `linux-protected-v1` 才声明保护支持。macOS 和同 UID 运行保留开发能力。
+本页介绍 Linux v2。服务须先由管理员部署，Agent 使用独立 UID，获得受保护配置路径、grant_id 和 exact key_id。正式 Linux release 且配置为 `linux-protected-v1` 才声明保护支持。macOS 另有独立 UID 本机预览，始终报告 false，见[本机使用](/guide/local-use)。同 UID 开发模式不提供 Agent 隔离。
 
 完整协议、管理变更和恢复说明见仓库 [ADAPTER.md](https://github.com/eccstartup/anp-keyd/blob/master/docs/ADAPTER.md)。
 

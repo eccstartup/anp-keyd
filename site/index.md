@@ -28,7 +28,7 @@ features:
   - title: 导出是缺席的,不是被拒绝的
     details: export-seed 在默认构建里不存在 —— 不是"被拒绝",是没有这段代码:没有分支、没有环境变量、没有可翻的开关。
   - title: 签名核心不联网
-    details: Linux v2 使用 root 管理配置与本地 SQLite 记录授权、请求和审计。客户端负责网络发送；macOS 继续支持开发模式。
+    details: Linux v2 使用 root 管理配置与本地 SQLite 记录授权、请求和审计。客户端负责网络发送；macOS 提供独立 UID 本机预览，protected_supported=false，见[本机使用](/guide/local-use)。
 ---
 
 ## 它长什么样

@@ -7,6 +7,7 @@ anp-keyd 是面向 ANP Agent 的本地身份签名与有限授权服务。Agent 
 | 场景 | 当前边界 |
 |---|---|
 | 独立 UID 的 Linux 受保护部署 | 在 OS、管理员及 daemon 可信时，限制读密钥、改策略和跨主体签名 |
+| macOS 独立 UID 本机预览 | 已有临时实例签名/隔离/撤销/重启验收；protected_supported=false，SE 正式发行另行验收 |
 | 同 UID 开发模式 | 常规 API 不返回私钥；不抵御同 UID 任意代码执行 |
 | root、内核或可信管理端被控制 | 不在当前保护承诺内 |
 

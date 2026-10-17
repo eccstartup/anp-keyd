@@ -36,3 +36,6 @@ core.[0-9]*
 *.sqlite-wal
 *.sqlite-shm
 *.log
+
+# Canonical local-use guide is rendered into the documentation site.
+site/guide/local-use.md

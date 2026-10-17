@@ -49,11 +49,28 @@ def write_new(path, content):
         os.fsync(handle.fileno())
 
 
+def archive_previous(previous, archive):
+    # Exclusive copy + durable directory entry before removing the old slot.
+    # Interruption may leave both copies, but never discards the only backup.
+    trusted_file(previous)
+    content = read_binary(previous)
+    write_new(archive, content)
+    fd = os.open(previous.parent, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+        previous.unlink()
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--sha256', required=True)
     parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--archive-previous', action='store_true',
+                        help='preserve an existing previous binary in an exclusive digest-named archive')
     args = parser.parse_args()
     if sys.platform != 'darwin':
         raise ValueError('macOS only')
@@ -74,15 +91,25 @@ def main():
     if config['mode'] != 'macos-boundary-preview':
         raise ValueError('explicit local macOS preview required')
     previous = BINARY.with_name('anp-keyd.previous')
+    archive = None
     if os.path.lexists(previous):
-        raise ValueError('previous backup exists; inspect/archive it separately before another update')
+        trusted_file(previous)
+        if not args.archive_previous:
+            raise ValueError('previous backup exists; inspect it and use --archive-previous to preserve it')
+        digest = hashlib.sha256(read_binary(previous)).hexdigest()
+        archive = previous.with_name('anp-keyd.archive-' + digest)
+        if os.path.lexists(archive):
+            raise ValueError('backup archive already exists; retain both files and inspect separately')
     print(json.dumps({'binary': str(BINARY), 'candidate_sha256': args.sha256,
-                      'backup': str(previous), 'restart_locks_keys_and_revokes_grants': True,
+                      'backup': str(previous), 'archive_existing_backup': str(archive) if archive else None,
+                      'restart_locks_keys_and_revokes_grants': True,
                       'config_and_state_preserved': True, 'apply': args.apply}, indent=2), flush=True)
     if not args.apply:
         return
     if os.geteuid() != 0:
         raise ValueError('--apply requires root')
+    if archive is not None:
+        archive_previous(previous, archive)
     service = pwd.getpwuid(config['service_uid'])
     admin = pwd.getpwuid(config['admin_uids'][0])
     candidate = BINARY.with_name('.anp-keyd-update-' + str(uuid.uuid4()))

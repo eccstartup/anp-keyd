@@ -27,6 +27,14 @@ device.secret 仍然需要。完整软件目录加口令可解封，只有受支
 
 SE 持久化和分发需要匹配签名及 entitlement。临时芯片 ECDH 成功不能证明持久化可发行；当前 macOS 也未开放受保护部署声明。TPM 设备访问与 systemd 沙箱配置需要实体环境单独验收。
 
+## macOS 登录会话助手与未完成项
+
+现有 SE 后端依赖用户数据保护钥匙串，系统 LaunchDaemon 不能仅增加证书来解决登录上下文。`admin se-session` 前台助手已实现并完成软件/合成 HS 桥接验证；这不代替持久 SE 验收。它只面向可信本地管理员、指定 exact hot key，不开放 Agent 解密接口；最多 900 秒，1 秒心跳、5 秒失联期限，会话失效后全局锁钥、撤权及抑制旧缓存，不自动恢复 grant。
+
+正式签名身份/profile、持久 SE、真实注销/重新登录、休眠、整机重启、升级和实体 TPM 仍未完成。CSR 本身不授予 entitlement；免费账号能否获得所需授权尚未确认。普通 macOS 独立 UID 预览不需要付费会员、完整 Xcode 或硬件，见[本机使用](/guide/local-use)。
+
+协议和操作限制见[SE 会话说明](https://github.com/eccstartup/anp-keyd/blob/master/deploy/macos/SE-SESSION.md)。
+
 ## 恢复代价
 
 硬件失效或丢失后，不能靠复制绑定信封恢复 HS。应在设备可用时准备并验证独立恢复材料。助记词和便携归档不依赖原设备，但它们是可复制的完整身份材料，必须另行保护。

@@ -2,7 +2,7 @@
 
 Linux v2 使用独立服务 UID、管理员 UID 与 Agent UID；可信配置由 root 持有。客户端在发送管理口令前验证路径权限和 daemon 的内核 UID。主体、exact-key grant、目标策略、次数、绝对期限、撤销与持久请求去重均在 daemon 执行。
 
-真实 systemd 主机验收已完成；仅正式 Linux 构建加显式 `linux-protected-v1` 模式报告 `protected_supported=true`。macOS 保留开发模式；同 UID 任意代码可以读取文件或影响进程，不能仅凭 socket 不返回私钥就声称密钥隔离。
+真实 systemd 主机验收已完成；仅正式 Linux 构建加显式 `linux-protected-v1` 模式报告 `protected_supported=true`。macOS 提供独立 UID 本机预览，仍报告 false，见[本机使用](/guide/local-use)；同 UID 任意代码可以读取文件或影响进程，不能仅凭 socket 不返回私钥就声称密钥隔离。
 
 软件整套目录和口令可以解封。硬件根保护解封材料，签名仍在普通内存中执行。SQLite 事务审计与本地哈希链不抵御管理员整体回滚。历史私钥导出不能被软件收回。
 

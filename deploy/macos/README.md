@@ -121,7 +121,9 @@ python3 deploy/macos/update-local.py --binary target/release/anp-keyd --sha256 V
 # Review the plan, then the human may run the same command with sudo and --apply.
 ```
 
-It retains `bin/anp-keyd.previous`, refuses an existing backup, atomically replaces
+It retains `bin/anp-keyd.previous`; if that slot already exists, review it and add
+`--archive-previous` to the plan and apply commands to preserve it in an exclusive
+SHA-256-named archive first. Existing archives are never overwritten. It atomically replaces
 the binary under the state lock and checks identity/health after restart. Never
 delete a backup or state database merely to make an update succeed. There is no
 automatic rollback, state reset or schema downgrade. Do not automatically install

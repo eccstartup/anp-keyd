@@ -28,6 +28,31 @@ anp-keyd probe --security
 
 安装后还需迁入身份、确认 hot 角色、发布策略、解锁并建立 grant，才有可用签名。见[Agent 接入](/advanced/agent)及仓库 [ADAPTER](https://github.com/eccstartup/anp-keyd/blob/master/docs/ADAPTER.md)。
 
+## macOS 本机独立 UID 预览
+
+普通预览不要求完整 Xcode、付费开发者会员或 SE。从源码编译需要 Rust 与 Command Line Tools。可信人类管理员、服务和整个 Agent 各用独立 UID；root 持有安装与配置，始终报告 `protected_supported=false`。
+
+```sh
+cargo build --locked --release --features mcp
+shasum -a 256 target/release/anp-keyd
+python3 deploy/macos/provision-accounts.py --admin-user YOUR_HUMAN_ACCOUNT
+sudo bash deploy/macos/setup-local.sh YOUR_HUMAN_ACCOUNT VERIFIED_SHA256
+```
+
+先审核源码、账号计划和摘要，再由人类终端执行 sudo。安装器建立账号和 launchd 服务，拒绝已有安装；新状态没有真实密钥。整个 Agent 必须在独立非管理员 UID 中启动，仅切换签名子进程不足以隔离。
+
+已有安装不要重复 setup。先验收候选，再查看保留状态的更新计划：
+
+```sh
+python3 deploy/macos/update-local.py --binary target/release/anp-keyd --sha256 VERIFIED_SHA256
+# 若已有 previous，审核后加 --archive-previous；它先完整归档，不覆盖归档。
+# 核对计划后，由人类以 sudo 执行同一命令并加 --apply。
+```
+
+重启锁钥并撤销旧 grant，配置/状态保留。不要删除备份来绕过检查。macOS 通用真实身份迁移尚未验收，临时 fixture 不用于真实身份导入。
+
+按[本机使用指南](/guide/local-use)完成临时签名、跨 UID、撤销与重启验收。详细安装/验收命令见[仓库 macOS 说明](https://github.com/eccstartup/anp-keyd/blob/master/deploy/macos/README.md)。SE 登录助手及正式发行是独立未完成项，见[硬件根](/advanced/hardware-root)。
+
 ## 本地开发
 
 ```sh

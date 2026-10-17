@@ -337,7 +337,7 @@ cargo install --path . --features hardware-tpm   # Linux:钥匙可以绑到 TPM 
 
 只复制不含 device.secret 的信封不足以解封；整套软件目录加口令可以解封。
 硬件绑定增加本机解封依赖，签名仍在 daemon 普通内存执行。本地审计链与锚
-可检测部分修改，不能抵御整套回滚。Linux v2 已实现独立 UID、有限 grant、事务签名、迁移与撤销；受保护发布门禁仍未开放。
+可检测部分修改，不能抵御整套回滚。Linux v2 已实现独立 UID、有限 grant、事务签名、迁移与撤销；正式 Linux release 加显式 `linux-protected-v1` 已通过 systemd 主机验收。
 
 ## Linux 边界预览
 
@@ -395,18 +395,9 @@ anp-keyd keygen --spec mybot.spec.json --hardware secure-enclave
 备份。导出/导入是唯一允许的搬家路径,而且那条路径的产物是一把**硬件无关**的
 钥匙。
 
-**macOS 有一条发行前置。** SE 私钥唯一的持久化机制就是钥匙串,而写钥匙串
-需要 `application-identifier` 这个 entitlement —— **它只有 Apple 签发的证书
-能给**。所以:
+**普通 macOS 本机预览不要求 SE、付费开发者会员或完整 Xcode。** 从源码编译需要 Rust 和 Command Line Tools。它使用独立服务/管理/Agent UID，仍报告 `protected_supported=false`，详见 [本机指南](deploy/LOCAL-USE.md)。
 
-- 未签名的二进制建**永久** SE key → `errSecMissingEntitlement`(芯片在,
-  是钥匙串拒绝)
-- ad-hoc 签名 + 手写 `keychain-access-groups` → 进程**被内核 SIGKILL**
-- ad-hoc 签名**不带**那个 entitlement → 正常运行,但 SE key 一退出就没了
-
-也就是说 SE 版本**必须以签名身份分发**,`cargo build` 的产物做不到。这是
-发行决策,不是代码里能补的一环 —— `probe` 会替你把这件事说出来,而不是
-报一个假的"通过"。
+**SE 是另一项尚未完成的增强。** 已验证芯片 ECDH，现有后端依赖用户的数据保护钥匙串，系统 LaunchDaemon 不能靠增加证书直接取得登录上下文。`admin se-session` 登录助手已实现：限 exact hot key、最长 900 秒，失联/会话失效后锁钥撤权，不恢复旧 grant。正式签名/profile、持久 SE、真实注销/休眠/整机重启和升级仍待验收。CSR 本身不授予 entitlement；免费账号能否取得所需授权尚未确认，不要求用户先购买会员或安装完整 Xcode。见 [SE 会话说明](deploy/macos/SE-SESSION.md)。
 
 **Linux/TPM 没有这道门槛。** 走 `/dev/tpmrm0`,不要 entitlement,可选绑 PCR
 (**默认不绑** —— 绑了的话内核或固件一升级就把用户锁在门外)。`swtpm` 能在
@@ -628,3 +619,9 @@ Apache-2.0。见 [LICENSE](LICENSE)。
 账号与安装工具默认只打印计划，显式 `--apply` 才修改系统；空状态安装不迁移真实密钥。
 现有同 UID Agent 不会因安装而自动获得隔离。
 见 [本机部署、信任边界和待验收项目](deploy/macos/README.md)。
+
+### macOS 连接期限修复与更新
+
+修复 `7392419` 解决对端关闭后设置 socket 超时的间歇性 EINVAL，保持整帧截止时间且不自动重发请求。修复候选已通过 macOS 实机临时密钥签名、跨 UID、撤销、正常重启及 SIGKILL 验收；软件回归 523 项及 Linux 126 项边界检查通过。验收候选不等于已更新每台机器的日常安装。
+
+已有安装使用 [更新工具](deploy/macos/README.md#daily-workflow-updates-and-restart)，核对实际二进制摘要后执行；已有 previous 备份可用 `--archive-previous` 完整归档，工具不会覆盖归档。更新重启会锁钥并撤销旧 grant，保留配置及状态。

@@ -71,4 +71,12 @@ all-features 会请求启用所有 feature，但平台 cfg 只编译适用的后
 
 本地 Rust 回归不能代替多 UID、安装权限、systemd 沙箱、真实整机重启及服务兼容。deploy/linux 下的 test-boundary、systemd-checks、systemd-boot-check 和 anp-service-acceptance 使用显式隔离环境验收；故障注入不在日常主机执行。
 
-已有 systemd 主机验收已通过，实体硬件和 macOS 保护域仍未交付。测试使用临时身份，注明代码基线、特性、部署模式和未验项；历史测试数字不作为当前运行结果。
+已有 systemd 主机验收已通过，实体硬件及 macOS 正式保护发行仍未验收；macOS 独立 UID 预览已有临时实例验收。测试使用临时身份，注明代码基线、特性、部署模式和未验项；历史测试数字不作为当前运行结果。
+
+## macOS 连接期限修复验收（2026-10-17）
+
+旧安装版本出现对端关闭后设置 socket 超时的 EINVAL。修复 `7392419` 使用 poll 和非阻塞 I/O 保持原整帧截止时间，不忽略错误或重发授权。固定摘要的候选已由操作员在 root-owned 临时实例通过实际 hot 签名/独立验签、跨 UID 拒绝、撤销、task-port 拒绝、正常重启、SIGKILL 后锁钥/撤权/缓存抑制及假 socket 拒绝。
+
+macOS MCP+SE 软件回归 523 项、显式 console/合成 HS 2 项、严格 Clippy、Linux Rust 1.88 默认 504 项及 126 项多 UID/SDK 边界通过。完整回归显式设置 RUST_LOG=info；继承 warn 时监听日志断言会失败。更新工具新增归档既有 previous 备份，Python 16 项通过。
+
+这些结果不证明日常安装已更新，不代替完整 Agent 框架、原生 UI 重测、整机重启或持久 SE 验收。安装与更新见[安装](/guide/install)，使用边界见[本机使用](/guide/local-use)。

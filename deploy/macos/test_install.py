@@ -80,6 +80,25 @@ class ChildCredentials(unittest.TestCase):
 
 
 class UpdateWrites(unittest.TestCase):
+    def test_archive_keeps_bytes_and_refuses_existing_destination(self):
+        import tempfile
+        spec = importlib.util.spec_from_file_location('local_update', Path(__file__).with_name('update-local.py'))
+        update = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(update)
+        with tempfile.TemporaryDirectory() as directory:
+            previous = Path(directory) / 'previous'
+            archive = Path(directory) / 'archive'
+            previous.write_bytes(b'old-reviewed-binary')
+            with patch.object(update, 'trusted_file'):
+                update.archive_previous(previous, archive)
+                self.assertFalse(previous.exists())
+                self.assertEqual(archive.read_bytes(), b'old-reviewed-binary')
+                previous.write_bytes(b'keep-this-backup')
+                with self.assertRaises(FileExistsError):
+                    update.archive_previous(previous, archive)
+                self.assertEqual(previous.read_bytes(), b'keep-this-backup')
+                self.assertEqual(archive.read_bytes(), b'old-reviewed-binary')
+
     def test_backup_and_stage_are_exclusive_and_ignore_restrictive_umask(self):
         import os
         import tempfile

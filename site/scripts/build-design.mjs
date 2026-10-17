@@ -101,3 +101,18 @@ mkdirSync(dirname(fileURLToPath(target)), { recursive: true })
 writeFileSync(target, frontmatter + lines.join('\n'))
 
 console.log(`design/index.md ← docs/DESIGN.md(${lines.length} 行,链接来自 ${REPO})`)
+
+// Keep the published operator guide identical to the repository guide.
+let localUse = readFileSync(new URL('../../deploy/LOCAL-USE.md', import.meta.url), 'utf8')
+const operatorLinks = {
+  'macos/README.md': blob('deploy/macos/README.md'),
+  'linux/README.md': blob('deploy/linux/README.md'),
+  'macos/SE-SESSION.md': '/advanced/hardware-root',
+}
+localUse = localUse.replace(/\]\(([^)]+)\)/g, (whole, link) => {
+  if (operatorLinks[link]) return `](${operatorLinks[link]})`
+  if (/^https?:/.test(link)) return whole
+  throw new Error(`Unmapped local-use link: ${link}`)
+})
+writeFileSync(new URL('../guide/local-use.md', import.meta.url), frontmatter + localUse)
+console.log('guide/local-use.md ← deploy/LOCAL-USE.md')

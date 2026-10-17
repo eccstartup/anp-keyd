@@ -39,6 +39,7 @@ export default defineConfig({
         items: [
           { text: '它是什么', link: '/guide/what-is' },
           { text: '安装', link: '/guide/install' },
+          { text: '本机安全使用', link: '/guide/local-use' },
           { text: '五分钟跑通', link: '/guide/quickstart' },
         ],
       },
