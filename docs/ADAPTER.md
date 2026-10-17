@@ -245,7 +245,7 @@ connector 从已授权列表选定 exact key，读取公开文档，构造 ANP-0
 
 本地 SDK `4700786` 修复了热密钥解析：DID 指纹绑定根 proof，活动根签署文档通过 exact authentication 方法授权热密钥。缺少可信 proof 的路径保持直接指纹检查，退役文档不获得新增委托能力。
 
-当前验收使用真实 daemon 的 createConfig/signRequest 结果，直接调用 `resolveVerificationKey` 和 `verifyAnpLoginRequest`，不显式提供热公钥；同时拒绝重放、body 篡改和错误 expectedNonce。SDK 回归另覆盖错误 kid、未授权方法、根 proof 伪造、过期、密钥替换、相对方法与网络解析。旧 SDK 仍有原限制；修复仅本地提交，未 push 或发布。
+当前验收使用真实 daemon 的 createConfig/signRequest 结果，直接调用 `resolveVerificationKey` 和 `verifyAnpLoginRequest`，不显式提供热公钥；同时拒绝重放、body 篡改和错误 expectedNonce。SDK 回归另覆盖错误 kid、未授权方法、根 proof 伪造、过期、密钥替换、相对方法与网络解析。旧 SDK 仍有原限制；该修复已 push 到 SDK 仓库 master（远端 `cabb0c9` 以 `4700786` 为祖先），但没有任何 tag、未发布；2026-10-17 更正，核对记录在 `docs/validation/sdk-release-audit-2026-10-17/`。
 awiki did-auth RPC 要求 JSON-RPC envelope，SDK signRequest 生成的 ANP-02 `{nonce,did,didDocument,...}` 是另一种 body。已签 body 不能再包装成 RPC；awiki 链路使用同一 v2 client 对正确 RPC 字节请求签名。实际服务验收采用一次性本地服务、逻辑 HTTPS origin 与测试 HTTP 通道，不能据此提供生产 fetch 的目标覆盖能力。
 
 ### 6.2 其他 SDK 接缝
