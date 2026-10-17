@@ -306,7 +306,7 @@ mod tests {
     fn bounded_parser_sweep_never_accepts_encoded_or_control_paths() {
         for byte in 0..=255u8 {
             let target = format!("https://example.com/a{}b", char::from(byte));
-            if byte <= 32 || byte >= 127 || [b'%', b'\\', b'#'].contains(&byte) {
+            if byte <= 32 || byte >= 127 || b"%\\#".contains(&byte) {
                 assert!(CanonicalHttpRequest::new(input(&target)).is_err(), "{byte}");
             }
         }
