@@ -13,21 +13,32 @@ protection is a separate claim; see [TPM.md](TPM.md).
 
 Use a human-controlled checkout and a separate non-admin Agent account for each
 security principal. The human must review code/build provenance. From the
-repository root:
+repository root, one command installs the service, creates a fresh identity,
+migrates it into protected state, publishes a policy, creates one grant and
+unlocks the hot key:
 
 ```sh
-./install.sh
+./install.sh --bootstrap --did-host agents.example.com \
+  --target https://api.example.com/v1/status
 ```
 
-This builds a release with the `mcp` feature, computes its SHA-256, creates the
-default `anp-agent` account if it does not exist, installs root-owned files and
-the systemd unit, starts the service, and runs read-only checks. Choose accounts
-or grant a TPM device explicitly:
+The operator enters every passphrase at the terminal; the binary reads it from
+the controlling tty, never from argv, environment, stdin or the Agent.
+
+To install only the empty service and finish identity and authorization
+manually, run `./install.sh` without `--bootstrap` and follow
+[LOCAL-USE.md](../LOCAL-USE.md). Choose accounts or grant a TPM device
+explicitly:
 
 ```sh
 ./install.sh --admin-user operator --agent-user agent-a --agent-user agent-b
 ./install.sh --tpm-device
 ```
+
+With `--bootstrap`, add `--method` (repeatable, default `GET`), `--body-bytes`,
+`--grant-days` and `--max-uses` to shape the policy and grant. Multiple
+`--agent-user` values share the service; bootstrap issues the first grant to the
+first account.
 
 Inspect the plan without changing the host:
 
@@ -43,8 +54,9 @@ separate acceptance in [TPM.md](TPM.md) before claiming hardware protection.
 The installer creates its own non-login service account, socket groups,
 root-owned executable/configuration, SQLite state and systemd unit. It refuses
 partial or existing installations rather than silently repairing or replacing
-them. It does not migrate user keys. Use the offline migration procedure below
-for existing installations. Establish fresh sessions after group changes.
+them. Without `--bootstrap` it does not migrate user keys; use the offline
+migration procedure below for existing installations. Establish fresh sessions
+after group changes.
 
 Agents must have no sudo/admin rights, Docker/host-control sockets, administrator
 credentials, or access to administrator processes. The entire Agent must run under

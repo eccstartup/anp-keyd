@@ -60,43 +60,43 @@ anp-keyd --root /tmp/keyd-lab stop
 
 ## 正式安装
 
-Linux 一条命令完成构建、校验、建账号、装服务和启动：
+Linux 上一条命令完成安装、创建身份、发布策略、创建 grant 并解锁：
 
 ```bash
-git clone https://github.com/eccstartup/anp-keyd.git && cd anp-keyd && ./install.sh
+git clone https://github.com/eccstartup/anp-keyd.git && cd anp-keyd
+./install.sh --bootstrap --did-host agents.example.com \
+  --target https://api.example.com/v1/status
 ```
 
-如果仓库已经在本机：
+- `--did-host` 是 DID 文档将来发布的域名。
+- `--target` 是 Agent 实际要访问的完整 HTTPS 地址，策略里的网站、路径和方法都从它得出。
+
+省略这两项时，脚本会在终端里询问。
+
+执行过程中会要求你输入几次口令：绑定钥匙、日常热钥匙、迁入受保护状态和解锁。口令只由 anp-keyd 从你的终端读取，不进入 Agent、命令行参数或环境变量。
+
+完成后打印 DID 文档地址、vault、grant 编号、有效期限、root 持有的恢复材料目录，以及一段可以直接交给 Agent 的请求示例。把 DID 文档上传到打印出的地址，把 grant 编号交给 Agent，它就可以开始签名。
+
+只安装空服务，之后手动初始化：
 
 ```bash
 ./install.sh
 ```
 
-脚本会：
-
-- 构建 release（只需要 Rust；其余用系统自带工具）
-- 创建服务账号和默认 Agent 账号 `anp-agent`
-- 安装 root 持有的程序、配置和 systemd 服务
-- 启动服务，打印只读检查结果
-
-指定账号、使用 TPM，或先看计划：
+其他常用选项：
 
 ```bash
 ./install.sh --admin-user operator --agent-user agent-a
-./install.sh --tpm-device
+./install.sh --tpm-device --bootstrap --did-host agents.example.com \
+  --target https://api.example.com/v1/status
 ./install.sh --dry-run
 ```
 
-macOS 用同一条命令安装本机预览，始终 `protected_supported=false`。
+`--method` 可以重复，默认只允许 `GET`；`--body-bytes` 限制请求体大小，`--grant-days` 和 `--max-uses` 限制这张 grant 的有效期和签名次数。指定多个 Agent 账号时，`--bootstrap` 只为第一个账号创建 grant。
 
-安装脚本只创建空服务。装好后还要做一次身份和授权：
+macOS 用 `./install.sh` 安装本机预览，始终 `protected_supported=false`；身份和授权按[本机使用指南](deploy/LOCAL-USE.md)手动完成。
 
-1. 准备身份：新建，或从旧机器迁入。
-2. 管理员登记身份，确认热钥匙。
-3. 发布策略：允许访问哪个网站、哪个路径、哪些 HTTP 方法。
-4. 创建 grant，解锁热钥匙，把 grant 交给 Agent。
-
-完整命令见[本机使用指南](deploy/LOCAL-USE.md)，手动校验发行包和更新见 [Linux 部署](deploy/linux/README.md)。
+手动校验发行包和更新见 [Linux 部署](deploy/linux/README.md)。
 
 ## Agent 怎么用
 

@@ -12,37 +12,75 @@
 
 不要给 Agent sudo、Docker 管理权限、管理员凭据、真实身份口令，也不要让它能改服务程序或配置。
 
-## 1. 安装
+## 1. 一条命令完成安装和初始化
 
-在仓库根目录执行一条命令：
+Linux 上在仓库根目录执行：
+
+```bash
+./install.sh --bootstrap --did-host agents.example.com \
+  --target https://api.example.com/v1/status
+```
+
+这条命令依次完成：
+
+1. 构建 release、校验摘要、创建服务账号、安装并启动 systemd 服务；
+2. 生成一个 did:wba 身份，并发布本地 DID 文档；
+3. 创建一个日常签名的热钥匙，更新 DID 文档；
+4. 停止服务，把两把钥匙离线迁入受保护状态，再启动服务；
+5. 登记 vault，确认绑定钥匙为 root、热钥匙为 hot；
+6. 按 `--target` 发布策略，创建 grant；
+7. 解锁热钥匙，确认 `signing_available=true`。
+
+`--did-host` 是 DID 文档将来发布的域名，`--target` 是 Agent 要访问的完整 HTTPS 地址；省略时脚本会在终端里询问。
+
+全程会要求你在终端输入口令：绑定钥匙、热钥匙、迁入受保护状态和解锁。口令只由 anp-keyd 从 `/dev/tty` 读取，不经过 Agent、命令行参数或环境变量。
+
+成功后打印 DID 文档地址、vault、grant、有效期、恢复材料目录和一段 Agent 请求示例。把 DID 文档上传到打印出的地址，把 grant 交给 Agent。
+
+常用选项：
+
+```bash
+./install.sh --admin-user operator --agent-user agent-a
+./install.sh --tpm-device
+./install.sh --dry-run
+```
+
+`--method` 可以重复，默认 `GET`；`--body-bytes`、`--grant-days`、`--max-uses` 分别限制请求体大小、有效天数和签名次数。指定多个 Agent 账号时，`--bootstrap` 只为第一个账号创建 grant。
+
+只安装空服务，之后手动初始化：
 
 ```bash
 ./install.sh
 ```
 
-脚本会构建 release、校验摘要、创建服务账号和默认 Agent 账号 `anp-agent`、安装 systemd 服务并启动。要指定账号或 TPM：
-
-```bash
-./install.sh --admin-user operator --agent-user agent-a
-./install.sh --tpm-device
-```
-
-先看计划、不改系统：
-
-```bash
-./install.sh --dry-run
-```
-
 手动校验发行包、更新和离线迁移见 [Linux 部署](linux/README.md)。
 
-macOS 用同一条命令安装本机预览。安装后用一次性身份和公开口令做验收，不要用真实密钥试错。
+macOS 用同一条命令安装本机预览，始终 `protected_supported=false`。本机预览不支持 `--bootstrap`；用一次性身份和公开口令按下面的手动步骤初始化，不要用真实密钥试错。
 
-## 2. 准备身份
+## 2. 手动完成身份和授权
 
-新安装没有身份。两种来源：
+需要已有身份、多个 Agent 或自定义策略时，按本节手动完成。下面的程序路径是正式安装的位置；管理命令必须在管理员账号下运行（root 不在 `admin_uids` 里）。
 
-- **新身份**：按 [README](../README.md) 里的五分钟试用生成，然后由管理员迁入托管目录。
-- **旧身份**：停止旧 daemon 和所有写者，用离线迁移工具迁入：
+### 2.1 准备一个身份
+
+新身份先在一个 root 控制的暂存目录里生成。`keygen` 生成的是绑定钥匙（root）；日常签名还需要一把单独的热钥匙：
+
+```bash
+sudo install -d -m 700 /root/keyd-staging
+sudo /usr/local/libexec/anp-keyd --root /root/keyd-staging spec \
+  --host agents.example.com --path agents/anp-keyd \
+  --out /root/keyd-staging/identity.spec.json
+sudo /usr/local/libexec/anp-keyd --root /root/keyd-staging keygen \
+  --spec /root/keyd-staging/identity.spec.json
+sudo /usr/local/libexec/anp-keyd --root /root/keyd-staging publish \
+  --did DID --spec /root/keyd-staging/identity.spec.json
+sudo /usr/local/libexec/anp-keyd --root /root/keyd-staging rotate-hot-key \
+  --did DID --label daily
+```
+
+`publish` 打印 DID 文档地址；把文档上传到该地址。`rotate-hot-key` 打印新的热钥匙 kid，记下来。
+
+旧身份（已经停止写入的 vault 或恢复副本）跳过这一步，直接迁移：
 
 ```bash
 sudo python3 deploy/linux/migrate-vault.py --source /root/frozen-vault
@@ -52,34 +90,47 @@ sudo python3 deploy/linux/migrate-vault.py --source /root/frozen-vault \
 
 迁移会核对摘要、逐钥验证恢复副本，并把新 vault 里的钥匙标成未分类、锁定状态。
 
-## 3. 登记、确认角色、发布策略、创建 grant
-
-下面所有管理变更都分两步：`prepare` 生成计划和摘要，你核对后 `commit`。示例里的 UUID 和网址都要换成真实值。
-
-先看当前有什么：
+新身份也走同一条迁移：
 
 ```bash
-anp-keyd admin --config /etc/anp-keyd/service.json list-principals
-anp-keyd admin --config /etc/anp-keyd/service.json catalog
+sudo systemctl stop anp-keyd
+sudo python3 deploy/linux/migrate-vault.py --source /root/keyd-staging --binary /usr/local/libexec/anp-keyd
+sudo python3 deploy/linux/migrate-vault.py --source /root/keyd-staging \
+  --binary /usr/local/libexec/anp-keyd --apply --recovery-dir /root/keyd-recovery
+sudo systemctl start anp-keyd
 ```
 
-### 3.1 确认热钥匙
+`migration.json` 里的 `vault_id` 后面要用到。
 
-从 `catalog` 找到日常签名用的那把钥匙的 `key_id`：
+### 2.2 登记 vault、确认角色
+
+所有管理变更都分两步：`prepare` 生成计划和摘要，你核对后 `commit`。示例里的 UUID、网址和 kid 都要换成真实值。
+
+```bash
+ADMIN="sudo -u operator /usr/local/libexec/anp-keyd admin --config /etc/anp-keyd/service.json"
+```
+
+登记 vault：
 
 ```json
+{"kind":"Catalog","change":{"action":"EnrollVault","vault_id":"VAULT_UUID"}}
+```
+
+```bash
+$ADMIN prepare --file enroll.json
+$ADMIN commit --operation-id PREPARED_OPERATION_UUID --digest PREPARED_DIGEST
+```
+
+从 `$ADMIN catalog` 找到两把钥匙的 `key_id`：绑定钥匙确认成 root，热钥匙确认成 hot：
+
+```json
+{"kind":"Catalog","change":{"action":"ConfirmRole","key_id":"ROOT_KEY_UUID","role":"root"}}
 {"kind":"Catalog","change":{"action":"ConfirmRole","key_id":"HOT_KEY_UUID","role":"hot"}}
 ```
 
-```bash
-anp-keyd admin --config /etc/anp-keyd/service.json prepare --file role.json
-anp-keyd admin --config /etc/anp-keyd/service.json commit \
-  --operation-id PREPARED_OPERATION_UUID --digest PREPARED_DIGEST
-```
+分别 `prepare` 后 `commit`。root 要求钥匙指纹等于 DID 的绑定指纹；hot 要求不是 root 且在 DID 文档的 `authentication` 里。只有确认成 hot 的钥匙才能进入普通 Agent 的 grant。
 
-只有确认成 hot 的钥匙才能进入普通 Agent 的 grant。root 和 recovery 钥匙不用于日常签名。
-
-### 3.2 发布策略
+### 2.3 发布策略
 
 策略规定 Agent 能访问哪里。下面的例子只允许 `GET https://service.example.com/v1/status`：
 
@@ -106,9 +157,9 @@ anp-keyd admin --config /etc/anp-keyd/service.json commit \
 }
 ```
 
-同样 `prepare` 后 `commit`。
+同样 `prepare` 后 `commit`。有请求体的方法（`POST`、`PUT`、`PATCH`）用 `{"mode":"bounded","max_bytes":N}`，上限 16 MiB；无请求体的方法和有请求体的方法要分成两条策略。
 
-### 3.3 创建 grant
+### 2.4 创建 grant
 
 ```json
 {
@@ -125,18 +176,18 @@ anp-keyd admin --config /etc/anp-keyd/service.json commit \
 }
 ```
 
-`expiry` 是 Unix 秒，必须是未来时间，不能写 0。`max_uses` 是这张 grant 最多能签几次。提交后从返回的 effect 里取 `grant_id`，把它交给 Agent。
+`principal_id` 从 `$ADMIN list-principals` 取。`expiry` 是 Unix 秒，必须是未来时间，且不能超过策略的 `max_duration_seconds`。`max_uses` 是这张 grant 最多能签几次。提交后从返回的 effect 里取 `grant_id`，把它交给 Agent。
 
-### 3.4 解锁
+### 2.5 解锁
 
 ```bash
-anp-keyd admin --config /etc/anp-keyd/service.json unlock \
-  --vault-id VAULT_UUID --did DID --kid FULL_KID
+$ADMIN unlock --vault-id VAULT_UUID --did DID --kid FULL_KID
+$ADMIN status
 ```
 
-口令由管理 CLI 从终端读取，不经过 Agent、MCP 或聊天。解锁只让钥匙可用，不会自己产生授权；授权来自上面的 grant。
+口令由管理 CLI 从终端读取，不经过 Agent、MCP 或聊天。解锁只让钥匙可用，不会自己产生授权；授权来自上面的 grant。`status` 应报告 `signing_available=true`。
 
-## 4. 启动 Agent
+## 3. 启动 Agent
 
 确认 Agent 账号：
 
@@ -160,7 +211,7 @@ anp-keyd mcp --config /etc/anp-keyd/service.json
 
 MCP 需要构建时启用 `mcp` feature。工具参数不能覆盖配置文件、socket、DID 或 kid。
 
-## 5. 日常：失败、重试、撤销
+## 4. 日常：失败、重试、撤销
 
 - 每个新操作自己生成并保存 `request_id`。重试时复用原 ID；不要因为超时换一个新 ID 重签。
 - `outcome_unknown` 不表示没签名。停止自动重试，先查询状态并核对远端结果。
@@ -177,7 +228,7 @@ MCP 需要构建时启用 `mcp` feature。工具参数不能覆盖配置文件�
 
 服务重启后所有 grant 失效、钥匙锁定、未完成批准作废。需要你重新解锁和建权，不会自动恢复。
 
-## 6. macOS 预览和 SE
+## 5. macOS 预览和 SE
 
 macOS 提供独立账号的本机预览，始终 `protected_supported=false`。Secure Enclave 登录助手、真实注销/休眠/整机重启、正式签名和持久 SE 仍需要单独验收，见[SE 说明](macos/SE-SESSION.md)。
 

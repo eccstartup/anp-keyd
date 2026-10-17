@@ -21,6 +21,15 @@ with an explicit device grant:
 ./install.sh --tpm-device
 ```
 
+To create the identity, policy, grant and first unlock in the same run, add the
+bootstrap options; both the binding key and the hot key are generated with the
+TPM backend:
+
+```sh
+./install.sh --tpm-device --bootstrap --did-host agents.example.com \
+  --target https://api.example.com/v1/status
+```
+
 Use `--tpm-device /dev/tpmrm0` to name the device explicitly. The manual
 reviewed-release path is:
 

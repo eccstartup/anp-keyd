@@ -28,13 +28,26 @@ usage() {
   --dry-run           只打印计划，不做任何修改
   -h, --help          显示本帮助
 
+初始化身份和 grant（仅 Linux，安装后在同一个命令里继续）:
+  --bootstrap         安装后创建新身份、迁入受保护状态并创建一张 grant
+  --did-host HOST     DID 文档所在域名，例如 agents.example.com
+  --did-path PATH     DID 路径，默认 agents/anp-keyd
+  --target URL        Agent 要访问的完整 HTTPS URL
+  --method METHOD     允许的方法，可重复，默认 GET
+  --body-bytes N      有请求体的方法允许的最大字节数，默认 1048576
+  --grant-days N      grant 有效天数，默认 1
+  --max-uses N        grant 最多签名次数，默认 100
+
 示例:
   ./install.sh
   ./install.sh --agent-user agent-a --agent-user agent-b
   ./install.sh --tpm-device
+  ./install.sh --bootstrap --did-host agents.example.com \
+    --target https://api.example.com/v1/status
   sudo ./install.sh --binary /root/anp-keyd --sha256 VERIFIED_SHA256 --admin-user operator
 
-安装只创建空服务。身份、解锁口令和 grant 仍需管理员按 deploy/LOCAL-USE.md 完成。
+不带 --bootstrap 时只创建空服务。身份、策略和 grant 也可以之后按
+deploy/LOCAL-USE.md 手动完成。口令始终由你在这个终端输入，不经过 Agent。
 EOF
 }
 
@@ -47,6 +60,14 @@ BINARY=""
 SHA256=""
 DRY_RUN=0
 ROOT_PHASE=0
+BOOTSTRAP=0
+DID_HOST=""
+DID_PATH="agents/anp-keyd"
+TARGET=""
+METHODS=()
+BODY_BYTES=1048576
+GRANT_DAYS=1
+MAX_USES=100
 
 while (($#)); do
   case "$1" in
@@ -62,6 +83,29 @@ while (($#)); do
       else
         TPM_DEVICE="/dev/tpmrm0"; shift
       fi ;;
+    --bootstrap)
+      BOOTSTRAP=1; shift ;;
+    --did-host)
+      [[ $# -ge 2 ]] || die "--did-host 需要一个域名"
+      DID_HOST="$2"; shift 2 ;;
+    --did-path)
+      [[ $# -ge 2 ]] || die "--did-path 需要一个路径"
+      DID_PATH="$2"; shift 2 ;;
+    --target)
+      [[ $# -ge 2 ]] || die "--target 需要一个 URL"
+      TARGET="$2"; shift 2 ;;
+    --method)
+      [[ $# -ge 2 ]] || die "--method 需要一个方法"
+      METHODS+=("$2"); shift 2 ;;
+    --body-bytes)
+      [[ $# -ge 2 ]] || die "--body-bytes 需要一个数字"
+      BODY_BYTES="$2"; shift 2 ;;
+    --grant-days)
+      [[ $# -ge 2 ]] || die "--grant-days 需要一个数字"
+      GRANT_DAYS="$2"; shift 2 ;;
+    --max-uses)
+      [[ $# -ge 2 ]] || die "--max-uses 需要一个数字"
+      MAX_USES="$2"; shift 2 ;;
     --binary)
       [[ $# -ge 2 ]] || die "--binary 需要一个路径"
       BINARY="$2"; shift 2 ;;
@@ -104,6 +148,30 @@ if [[ "$PLATFORM" == macos ]]; then
   [[ -z "$TPM_DEVICE" ]] || die "macOS 不使用 --tpm-device"
 fi
 
+if ((BOOTSTRAP)); then
+  [[ "$PLATFORM" == linux ]] || die "--bootstrap 目前只支持 Linux 受保护部署；macOS 预览请按 deploy/LOCAL-USE.md 手动初始化"
+  [[ "$GRANT_DAYS" =~ ^[0-9]+$ ]] || die "--grant-days 必须是整数"
+  [[ "$MAX_USES" =~ ^[0-9]+$ ]] || die "--max-uses 必须是整数"
+  [[ "$BODY_BYTES" =~ ^[0-9]+$ ]] || die "--body-bytes 必须是整数"
+  if ((ROOT_PHASE == 0 && DRY_RUN == 0)); then
+    if [[ -z "$DID_HOST" ]]; then
+      [[ -t 0 ]] || die "--bootstrap 需要 --did-host，或在终端里运行以便询问"
+      read -r -p "DID 文档所在域名（例如 agents.example.com）: " DID_HOST
+    fi
+    [[ -n "$DID_HOST" ]] || die "DID 域名不能为空"
+    if [[ -z "$TARGET" ]]; then
+      [[ -t 0 ]] || die "--bootstrap 需要 --target，或在终端里运行以便询问"
+      read -r -p "Agent 要访问的完整 URL（例如 https://api.example.com/v1/status）: " TARGET
+    fi
+    [[ -n "$TARGET" ]] || die "目标 URL 不能为空"
+  fi
+  if ((DRY_RUN == 0)); then
+    [[ "$TARGET" == https://* ]] || die "--target 必须以 https:// 开头"
+  fi
+elif [[ -n "$DID_HOST$TARGET" || ${#METHODS[@]} -gt 0 ]]; then
+  die "身份初始化选项需要同时带上 --bootstrap"
+fi
+
 if [[ -z "$BINARY" ]]; then
   command -v cargo >/dev/null 2>&1 \
     || die "未找到 cargo。先安装 Rust（https://rustup.rs），或用 --binary 指定已构建的程序；也可以不用 sudo 直接运行 ./install.sh，脚本会先构建再提权"
@@ -135,11 +203,18 @@ Agent:      ${AGENT_USERS[*]}
 程序:       $BINARY
 SHA-256:    $SHA256
 TPM 设备:   ${TPM_DEVICE:-无}
+身份初始化: $( ((BOOTSTRAP)) && echo "是" || echo "否" )$(
+  if ((BOOTSTRAP)); then
+    printf '\nDID 域名:   %s\nDID 路径:   %s\n目标 URL:   %s\n方法:       %s\n有效天数:   %s\n次数上限:   %s\n' \
+      "${DID_HOST:-（会询问）}" "$DID_PATH" "${TARGET:-（会询问）}" "${METHODS[*]:-GET}" "$GRANT_DAYS" "$MAX_USES"
+  fi
+)
 
 将执行:
   - 创建缺失的 Agent 账号（Linux: anp-agent；macOS: _anpagent）
   - 安装 root 持有的程序、配置和 systemd/launchd 服务
   - 启动服务并做只读检查
+$( ((BOOTSTRAP)) && printf '  - 生成新身份，离线迁入受保护状态，创建策略和 grant，并解锁\n  - 口令由你在这个终端输入\n' )
 
 尚未修改任何内容（--dry-run）。
 EOF
@@ -151,6 +226,11 @@ if ((EUID != 0)); then
   args=(--_root --admin-user "$ADMIN_USER" --binary "$BINARY" --sha256 "$SHA256")
   for agent in "${AGENT_USERS[@]}"; do args+=(--agent-user "$agent"); done
   [[ -n "$TPM_DEVICE" ]] && args+=(--tpm-device "$TPM_DEVICE")
+  if ((BOOTSTRAP)); then
+    args+=(--bootstrap --did-host "$DID_HOST" --did-path "$DID_PATH" --target "$TARGET"
+      --body-bytes "$BODY_BYTES" --grant-days "$GRANT_DAYS" --max-uses "$MAX_USES")
+    for method in "${METHODS[@]}"; do args+=(--method "$method"); done
+  fi
   exec sudo -- "$SCRIPT_DIR/install.sh" "${args[@]}"
 fi
 
@@ -199,7 +279,21 @@ case "$PLATFORM" in
     echo
     echo "安装完成。服务已启动，状态目录 /var/lib/anp-keyd。"
     echo "管理员: $ADMIN_USER    Agent: ${AGENT_USERS[*]}"
-    echo "下一步（身份、热钥匙、策略、grant、解锁）见 deploy/LOCAL-USE.md。"
+
+    if ((BOOTSTRAP)); then
+      hardware=none
+      [[ -n "$TPM_DEVICE" ]] && hardware=tpm
+      args=(python3 "$REPO_ROOT/deploy/linux/bootstrap.py"
+        --config /etc/anp-keyd/service.json --binary "$BIN"
+        --admin-user "$ADMIN_USER" --agent-user "${AGENT_USERS[0]}"
+        --did-host "$DID_HOST" --did-path "$DID_PATH" --target "$TARGET"
+        --body-bytes "$BODY_BYTES" --grant-days "$GRANT_DAYS" --max-uses "$MAX_USES"
+        --hardware "$hardware")
+      for method in "${METHODS[@]}"; do args+=(--method "$method"); done
+      "${args[@]}"
+    else
+      echo "下一步（身份、热钥匙、策略、grant、解锁）见 deploy/LOCAL-USE.md。"
+    fi
     ;;
 
   macos)

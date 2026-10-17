@@ -63,13 +63,14 @@ anp-keyd --root /tmp/keyd-lab sign --did 你的DID \
 
 ## 正式使用
 
-Linux 上把服务、管理员和 Agent 分成三个系统账号，Agent 读不到私钥和状态。步骤：
+Linux 上把服务、管理员和 Agent 分成三个系统账号，Agent 读不到私钥和状态。一条命令完成安装、身份、策略、grant 和解锁：
 
-1. [一条命令安装服务](/guide/install)
-2. 准备 did:wba 身份
-3. 登记身份、确认热钥匙、发布策略
-4. 创建 grant
-5. 解锁，让 Agent 开始签名
+```bash
+./install.sh --bootstrap --did-host agents.example.com \
+  --target https://api.example.com/v1/status
+```
+
+命令会打印 DID 文档地址和 grant 编号。上传 DID 文档、把 grant 交给 Agent，就可以开始签名。详细说明见[安装](/guide/install)，手动分步完成见[本机使用](/guide/local-use)。
 
 ## 从哪儿开始
 

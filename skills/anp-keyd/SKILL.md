@@ -11,13 +11,24 @@ Linux v2 通过独立 OS UID 认证主体，daemon 执行 exact-key grant、目�
 
 安装需要 root，属于管理员动作。只有在人类明确批准、并临时提供 sudo 时，Agent 才能执行；否则把下面这一条命令交给人类，在自己的终端里运行。身份口令、解锁口令和 sudo 口令都不进入聊天、MCP、argv 或环境变量。
 
-在人类审阅过的仓库根目录运行一条命令：
+在人类审阅过的仓库根目录运行一条命令，安装服务并完成身份、策略、grant 和第一次解锁：
+
+```bash
+./install.sh --bootstrap --did-host agents.example.com \
+  --target https://api.example.com/v1/status
+```
+
+`--did-host` 是 DID 文档将来发布的域名，`--target` 是 Agent 要访问的完整 HTTPS 地址；省略时脚本会在终端里询问。执行中会多次要求人类输入口令：绑定钥匙、热钥匙、迁入受保护状态和解锁。口令由 anp-keyd 直接从 `/dev/tty` 读取；Agent 不要代输、捕获、转发或保存口令。
+
+成功后打印 DID 文档地址、vault、grant、有效期、恢复材料目录和 Agent 请求示例。把 DID 文档上传到打印的地址，把 grant 交给 Agent。
+
+只安装空服务、之后按 `deploy/LOCAL-USE.md` 手动初始化：
 
 ```bash
 ./install.sh
 ```
 
-它会构建 release、计算 SHA-256、创建缺失的 Agent 账号（Linux 默认 `anp-agent`，macOS 为 `_anpagent`）、安装 root 持有的程序和服务，然后启动并做只读检查。先看计划、不改系统：
+先看计划、不改系统：
 
 ```bash
 ./install.sh --dry-run
@@ -27,8 +38,11 @@ Linux v2 通过独立 OS UID 认证主体，daemon 执行 exact-key grant、目�
 
 ```bash
 ./install.sh --admin-user operator --agent-user agent-a
-./install.sh --tpm-device
+./install.sh --tpm-device --bootstrap --did-host agents.example.com \
+  --target https://api.example.com/v1/status
 ```
+
+`--method` 可以重复，默认 `GET`；`--body-bytes`、`--grant-days`、`--max-uses` 限制请求体大小、有效天数和签名次数。指定多个 Agent 账号时，`--bootstrap` 只为第一个账号创建 grant。
 
 安装后确认：
 
@@ -38,7 +52,7 @@ sudo -u ADMIN_USER /usr/local/libexec/anp-keyd admin \
   --config /etc/anp-keyd/service.json status
 ```
 
-macOS 使用同一条命令安装本机预览，始终 `protected_supported=false`。安装只创建空服务；身份、热钥匙、策略、grant 和第一次解锁仍由管理员按 `deploy/LOCAL-USE.md` 完成。安装完成后必须收回 Agent 账号的 sudo，否则受保护边界不成立。
+macOS 使用同一条命令安装本机预览，始终 `protected_supported=false`。macOS 不支持 `--bootstrap`；身份和授权按 `deploy/macos/AGENT.md` 手动完成。安装完成后必须收回 Agent 账号的 sudo，否则受保护边界不成立。
 
 ## 普通 Agent 工作流
 

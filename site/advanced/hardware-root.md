@@ -42,7 +42,14 @@ anp-keyd keygen --spec mybot.spec.json --hardware secure-enclave
 ./install.sh --tpm-device
 ```
 
-安装器只开放 `/dev/tpmrm0`，并把 TPM 工具固定到该设备。
+同一次运行里完成身份、策略、grant 和解锁：
+
+```bash
+./install.sh --tpm-device --bootstrap --did-host agents.example.com \
+  --target https://api.example.com/v1/status
+```
+
+绑定钥匙和热钥匙都会用 TPM 后端生成。安装器只开放 `/dev/tpmrm0`，并把 TPM 工具固定到该设备。
 
 已经验证的范围：设备授权、systemd 沙箱、跨进程封存/打开、跨 UID 拒绝、删除密钥后无法再打开。
 
