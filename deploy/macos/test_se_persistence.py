@@ -126,14 +126,49 @@ class PersistenceHarness(unittest.TestCase):
             with self.assertRaisesRegex(harness.AcceptanceError, 'digest mismatch'):
                 harness.verify_binary(Path(binary), args.sha256, TEAM, APP)
 
-    def test_second_uid_requires_root(self):
+    def test_second_uid_denial_uses_the_other_account(self):
         with tempfile.TemporaryDirectory() as directory:
             binary = script(directory, 'se-persistence', FAKE)
             args = self.args(binary)
-            args.other_uid = 501
-            with patch.object(harness.os, 'geteuid', return_value=501):
-                with self.assertRaisesRegex(harness.AcceptanceError, 'root'):
+            args.other_uid = 502
+            real_run = harness.run
+
+            def fake_run(command, *arguments, uid=None, timeout=120):
+                if uid == 502:
+                    return SimpleNamespace(returncode=1, stdout=b'',
+                                           stderr=b'no key with that label')
+                return real_run(command, *arguments, timeout=timeout)
+
+            with patch.object(harness, 'verify_binary',
+                              return_value={'signature_prerequisites_passed': True}):
+                with patch.object(harness.os, 'geteuid', return_value=501):
+                    with patch.object(harness, 'run', side_effect=fake_run):
+                        report = harness.accept(args)
+        self.assertTrue(report['cross_uid_denial'])
+        self.assertEqual(report['phases']['cross_uid_denied'], 'ok')
+
+    def test_root_invocation_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = script(directory, 'se-persistence', FAKE)
+            args = self.args(binary)
+            with patch.object(harness.os, 'geteuid', return_value=0):
+                with self.assertRaisesRegex(harness.AcceptanceError,
+                                            'login data protection keychain'):
                     harness.accept(args)
+
+    def test_other_uid_is_run_through_sudo(self):
+        account = SimpleNamespace(pw_name='other', pw_uid=502, pw_gid=20, pw_dir='/Users/other')
+        result = SimpleNamespace(returncode=1, stdout=b'', stderr=b'no key with that label')
+        with patch.object(harness.os, 'geteuid', return_value=501):
+            with patch.object(harness.pwd, 'getpwuid', return_value=account):
+                with patch.object(harness.subprocess, 'run', return_value=result) as started:
+                    self.assertIs(harness.run(Path('/tmp/probe'), 'open', '/tmp/state', uid=502),
+                                  result)
+        command = started.call_args[0][0]
+        self.assertEqual(command[:5],
+                         ['/usr/bin/sudo', '-u', 'other', '--', '/tmp/probe'])
+        self.assertEqual(command[5:], ['open', '/tmp/state'])
+        self.assertNotIn('preexec_fn', started.call_args[1])
 
 
 if __name__ == '__main__':

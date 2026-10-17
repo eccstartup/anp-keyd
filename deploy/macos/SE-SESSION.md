@@ -154,14 +154,28 @@ binary and not a release command:
 ```sh
 cargo build --locked --release --features mcp,hardware-se,se-acceptance \
   --example se-persistence
-python3 deploy/macos/se-persistence.py \
+sha256sum target/release/examples/se-persistence
+python3 deploy/macos/se-release.py sign-example --team-id TEAMID \
+  --application-id TEAMID.org.example.keyd \
+  --identity 'Developer ID Application: ...' \
   --binary target/release/examples/se-persistence \
-  --sha256 VERIFIED_SHA256 --team-id TEAMID \
+  --sha256 VERIFIED_UNSIGNED_EXAMPLE_SHA256 \
+  --out target/se-release/se-persistence.signed
+python3 deploy/macos/se-persistence.py \
+  --binary target/se-release/se-persistence.signed \
+  --sha256 VERIFIED_SIGNED_EXAMPLE_SHA256 --team-id TEAMID \
   --application-id TEAMID.org.example.keyd \
   --other-uid 501 \
-  --unsigned-binary /path/to/an-unsigned-se-persistence \
-  --unsigned-sha256 VERIFIED_UNSIGNED_SHA256
+  --unsigned-binary target/release/examples/se-persistence \
+  --unsigned-sha256 VERIFIED_UNSIGNED_EXAMPLE_SHA256
 ```
+
+Run this from the login user's own terminal, never through `sudo`: root has no
+login data protection keychain. `--other-uid` makes sudo run only the denial
+probe as that second user, so the sudo prompt may appear once. On macOS the
+`keychain-access-groups` entitlement is authorized by the code signature and
+Team ID (TN3137), so the bare example is signed with the same entitlement set
+as the helper; it does not embed the provisioning profile.
 
 It creates a persistent SE key in process A, reopens it in a new process B,
 proves another UID is denied by the keychain, deletes the key and proves the old

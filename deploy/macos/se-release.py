@@ -435,6 +435,68 @@ def build(args):
     return report
 
 
+def sign_example(args):
+    """Sign a bare acceptance example with the reviewed entitlement set.
+
+    A macOS command-line tool does not need a provisioning profile for
+    `keychain-access-groups`: TN3137 makes it a code-signing entitlement tied to
+    the Team ID. The example still gets the same exact entitlement set as the
+    helper so the probe exercises the production keychain profile.
+    """
+    validate_identity_fields(args.team_id, args.application_id)
+    identity = resolve_identity(args.identity)
+    profile = None
+    if args.profile:
+        profile = profile_metadata(args.profile, args.team_id, args.application_id)
+    source = args.binary.resolve(strict=True)
+    if not source.is_file() or source.is_symlink():
+        raise ReleaseError(f'candidate must be a regular file: {source}')
+    source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    if not re.fullmatch(r'[0-9a-f]{64}', args.sha256):
+        raise ReleaseError('expected a lowercase SHA-256')
+    if source_digest != args.sha256:
+        raise ReleaseError('candidate digest mismatch')
+    out = args.out.resolve()
+    if out.exists():
+        raise ReleaseError(f'refusing to replace an existing output: {out}')
+    out.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, out)
+    os.chmod(out, 0o755)
+    entitlement_path = out.parent / (out.name + '.entitlements')
+    entitlement_path.write_bytes(plistlib.dumps(entitlements(args.team_id, args.application_id)))
+    signed = run([
+        '/usr/bin/codesign', '--force', '--options', 'runtime', '--timestamp',
+        '--entitlements', str(entitlement_path), '--sign', identity['sha1'], str(out),
+    ], env=ENV, timeout=300)
+    if signed.returncode:
+        out.unlink(missing_ok=True)
+        raise ReleaseError('codesign failed: ' + signed.stderr.decode(errors='replace').strip())
+    digest = hashlib.sha256(out.read_bytes()).hexdigest()
+    try:
+        report = PREFLIGHT.inspect(out, digest, 'user-session', args.team_id, args.application_id)
+    except (ValueError, OSError, subprocess.SubprocessError):
+        out.unlink(missing_ok=True)
+        raise
+    if not report['signature_prerequisites_passed']:
+        out.unlink(missing_ok=True)
+        raise ReleaseError('signature prerequisites failed: ' + '; '.join(report['blockers']))
+    return {
+        'schema': 1,
+        'binary': str(out),
+        'source_sha256': source_digest,
+        'candidate_sha256': digest,
+        'team_id': args.team_id,
+        'application_identifier': args.application_id,
+        'identity': identity,
+        'profile': profile,
+        'profile_embedded': False,
+        'signature_prerequisites_passed': True,
+        'hardware_acceptance_complete': False,
+        'protected_supported': False,
+        'pending': PENDING,
+    }
+
+
 def install(args):
     if os.geteuid() != 0:
         raise ReleaseError('installation requires root')
@@ -495,7 +557,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     subparsers = parser.add_subparsers(dest='command')
-    for name, handler in [('plan', plan), ('build', build), ('install', install)]:
+    for name, handler in [('plan', plan), ('build', build),
+                          ('sign-example', sign_example), ('install', install)]:
         sub = subparsers.add_parser(name)
         sub.add_argument('--team-id', required=True)
         sub.add_argument('--application-id', required=True)
@@ -510,6 +573,14 @@ def main():
             sub.add_argument('--out', type=Path, default=Path('target/se-release/ANPKeyd.app'))
             sub.add_argument('--binary', type=Path, help='use an already built candidate')
             sub.add_argument('--require-notarized', action='store_true')
+        if name == 'sign-example':
+            sub.add_argument('--identity', required=True)
+            sub.add_argument('--profile', type=Path,
+                             help='optional: validate the renewal/expiry of the reviewed profile')
+            sub.add_argument('--binary', type=Path, required=True)
+            sub.add_argument('--sha256', required=True)
+            sub.add_argument('--out', type=Path,
+                             default=Path('target/se-release/se-persistence.signed'))
         if name == 'install':
             sub.add_argument('--bundle', type=Path, required=True)
             sub.add_argument('--profile-sha256')
@@ -531,7 +602,7 @@ def main():
         require_notarized=a.require_notarized, previous=a.previous))
     args = parser.parse_args()
     if not args.command:
-        parser.error('choose plan, build, verify or install')
+        parser.error('choose plan, build, sign-example, verify or install')
     try:
         report = args.handler(args)
     except (ReleaseError, ValueError, OSError, plistlib.InvalidFileException) as error:

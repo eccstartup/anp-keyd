@@ -56,25 +56,31 @@ class AcceptanceError(Exception):
 
 def run(binary, *arguments, uid=None, timeout=120):
     environment = os.environ.copy()
-    preexec = None
-    if uid is not None:
+    if uid is not None and uid != os.geteuid():
         try:
             account = pwd.getpwuid(uid)
         except KeyError as error:
             raise AcceptanceError(f'no such UID: {uid}') from error
         if account.pw_uid == 0:
             raise AcceptanceError('the second UID must be non-root')
-        environment = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin',
-                       'HOME': account.pw_dir, 'USER': account.pw_name}
-
-        def preexec():
-            os.setgroups([])
-            os.setgid(account.pw_gid)
-            os.setuid(account.pw_uid)
+        # The primary process stays in the operator's login session: root has
+        # no login data protection keychain. The denial probe only needs the
+        # binary to run under the other account, so ask sudo for that one
+        # process. A password prompt, if needed, appears on the operator's tty.
+        command = ['/usr/bin/sudo', '-u', account.pw_name, '--',
+                   str(binary), *map(str, arguments)]
+        try:
+            result = subprocess.run(command, capture_output=True, timeout=timeout)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise AcceptanceError(f'could not run as {account.pw_name}: {error}') from error
+        error = result.stderr.decode(errors='replace').strip()
+        if result.returncode and error.startswith('sudo:'):
+            raise AcceptanceError(f'could not switch to UID {uid}: {error}')
+        return result
 
     try:
         return subprocess.run([str(binary), *map(str, arguments)], env=environment,
-                              capture_output=True, timeout=timeout, preexec_fn=preexec)
+                              capture_output=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as error:
         raise AcceptanceError(f'{binary} failed to run: {error}') from error
 
@@ -115,8 +121,10 @@ def verify_binary(binary, digest, team, application):
 
 def accept(args):
     RELEASE.validate_identity_fields(args.team_id, args.application_id)
-    if args.other_uid is not None and os.geteuid() != 0:
-        raise AcceptanceError('--other-uid requires root (credential switching)')
+    if os.geteuid() == 0:
+        raise AcceptanceError(
+            'run this from the login user\'s terminal; root has no login data protection '
+            'keychain. Use --other-uid to have sudo run only the denial probe as a second user')
     if args.unsigned_binary and not args.unsigned_sha256:
         raise AcceptanceError('--unsigned-binary requires its reviewed --unsigned-sha256')
     binary = args.binary.resolve(strict=True)
@@ -265,7 +273,7 @@ def main():
     parser.add_argument('--team-id', required=True)
     parser.add_argument('--application-id', required=True)
     parser.add_argument('--other-uid', type=int,
-                        help='second non-root UID that must be denied; requires root')
+                        help='second non-root UID that must be denied; run through sudo')
     parser.add_argument('--unsigned-binary', type=Path,
                         help='same example built and signed without the SE entitlement')
     parser.add_argument('--unsigned-sha256',
