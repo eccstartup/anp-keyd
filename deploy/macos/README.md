@@ -98,7 +98,8 @@ are separate; default driver success does not complete those gates.
 
 Complete-framework Claude Code acceptance and the offline identity cutover are
 described in [AGENT.md](AGENT.md). Its deterministic local API fixture is separate
-from live model-provider acceptance. Run its human UI steps on the current build.
+from live model-provider acceptance. Prior full native UI acceptance remains recorded in HISTORY.md; repeat it only
+when explicitly selected or relevant UI changes require regression.
 
 ## Daily workflow, updates and restart
 

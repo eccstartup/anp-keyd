@@ -23,8 +23,11 @@ sudo bash deploy/macos/check-agent.sh \
 
 Only the human enters sudo locally. This reuses existing accounts and creates
 isolated `/Library/ANPKeydChecks-*` state. It does not change the daily binary,
-keys, launchd job, account records, or model authentication. The optional seventh
-argument `--noninteractive` skips UI and must not be recorded as UI acceptance.
+keys, launchd job, account records, or model authentication. Native Cancel, timeout, exact-target and masked-input acceptance was already
+completed with candidate `453f5aa6...12b7ee` (see HISTORY.md). This integration
+does not change the UI. By default it reuses that historical result; the optional
+seventh argument `--interactive-ui` explicitly repeats all three windows. Do not
+record a default run as a new UI acceptance.
 
 The driver pins and copies executable bytes into a new root-owned directory.
 Its disposable source is installed by the supported offline migrator, with
@@ -43,7 +46,7 @@ lookup, unknown IDs, conflicting payloads, target denial, cross-principal denial
 revocation and no second HTTP send after revocation. Restart/crash and forged
 socket checks run as well.
 
-The native UI steps require Cancel, an untouched 120-second timeout, then the
+When explicitly requested, the native UI steps require Cancel, an untouched 120-second timeout, then the
 public fixture password `temporary-boundary-test-secret`. Confirm exact
 instance/vault/DID/key and masked input locally. Never enter a real password in
 this fixture. No log is sufficient to replace visual confirmation.

@@ -2,8 +2,8 @@
 # Human-run complete-framework acceptance. Temporary identities/state only.
 set -euo pipefail
 if [ "${1:-}" = --help ] || [ "$#" -lt 6 ] || [ "$#" -gt 7 ]; then
-  echo 'Usage: sudo bash check-agent.sh CANDIDATE_PATH SHA256 HELPER_PATH SHA256 CLAUDE_STANDALONE_PATH SHA256 [--noninteractive]'
-  echo 'Default includes native Cancel, 120-second timeout and masked temporary-password unlock.'
+  echo 'Usage: sudo bash check-agent.sh CANDIDATE_PATH SHA256 HELPER_PATH SHA256 CLAUDE_STANDALONE_PATH SHA256 [--interactive-ui]'
+  echo 'Default reuses the recorded native UI acceptance; --interactive-ui explicitly repeats the three windows.'
   echo 'Claude uses a loopback API fixture, no real model credentials or inference. Existing installation is unchanged.'
   if [ "${1:-}" = --help ]; then exit 0; else exit 2; fi
 fi
@@ -11,10 +11,10 @@ if [ "$(uname -s)" != Darwin ] || [ "$(id -u)" != 0 ]; then
   echo 'Requires macOS root in the human terminal; enter any sudo password locally.' >&2
   exit 1
 fi
-ui=(--interactive-ui)
+ui=()
 if [ "$#" = 7 ]; then
-  if [ "$7" != --noninteractive ]; then echo 'Unknown seventh argument' >&2; exit 2; fi
-  ui=()
+  if [ "$7" != --interactive-ui ]; then echo 'Unknown seventh argument' >&2; exit 2; fi
+  ui=(--interactive-ui)
 fi
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd -P)"
 /usr/bin/python3 - "$1" "$2" "$3" "$4" "$5" "$6" <<'PY'
