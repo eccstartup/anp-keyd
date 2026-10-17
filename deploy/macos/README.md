@@ -10,15 +10,17 @@ protected macOS distribution.
 
 A trusted human administrator, a separate non-login service UID, and a distinct
 non-admin UID for every untrusted Agent. The complete Agent process must run under
-that UID. Root owns the code, config and launchd job; service UID owns protected
-state and sockets. Agents receive only signing transport access and explicit,
-limited hot-key grants. PTY/TTY, executable names and socket-group membership
-cannot replace kernel UID authorization. Same-UID arbitrary code is one principal.
+that UID. Root owns the code, config and launchd job; the service UID owns
+protected state and sockets. Agents receive only signing transport access and
+explicit, limited hot-key grants. PTY/TTY, executable names and socket-group
+membership cannot replace kernel UID authorization. Same-UID arbitrary code is one
+principal.
 
 The installer requires local APFS, symlink-free trusted paths and no extended ACLs
 on protected installation paths. It refuses insecure existing permissions instead
-of loosening checks. PT_DENY_ATTACH/core-dump restrictions are additional defenses;
-root/admin/kernel compromise and all possible OS escape paths are not covered.
+of loosening checks. PT_DENY_ATTACH/core-dump restrictions are additional
+defenses; root/admin/kernel compromise and all possible OS escape paths are not
+covered.
 
 ## Fresh installation: human terminal
 
@@ -41,7 +43,7 @@ read-only installation checks. Enter sudo credentials only in the human terminal
 sudo bash deploy/macos/setup-local.sh YOUR_HUMAN_ACCOUNT VERIFIED_SHA256
 ```
 
-It refuses existing/partial setup. It is not an update or repair command. Do not
+It refuses existing or partial setup. It is not an update or repair command. Do not
 repeat `launchctl bootstrap` after successful setup: the job is already loaded.
 Log out/in to refresh group membership. Initial state contains no user keys.
 Further Agents need their own independently provisioned non-admin UIDs, transport
@@ -59,7 +61,8 @@ sudo /usr/bin/python3 deploy/macos/test-install.py
 Continue with temporary-key acceptance below. Do not manually copy into managed
 state or loosen ownership to make an Agent work. macOS fresh deployment does not
 promise the Linux offline vault-migration tool as a supported macOS workflow;
-the operator-run [Agent and migration procedure](AGENT.md) now provides an offline cutover. Validate it with temporary identities before any real migration.
+the operator-run [Agent and migration procedure](AGENT.md) provides an offline
+cutover. Validate it with temporary identities before any real migration.
 
 ## Temporary-key acceptance: existing installation stays unchanged
 
@@ -79,15 +82,17 @@ installed UID boundary read-only, then runs the installed and candidate binaries
 in separate temporary `/Library/ANPKeydChecks-*` instances. It reuses existing
 accounts; second-subject transport groups are assigned only to test children.
 It creates no accounts and does not update the daily binary/state/config/launchd
-job or read real keys. Root is needed for credential switching and secure temporary
-paths; an assistant's sandbox exemption does not replace the human's sudo password.
+job or read real keys. Root is needed for credential switching and secure
+temporary paths; an assistant's sandbox exemption does not replace the human's
+sudo password.
 
 Tests cover actual hot-key signing with independent upstream verification,
-changed-target rejection, stable-ID retry/conflict, cross-UID grant/document/result
-isolation, PTY/admin/group bypass denial, task-port denial, revocation, loaded-key
-and active-grant invalidation after graceful restart and SIGKILL, and a forged
-socket rejected before any request/password. These are bounded tests, not a proof
-of every host escape or a complete AI framework's account isolation.
+changed-target rejection, stable-ID retry/conflict, cross-UID
+grant/document/result isolation, PTY/admin/group bypass denial, task-port denial,
+revocation, loaded-key and active-grant invalidation after graceful restart and
+SIGKILL, and a forged socket rejected before any request/password. These are
+bounded tests, not proof of every host escape or a complete AI framework's account
+isolation.
 
 Default acceptance is noninteractive. Append `--interactive-ui` to check the
 candidate's native dialog: Cancel, 120-second timeout, then masked input of the
@@ -98,8 +103,7 @@ are separate; default driver success does not complete those gates.
 
 Complete-framework Claude Code acceptance and the offline identity cutover are
 described in [AGENT.md](AGENT.md). Its deterministic local API fixture is separate
-from live model-provider acceptance. Prior full native UI acceptance remains recorded in HISTORY.md; repeat it only
-when explicitly selected or relevant UI changes require regression.
+from live model-provider acceptance.
 
 ## Daily workflow, updates and restart
 
@@ -117,9 +121,9 @@ create a grant. Root/recovery keys cannot be used by ordinary Agent grants.
 See the [daily workflow](../LOCAL-USE.md) for explicit grant creation and running
 the entire Agent under its own UID.
 
-Stopping/restarting leaves configuration/state intact but locks keys and invalidates
-grants. `KeepAlive=false`; crash recovery does not automatically restart/unlock.
-The verified binary updater is plan-only by default:
+Stopping/restarting leaves configuration/state intact but locks keys and
+invalidates grants. `KeepAlive=false`; crash recovery does not automatically
+restart/unlock. The verified binary updater is plan-only by default:
 
 ```sh
 python3 deploy/macos/update-local.py --binary target/release/anp-keyd --sha256 VERIFIED_SHA256
@@ -128,22 +132,22 @@ python3 deploy/macos/update-local.py --binary target/release/anp-keyd --sha256 V
 
 It retains `bin/anp-keyd.previous`; if that slot already exists, review it and add
 `--archive-previous` to the plan and apply commands to preserve it in an exclusive
-SHA-256-named archive first. Existing archives are never overwritten. It atomically replaces
-the binary under the state lock and checks identity/health after restart. Never
-delete a backup or state database merely to make an update succeed. There is no
-automatic rollback, state reset or schema downgrade. Do not automatically install
-an unaccepted SE candidate over a working daily deployment.
+SHA-256-named archive first. Existing archives are never overwritten. It atomically
+replaces the binary under the state lock and checks identity/health after restart.
+Never delete a backup or state database merely to make an update succeed. There is
+no automatic rollback, state reset or schema downgrade. Do not automatically
+install an unaccepted SE candidate over a working daily deployment.
 
 ## Secure Enclave is a separate, unfinished enhancement
 
 The current SE backend needs the user's data protection keychain; signing a
 system LaunchDaemon cannot give it that login context. The foreground
-`admin se-session` bridge is implemented, but formal signing/profile authorization,
-persistent SE keys, real logout/relogin/sleep/reboot and upgrade acceptance remain
-outstanding. The [SE guide](SE-SESSION.md) explains the limits, the
-`se-release.py` bundle tool, the cross-process `se-persistence.py` probe and the
-read-only `se-preflight.py` check. There is no requirement to buy membership or
-install full Xcode to use the ordinary local preview. A CSR alone does not authorize entitlements.
+`admin se-session` bridge is implemented, but formal signing/profile
+authorization, persistent SE keys, real logout/relogin/sleep/reboot and upgrade
+acceptance remain outstanding. The [SE guide](SE-SESSION.md) explains the limits,
+the `se-release.py` bundle tool, the cross-process `se-persistence.py` probe and
+the read-only `se-preflight.py` check. Ordinary local preview does not require a
+paid membership or full Xcode. A CSR alone does not authorize entitlements.
 
 Historical per-stage results, older pending messages and local installation hashes
 are preserved in [HISTORY.md](HISTORY.md); they are not acceptance of your machine.

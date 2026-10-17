@@ -34,13 +34,12 @@ External SDK sources are read-only test inputs, not vendored or modified here.
 
 Compatibility boundary: anp-sdk signRequest produces an ANP-02 login body; awiki did-auth RPC requires a JSON-RPC envelope. The live acceptance verifies the former with the existing SDK verifier and nonce store, and uses the same v2 client with the actual JSON-RPC body for awiki. It does not rewrite already-signed bytes or claim a native SDK login endpoint exists on awiki.
 
-Hot-key resolution requires `@connectx-sdk/core` 0.4.2 or later, the first public
-release containing the fix `4700786` (or that commit itself from the SDK repo). A
-root-signed active document authorizes the exact authentication
+Hot-key resolution requires `@connectx-sdk/core` 0.4.2 or later. A root-signed
+active document authorizes the exact authentication
 method; the DID fingerprint binds the proof key rather than every hot key.
 Older SDK builds still reject legitimate hot methods. There is no root-key fallback.
 
-`test-sdk.mjs` now requires `resolveVerificationKey` and `verifyAnpLoginRequest`
+`test-sdk.mjs` requires `resolveVerificationKey` and `verifyAnpLoginRequest`
 to succeed without a supplied public key, and checks replay, wrong nonce and body
 tampering. The SDK's own tests cover wrong kid, withheld authentication, forged
 root proof, expiry, relative methods, network resolution and key substitution.

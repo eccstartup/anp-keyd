@@ -15,10 +15,9 @@ __pycache__/
 .venv/
 node_modules/
 
-# VitePress build/cache and the page generated from docs/DESIGN.md.
+# VitePress build/cache output.
 site/.vitepress/dist/
 site/.vitepress/cache/
-site/design/index.md
 
 # Local credentials and runtime artifacts. Test fixtures remain trackable.
 .env

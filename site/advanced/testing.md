@@ -1,6 +1,10 @@
-# 测试与向量
+# 测试与验证边界
 
-这一页是给**想验一遍**的人看的。一个安全工具说"它挡得住 X",那句话本身不是证据;证据在测试里,而不同测试失败的含义完全不同。
+这一页写给要改代码或判断“这个结论能不能信”的人。
+
+不同层级的测试回答不同问题：单元测试证明函数逻辑，容器测试证明进程协作，真机测试才证明安装权限和硬件。任何一层通过，都不能代替另一层。
+
+## 先跑本地回归
 
 ```bash
 RUST_LOG=info cargo test --locked --offline
@@ -8,75 +12,59 @@ RUST_LOG=info cargo test --locked --offline --features mcp,hardware-software
 cargo clippy --locked --offline --all-targets --features mcp,hardware-software -- -D warnings
 ```
 
-## 六类测试,失败的含义不一样
+离线命令要求依赖已经缓存。
 
-| 文件 | 回答的问题 | 红了意味着 |
+## 各层能证明什么
+
+| 层级 | 能证明 | 不能代替 |
 |---|---|---|
-| `src/**` 的单元测试 | 这个函数在它的假设下对不对 | 代码写错了 |
-| `tests/cli.rs` | 真起一个二进制、真在一个终端上敲命令 | 给人看的那一层坏了 |
-| `tests/signature_end_to_end.rs` | 整条路走通没有 | 接口对不上了 |
-| `tests/negative.rs` | **产品承诺的那十件事今天还成立吗** | **有人把一道墙拆了** |
-| `tests/tpm.rs` | 显式 TPM 环境：封装、解封和根丢失拒绝；可能使用 swtpm | 第三路熵那一层坏了 |
-| `tests/vectors/` + `tests/vectors.rs` | 外部标准和兄弟实现还认不认我们的实现 | 看它是哪一类出处,见下 |
+| 单元测试与固定向量 | 推导、加密、签名基、请求规范化、策略、事务失败路径 | 安装权限和真实对端 |
+| 多进程、多账号 | socket 互认、管理拒绝、跨主体隔离、配额竞态、MCP | systemd 沙箱和整机重启 |
+| systemd 真机 | 安装、隔离、自动恢复、真实开关机、损坏状态拒绝 | 其他平台或实体硬件 |
+| 真实服务与 SDK | 注册、热钥匙认证、nonce/body/过期拒绝、轮换、恢复 | 没走过的高层 SDK API |
+| 实体硬件 | 权限、持久化、复制、故障 | 软件替身或模拟器 |
 
-`tests/negative.rs` 那一行是这份表里最要紧的:**它红了不是"有个功能坏了",是"有一道承诺被拆了"。**
+容器通过不等于你的宿主通过；模拟器通过不等于实体芯片通过。
 
-## 另有四个单一命题
+## 测试文件分别管什么
 
-每个一个文件,一个文件说一句话:
-
-| 文件 | 命题 |
+| 文件 | 回答的问题 |
 |---|---|
-| `tests/probe.rs` | 体检说的都是真的 |
-| `tests/mcp.rs` | 开发 MCP 四个、保护 MCP 五个工具及各自参数边界 |
-| `tests/hardware.rs` | 硬件绑定那条路的**形状**:版本分派、AAD、硬件不在、口令错、拒绝降级 |
-| `tests/no_key_material_on_disk.rs` | 走完一遍之后,磁盘上扫不出任何密钥材料 |
+| `src/**` 单元测试 | 这个函数在它的假设下对不对 |
+| `tests/cli.rs` | 真启动二进制、在终端里敲命令，这一层还正常吗 |
+| `tests/signature_end_to_end.rs` | 整条签名链路还通吗 |
+| `tests/negative.rs` | 产品承诺的边界今天还成立吗 |
+| `tests/tpm.rs` | TPM 封装、解封和根丢失拒绝 |
+| `tests/vectors/` + `tests/vectors.rs` | 外部标准还认不认我们的实现 |
+| `tests/probe.rs` | 体检报告说的是不是真的 |
+| `tests/mcp.rs` | MCP 工具和参数边界 |
+| `tests/hardware.rs` | 硬件绑定路径的形状 |
+| `tests/no_key_material_on_disk.rs` | 跑完一遍后，磁盘上有没有密钥材料 |
 
-## `tests/vectors/`:红了该怀疑谁
+## 向量测试失败了该怀疑谁
 
-这个目录里的 JSON 每一条都带 `_source` 写明出处。**出处有两类,失败时该怀疑谁取决于它是哪一类:**
+`tests/vectors/` 里每条 JSON 都带 `_source`，写明出处。分两类：
 
-::: danger 权威文本的抄本
-RFC 8032、7638、8037、9421、8785 —— 抄自哪一节都写着。
+- **标准文本的抄本**：RFC 8032、7638、8037、9421、8785 等。失败先怀疑实现。改向量让测试变绿，等于删掉这个测试存在的理由。
+- **兄弟实现算出来的值**：例如 `anp_sdk_*`。失败说明两个实现分家了，两边仓库都要看，对方可能才是对的。
 
-**红了先怀疑实现。** 改一个向量让测试变绿,等于把这个文件存在的理由删掉。
-:::
+## `hardware-software` 是什么
 
-::: warning 兄弟实现自己算出来的值
-`anp_sdk_*`,出处在它自己的测试里。
+它把“封起来的熵”存在文件里，而不是芯片里。作用只是让没有硬件的机器也能测 v2 信封格式：版本分派、AAD、拒绝降级。
 
-**红了是两个实现分家了**,得先去两边的仓库里各读一遍 —— 因为期望值那一串在别人家也是断言,**它有可能才是对的一方**。
-:::
+`probe` 不会把它当成“这台机器有硬件根”。`tests/hardware.rs` 验的是路径形状，不是“HS 真的出不了这台机器”。
 
-这条规则写在 `tests/vectors.rs` 的文件头。
+## 硬件按平台单独验收
 
-## 关于测试替身 `hardware-software`
+- **Secure Enclave**：芯片 ECDH 路径可用；持久化还差 Apple 签发的身份、profile 和主机生命周期验收。
+- **TPM**：部署范围已验收；三条硬件测试标记为 `#[ignore]`，需要显式运行。实体芯片保护声明仍需真机验收。
 
-它是一个**假后端**:把"封起来的熵"存在一个文件里,而不是芯片里。
+平台说明和未验项见[硬件根](/advanced/hardware-root)。
 
-它存在的唯一理由是让 v2 记录格式在没有硬件的机器上真的能被测(版本分派、AAD、拒绝降级那一整块)。**它自己承认自己不是硬件**,所以 `probe` 不会拿它当"这台机器有硬件根"的证据。
+## 部署与故障验收
 
-`tests/hardware.rs` 用软件替身跑,所以它验的是**形状**而不是"HS 真的出不了这台机器" —— 最后那一条只有真后端能验,文件头把这条缺口写明了。它在默认构建里只跑三条(拒绝降级那几条),开了 `hardware-software` 才是七条。
+`deploy/linux` 下的 `test-boundary`、`systemd-checks`、`systemd-boot-check`、`anp-service-acceptance` 只对显式隔离环境操作；故障注入不在日常主机执行。
 
-## 实体硬件按平台单独验收
+macOS 使用 `check-local-use.sh`、`check-agent.sh` 和 `se-persistence.py`，同样只对临时实例操作。
 
-all-features 会请求启用所有 feature，但平台 cfg 只编译适用的后端；它不会自动运行 ignored 的硬件测试，也不适合作为发行构建命令。
-
-- **SE 的 ECDH 在真芯片上验过**,持久化还差一个 Apple 签发的签名身份。这一步不是代码问题,见[硬件根](/advanced/hardware-root)。
-- **TPM 那条在 Linux 上编过、也跑过 `swtpm` 的端到端**(`tests/tpm.rs`)。三条都标了 `#[ignore]`,要 `-- --ignored` 才跑,原因写在那个文件头。
-
-两边各自的缺口都记在设计说明第十节里,没有藏起来。
-
-## Linux v2 部署与故障验收
-
-本地 Rust 回归不能代替多 UID、安装权限、systemd 沙箱、真实整机重启及服务兼容。deploy/linux 下的 test-boundary、systemd-checks、systemd-boot-check 和 anp-service-acceptance 使用显式隔离环境验收；故障注入不在日常主机执行。
-
-已有 systemd 主机验收已通过，实体硬件及 macOS 正式保护发行仍未验收；macOS 独立 UID 预览已有临时实例验收。测试使用临时身份，注明代码基线、特性、部署模式和未验项；历史测试数字不作为当前运行结果。
-
-## macOS 连接期限修复验收（2026-10-17）
-
-旧安装版本出现对端关闭后设置 socket 超时的 EINVAL。修复 `7392419` 使用 poll 和非阻塞 I/O 保持原整帧截止时间，不忽略错误或重发授权。固定摘要的候选已由操作员在 root-owned 临时实例通过实际 hot 签名/独立验签、跨 UID 拒绝、撤销、task-port 拒绝、正常重启、SIGKILL 后锁钥/撤权/缓存抑制及假 socket 拒绝。
-
-macOS MCP+SE 软件回归 523 项、显式 console/合成 HS 2 项、严格 Clippy、Linux Rust 1.88 默认 504 项及 126 项多 UID/SDK 边界通过。完整回归显式设置 RUST_LOG=info；继承 warn 时监听日志断言会失败。更新工具新增归档既有 previous 备份，Python 16 项通过。
-
-这些结果不证明日常安装已更新，不代替完整 Agent 框架、原生 UI 重测、整机重启或持久 SE 验收。安装与更新见[安装](/guide/install)，使用边界见[本机使用](/guide/local-use)。
+所有验收都使用临时身份，并记录代码基线、feature、部署模式、实际范围和未验项。历史结果不能当作当前运行结果，也不能扩大支持声明。

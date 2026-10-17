@@ -1,87 +1,114 @@
-# 安装与模式选择
+# 安装
 
-需要 Rust 1.88 或更新。开发模式支持 macOS 和 Linux；受保护部署当前只支持 Linux。
+需要 Rust 1.88 或更新。受保护部署目前只支持 Linux；macOS 提供独立账号的本机预览。
 
 ## Linux 受保护部署
 
-在 Linux 构建正式 release。需要 MCP 时另加 --features mcp：
+服务、管理员和 Agent 会用三个系统账号。先构建，再核对二进制摘要，然后安装：
 
-```sh
-cargo build --locked --release
-```
-
-由管理员独立核对构建来源与 SHA-256，然后为新的服务实例安装：
-
-```sh
+```bash
+cargo build --locked --release --features mcp
+sha256sum target/release/anp-keyd
 sudo python3 deploy/linux/install.py --binary target/release/anp-keyd \
-  --sha256 VERIFIED_BINARY_SHA256 \
+  --sha256 你核对过的SHA256 \
   --admin-user operator --agent-user agent-a --agent-user agent-b
 sudo systemctl daemon-reload
 sudo systemctl enable --now anp-keyd
-anp-keyd admin status
-anp-keyd probe --security
 ```
 
-替换示例用户名和摘要。安装器拒绝已有部署，更新使用单独的 --update 流程；它不自动迁移身份。组权限变更后需新登录会话。管理员和 Agent UID 不得重叠，Agent 无 sudo 或宿主管理 socket。
+不需要 MCP 时去掉 `--features mcp`。`--agent-user` 可以写多个，每个 Agent 一个账号。
 
-合格 release 的新安装选择 linux-protected-v1；旧 preview 配置升级保留原模式，需管理员停机后明确切换。正式 Linux release 且显式保护模式才报告 protected_supported=true；这是支持范围声明，probe 也不能代替完整宿主检查。
+安装器会建立服务账号、socket 组、root 所有的程序与配置、SQLite 状态和 systemd 服务。它拒绝覆盖已有安装，不会自动迁入身份。
 
-安装后还需迁入身份、确认 hot 角色、发布策略、解锁并建立 grant，才有可用签名。见[Agent 接入](/advanced/agent)及仓库 [ADAPTER](https://github.com/eccstartup/anp-keyd/blob/master/docs/ADAPTER.md)。
+装完检查：
 
-## macOS 本机独立 UID 预览
+```bash
+/usr/local/libexec/anp-keyd admin --config /etc/anp-keyd/service.json status
+/usr/local/libexec/anp-keyd probe --security --config /etc/anp-keyd/service.json
+```
 
-普通预览不要求完整 Xcode、付费开发者会员或 SE。从源码编译需要 Rust 与 Command Line Tools。可信人类管理员、服务和整个 Agent 各用独立 UID；root 持有安装与配置，始终报告 `protected_supported=false`。
+安装成功只说明服务和权限检查通过。此时还没有身份，也还不能签名。接下来要准备身份、发布策略、创建 grant 并解锁，见[本机使用](/guide/local-use)和[接到 Agent 上](/advanced/agent)。
 
-```sh
+更新用 `--update`，先停服务：
+
+```bash
+cargo build --locked --release
+sha256sum target/release/anp-keyd
+sudo systemctl stop anp-keyd
+sudo python3 deploy/linux/install.py --update \
+  --binary target/release/anp-keyd --sha256 你核对过的SHA256
+sudo systemctl start anp-keyd
+```
+
+更新不会覆盖配置和状态，也不会自动重启。旧 grant 在重启后失效。
+
+### 什么时候报告 `protected_supported=true`
+
+同时满足三个条件：
+
+- 正式 Linux release；
+- 没启用 `hardware-software` 或 `seed-export`；
+- 配置显式为 `linux-protected-v1`。
+
+preview、调试构建和 macOS 都是 false。这个标志是支持范围声明，不是对任意宿主配置的持续证明。新安装默认选择保护模式；旧 preview 配置升级时保留原模式，需要管理员停机后明确切换。
+
+### TPM
+
+需要 TPM 后端时：
+
+```bash
+cargo build --locked --release --features hardware-tpm
+sudo python3 deploy/linux/install.py --binary target/release/anp-keyd \
+  --sha256 你核对过的SHA256 --admin-user operator --agent-user agent-a \
+  --tpm-device /dev/tpmrm0
+```
+
+安装器只授予 `/dev/tpmrm0` 并把传输固定到该设备。验收步骤见[TPM 说明](/advanced/hardware-root)和仓库 `deploy/linux/TPM.md`。
+
+## macOS 本机预览
+
+macOS 预览不要求完整 Xcode、付费开发者会员或 Secure Enclave。从源码编译需要 Rust 和 Command Line Tools。
+
+```bash
 cargo build --locked --release --features mcp
 shasum -a 256 target/release/anp-keyd
-python3 deploy/macos/provision-accounts.py --admin-user YOUR_HUMAN_ACCOUNT
-sudo bash deploy/macos/setup-local.sh YOUR_HUMAN_ACCOUNT VERIFIED_SHA256
+python3 deploy/macos/provision-accounts.py --admin-user 你的账号
+sudo bash deploy/macos/setup-local.sh 你的账号 你核对过的SHA256
 ```
 
-先审核源码、账号计划和摘要，再由人类终端执行 sudo。安装器建立账号和 launchd 服务，拒绝已有安装；新状态没有真实密钥。整个 Agent 必须在独立非管理员 UID 中启动，仅切换签名子进程不足以隔离。
+安装器建立独立账号和 launchd 服务，拒绝覆盖已有安装。它始终报告 `protected_supported=false`。
 
-已有安装不要重复 setup。先验收候选，再查看保留状态的更新计划：
+整个 Agent 必须在独立的非管理员账号下运行。只切换签名子进程的账号不构成隔离。
 
-```sh
-python3 deploy/macos/update-local.py --binary target/release/anp-keyd --sha256 VERIFIED_SHA256
-# 若已有 previous，审核后加 --archive-previous；它先完整归档，不覆盖归档。
-# 核对计划后，由人类以 sudo 执行同一命令并加 --apply。
-```
-
-重启锁钥并撤销旧 grant，配置/状态保留。不要删除备份来绕过检查。macOS 通用真实身份迁移尚未验收，临时 fixture 不用于真实身份导入。
-
-按[本机使用指南](/guide/local-use)完成临时签名、跨 UID、撤销与重启验收。详细安装/验收命令见[仓库 macOS 说明](https://github.com/eccstartup/anp-keyd/blob/master/deploy/macos/README.md)。SE 登录助手及正式发行是独立未完成项，见[硬件根](/advanced/hardware-root)。
+已有的安装不要重复执行 setup；更新按 `deploy/macos/update-local.py` 的步骤先看计划、核对后再执行。
 
 ## 本地开发
 
-```sh
+```bash
 cargo install --path .
 anp-keyd probe
 ```
 
-这不会建立 Linux v2 的服务/管理员/Agent 隔离。仅用临时身份和可信进程运行[开发快速体验](/guide/quickstart)。v1 解锁口令经过旧 socket，不能作为受保护管理通道。
+这不会建立服务/管理员/Agent 隔离，只适合临时身份和可信进程。用法见[五分钟跑通](/guide/quickstart)。
 
 ## 可选 feature
 
-| feature | 范围 |
+| feature | 作用 |
 |---|---|
-| mcp | 启用 MCP；v2 使用 mcp --config |
-| seed-export | 离线维护导出；默认不编入，启用后不声明保护支持 |
-| hardware-se | macOS SE 后端，发行及持久化仍待专项验收 |
-| hardware-tpm | Linux TPM 后端，实体权限和故障仍待验收 |
-| hardware-software | 测试替身，不是硬件；release 拒绝 |
+| `mcp` | 启用 MCP；v2 用 `mcp --config` |
+| `seed-export` | 离线维护用的明文导出；默认不编入，启用后不声明保护支持 |
+| `hardware-se` | macOS Secure Enclave 后端；正式发行和持久化未验收 |
+| `hardware-tpm` | Linux TPM 后端；部署范围已验收，实体芯片保护声明未做 |
+| `hardware-software` | 测试替身，不是硬件；release 构建拒绝 |
 
-指定硬件不可用时拒绝，不静默降级。默认不启用硬件后端。
-
-口令由可信管理 CLI 从控制终端读取，发送前认证 daemon；不会写入 argv、环境变量或 MCP 参数。Agent 能创建 PTY，所以终端不证明人类在场，授权依赖管理员 UID 和管理通道。
+指定硬件不可用时会报错，不会退回纯软件封装。
 
 ## 本地检查
 
-```sh
+```bash
 RUST_LOG=info cargo test --locked --offline
 RUST_LOG=info cargo test --locked --offline --features mcp,hardware-software
 cargo clippy --locked --offline --all-targets --features mcp,hardware-software -- -D warnings
 ```
 
-这些是本地软件回归，不能替代 Linux 多 UID/systemd 或实体硬件验收。离线命令要求已有依赖缓存；硬件 feature 按平台单独测试。详见[测试与向量](/advanced/testing)。
+这些是软件回归测试，不能代替多账号、systemd 或实体硬件验收。离线运行要求依赖已经缓存。

@@ -1,14 +1,13 @@
-# Linux v2 deployment: current software release
+# Linux v2 deployment
 
 Start with the [local-use guide](../LOCAL-USE.md) for the trust model and daily
 administrator/Agent workflow. This page describes the Linux service. Ordinary
 use does not require Apple membership, Xcode, SE or TPM.
 
-The software boundary has been accepted on an Ubuntu 24.04.4/aarch64 systemd VM,
-including complete VM shutdown/boot. A release build without seed export or
-software hardware, explicitly deployed as `linux-protected-v1`, can report
-`protected_supported=true`. This is a support declaration, not proof that every
-new machine is configured safely. Physical TPM acceptance is still outstanding.
+A release build without seed export or software hardware, explicitly deployed as
+`linux-protected-v1`, reports `protected_supported=true`. This is a support
+declaration, not proof that every new machine is configured safely. Physical TPM
+protection is a separate claim; see [TPM.md](TPM.md).
 
 ## New installation
 
@@ -28,15 +27,15 @@ sudo systemctl enable --now anp-keyd
 ```
 
 Replace the account names and digest. `--features mcp` is optional for a CLI-only
-installation. For a physical TPM root, build with `--features hardware-tpm` and
-add `--tpm-device` to the installer, then run the separate acceptance in
+installation. For a TPM root, build with `--features hardware-tpm` and add
+`--tpm-device` to the installer, then run the separate acceptance in
 [TPM.md](TPM.md); the installer grants only `/dev/tpmrm0` and pins the transport.
-The fresh installer creates its own non-login service account,
-socket groups, root-owned executable/configuration, SQLite state and systemd
-unit. It refuses partial/existing installations rather than silently repairing
-or replacing them. It does not migrate user keys. Use the separate offline
-migration/update procedure below for existing installations. Establish fresh
-sessions after group changes.
+
+The installer creates its own non-login service account, socket groups,
+root-owned executable/configuration, SQLite state and systemd unit. It refuses
+partial or existing installations rather than silently repairing or replacing
+them. It does not migrate user keys. Use the offline migration procedure below
+for existing installations. Establish fresh sessions after group changes.
 
 Agents must have no sudo/admin rights, Docker/host-control sockets, administrator
 credentials, or access to administrator processes. The entire Agent must run under
@@ -59,17 +58,14 @@ docker run --rm -v "$PWD:/src:ro" -w /src rust:1.90-bookworm \
 
 This harness requires dependencies/network or a separately mounted Cargo cache.
 It does not by itself accept the systemd sandbox, physical power loss or TPM.
-Commands for marked disposable systemd VMs are below. Keep actual host acceptance
-separate from unit tests, container results and build capability flags. Physical
-TPM grants and acceptance are covered separately in [TPM.md](TPM.md); an
-`swtpm` result there is emulator evidence, not physical acceptance.
+Keep actual host acceptance separate from unit tests, container results and build
+capability flags. TPM grants and acceptance are covered in [TPM.md](TPM.md); an
+`swtpm` result is emulator evidence, not physical acceptance.
 
-## Management and current implementation
+## Management and release behavior
 
-
-v2 now signs through durable reservation/result transactions and exact hot-key
-grants. Restart revokes all old grants and locks keys. Actual Ubuntu 24.04.4/aarch64
-systemd-host acceptance and a complete VM shutdown/boot have passed.
+v2 signs through durable reservation/result transactions and exact hot-key
+grants. Restart revokes all old grants and locks keys.
 
 `build-info.protected_supported` describes Linux release build capability (no
 software test double or seed export). Daemon replies and `probe --security` require
@@ -118,21 +114,23 @@ freezing the source. New legacy writers hold shared maintenance leases; cutover
 requires the exclusive lease. Source gets a managed marker and remains root-owned.
 
 `migration.json` records the exact inventory/vault/instance and durable cutover
-phase. Re-run the same arguments after interruption. Partial backup/staging copies resume only from matching completed files; uncommitted
-private temporary files are discarded. Unknown completed bytes are preserved and
-refused for administrator inspection. Never discard the source or
-recovery copy. Completed copies must match the original manifest; unknown bytes
-stop the tool. Crashes between catalog/config changes cannot create grants:
-only root config introduces the UUID, and startup registers it with audit in one
-SQLite recovery transaction. Restart always invalidates grants.
+phase. Re-run the same arguments after interruption. Partial backup/staging copies
+resume only from matching completed files; uncommitted private temporary files are
+discarded. Unknown completed bytes are preserved and refused for administrator
+inspection. Never discard the source or recovery copy. Completed copies must match
+the original manifest; unknown bytes stop the tool. Crashes between catalog/config
+changes cannot create grants: only root config introduces the UUID, and startup
+registers it with audit in one SQLite recovery transaction. Restart always
+invalidates grants.
 
-After restart: prepare/commit Catalog.EnrollVault, confirm roles explicitly,
-publish policy, unlock exact hot key, issue fresh grant, verify a real service,
-then switch clients to v2. Every imported key starts locked and unclassified.
-Restoring a recovery copy is the same migration process with its `vault/` as the
-source and a fresh recovery directory/UUID. Do not restore old grants or overwrite
-an active vault. Coordinate current remotely published documents before issuing
-grants: local restore cannot roll back a remote publication.
+After restart: prepare/commit `Catalog.EnrollVault`, confirm roles explicitly,
+publish policy, unlock the exact hot key, issue a fresh grant, verify a real
+service, then switch clients to v2. Every imported key starts locked and
+unclassified. Restoring a recovery copy is the same migration process with its
+`vault/` as the source and a fresh recovery directory/UUID. Do not restore old
+grants or overwrite an active vault. Coordinate current remotely published
+documents before issuing grants: local restore cannot roll back a remote
+publication.
 
 The complete software snapshot plus its password can unlock keys; the recovery
 copy is sensitive. Hardware envelopes require their actual backend/device and
@@ -147,15 +145,15 @@ The Rust CLI performs service authentication, callers persist request IDs, and
 there is no automatic retry/downgrade. Production fetch uses the canonical signed
 URL, original body, daemon headers and manual redirects.
 
-Registration: prepare a `RegistrationChallenge` with exact root key, HTTPS origin
-and the supported 32-character lowercase hex challenge. Confirm its digest, then
-`admin complete-secret-operation --operation-id ID --digest DIGEST`; the root is
-transient and never becomes a data key. Runtime uses hot grants. `RotateHotKey`
-selects an already provisioned next hot key, removes the old method, signs the
-new document, revokes grants and journals file recovery. Independently publish
-and verify the returned document before making fresh grants. New hot material
-can be provisioned in an offline administrator staging vault; online generation
-is outside this first migration/rotation tool.
+Registration: prepare a `RegistrationChallenge` with the exact root key, HTTPS
+origin and the supported 32-character lowercase hex challenge. Confirm its digest,
+then `admin complete-secret-operation --operation-id ID --digest DIGEST`; the root
+is transient and never becomes a data key. Runtime uses hot grants. `RotateHotKey`
+selects an already provisioned next hot key, removes the old method, signs the new
+document, revokes grants and journals file recovery. Independently publish and
+verify the returned document before making fresh grants. New hot material can be
+provisioned in an offline administrator staging vault; online generation is
+outside this first migration/rotation tool.
 
 The disposable multi-UID harness exercises the actual migrator. Optionally set
 `ANP_KEYD_ANP_TARGET` to a throwaway awiki-open-server physical origin configured
@@ -163,7 +161,7 @@ with `public_base_url=https://example.com`, `did_domain=example.com` and strict
 signed-document verification. `anp-service-acceptance.py` verifies registration,
 hot authentication, replay/body/expiry rejection and published hot rotation.
 Only this test can send a logical HTTPS target over a separate physical local
-HTTP route; production adapter does not offer that override.
+HTTP route; the production adapter does not offer that override.
 
 The host harness is deliberately destructive and only accepts an isolated VM
 whose PID 1 is systemd and whose root-owned mode-0600

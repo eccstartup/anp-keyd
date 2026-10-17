@@ -1,45 +1,63 @@
 # 命令行
 
-先选择部署模式，再选择命令。Linux v2 的管理和数据请求分别使用独立 socket；同 UID 开发命令不具有这个权限边界。完整参数以当前二进制 --help 为准。
+先选运行模式：
 
-## Linux v2
+- **Linux 受保护部署**：管理命令和 Agent 数据命令走不同的 socket，使用不同的系统账号。
+- **开发模式**：同一个账号下的 `serve` / `sign`，只适合联调和临时身份。
 
-| 命令 | 执行者及用途 |
+完整参数以当前二进制的 `--help` 为准。
+
+## Linux 受保护部署
+
+| 命令 | 谁用 | 做什么 |
+|---|---|---|
+| `build-info` | 任何人 | 查看构建支持哪些能力；不代表这台机器已经配置安全 |
+| `serve-protected --config FILE` | 服务账号 | 启动 daemon；由安装器生成的 systemd 服务调用 |
+| `data --config FILE --file REQUEST.json` | Agent | 发一条数据请求，例如签名、查授权、查结果 |
+| `admin --config FILE status` | 管理员 | 查看服务状态 |
+| `admin --config FILE catalog` | 管理员 | 查看钥匙、策略和主体 |
+| `admin --config FILE list-principals` | 管理员 | 查看已登记的主体 |
+| `admin --config FILE prepare --file CHANGE.json` | 管理员 | 准备一次精确变更，返回摘要和影响 |
+| `admin --config FILE commit --operation-id UUID --digest HASH` | 管理员 | 提交刚才核对过的变更 |
+| `admin --config FILE unlock --vault-id UUID --did DID --kid KID` | 管理员 | 读取口令并解锁指定热钥匙 |
+| `admin --config FILE lock-all` | 管理员 | 移除驻留内存的钥匙 |
+| `admin --config FILE complete-secret-operation --operation-id UUID --digest HASH` | 管理员 | 完成注册 proof 或热钥匙轮换 |
+| `probe --security --config FILE` | 任何人 | 检查当前账号能访问哪个端点、配置是否有效、支持声明是什么 |
+
+Agent 可用的数据操作：
+
+| 操作 | 用途 |
 |---|---|
-| build-info | 查询构建能力，不表示任意宿主已安全 |
-| serve-protected --config FILE | 专用服务 UID 运行，由安装器生成的 systemd unit 启动 |
-| data --config FILE --file REQUEST.json | Agent 发起单条 v2 数据请求 |
-| admin --config FILE status / catalog / list-principals | 管理员查看服务、钥匙/策略及主体 |
-| admin --config FILE prepare --file CHANGE.json | 管理员准备精确变更，返回摘要和影响 |
-| admin --config FILE commit --operation-id UUID --digest HASH | 提交同一次有效批准 |
-| admin --config FILE unlock --vault-id UUID --did DID --kid KID | 管理员认证 daemon 后读取口令并解锁 |
-| admin --config FILE lock-all | 管理员移除驻留密钥 |
-| admin --config FILE complete-secret-operation --operation-id UUID --digest HASH | 管理员完成注册 proof 或预配置热密钥轮换 |
-| probe --security --config FILE | 检查调用者所属端点、信任配置及支持声明 |
+| `GET_CAPABILITIES` | 查看协议版本、body 上限、执行器状态 |
+| `LIST_AUTHORIZED_KEYS` | 查看当前主体能用的钥匙 |
+| `GET_GRANT_STATUS` | 查看 grant 的期限和剩余次数 |
+| `GET_DOCUMENT` | 取某把钥匙的公开文档 |
+| `SIGN_HTTP` | 请求签名 |
+| `GET_REQUEST_STATUS` | 用原 `request_id` 查结果 |
 
-数据请求包含 GET_CAPABILITIES、LIST_AUTHORIZED_KEYS、GET_GRANT_STATUS、GET_DOCUMENT、SIGN_HTTP、GET_REQUEST_STATUS。不存在 Agent 解锁、任意字节签名或根签名操作。
+Agent 不能解锁、不能索取私钥、不能请求任意字节签名，也没有根签名入口。
 
-具体管理 JSON、body 格式和 request_id 恢复流程见[Agent 接入](/advanced/agent)及仓库 [ADAPTER](https://github.com/eccstartup/anp-keyd/blob/master/docs/ADAPTER.md)。
+管理 JSON 的格式和完整流程见[本机使用](/guide/local-use)，接入代码见[接到 Agent 上](/advanced/agent)。
 
-## 开发与离线维护命令
+## 开发与离线维护
 
 | 命令组 | 范围 |
 |---|---|
-| serve / stop | 旧开发 daemon；不是 v2 systemd 服务管理 |
-| sign / list / status / document / unlock / lock | 旧 socket 客户端，同 UID 不承诺隔离，v1 unlock 发送口令 |
-| spec / keygen / publish / verify-doc | 本地身份与公开文档处理 |
-| add-recovery-key / rotate-hot-key / remove-key / migrate / deactivate | 本地生命周期；托管目录拒绝这类直接写入旁路 |
-| import-mnemonic / import-archive | 恢复身份并重新封装，默认构建可用 |
-| probe | 本地开发环境体检；与 probe --security 区分 |
+| `serve` / `stop` | 旧开发 daemon；不是 v2 的 systemd 服务管理 |
+| `sign` / `list` / `status` / `document` / `unlock` / `lock` | 旧 socket 客户端；同账号不承诺隔离 |
+| `spec` / `keygen` / `publish` / `verify-doc` | 本地生成和处理身份、公开文档 |
+| `add-recovery-key` / `rotate-hot-key` / `remove-key` / `migrate` / `deactivate` | 本地生命周期操作；托管目录拒绝这类直接写入 |
+| `import-mnemonic` / `import-archive` | 从助记词或归档恢复身份并重新封装 |
+| `probe` | 开发环境体检；与 `probe --security` 不同 |
 
-控制终端不是人类认证；程序可以创建 PTY。生命周期权限依赖 OS 和受信管理边界，不能因命令“给人用”就推断 Agent 调不到。
+控制终端不能证明“对面是人”，程序也可以创建 PTY。生命周期权限靠操作系统账号和受信管理边界，不要因为命令写着“给人用”就认为 Agent 调不到。
 
-## 可选构建
+## 构建 feature
 
-| feature | 增加能力及限制 |
-|---|---|
-| mcp | MCP 前端；保护模式必须显式传 --config |
-| seed-export | export-seed；默认没有，启用后不声明受保护支持 |
-| hardware-se | macOS Secure Enclave 解封后端；发行和持久化仍待专项验收 |
-| hardware-tpm | Linux TPM 后端；实体权限和故障仍待专项验收 |
-| hardware-software | 测试替身；release 拒绝，不提供硬件保护 |
+| feature | 增加什么 | 限制 |
+|---|---|---|
+| `mcp` | MCP 前端 | 保护模式必须显式传 `--config` |
+| `seed-export` | `export-seed` | 默认没有；启用后不声明受保护支持 |
+| `hardware-se` | macOS Secure Enclave 解封 | 正式发行和持久化未验收 |
+| `hardware-tpm` | Linux TPM 解封 | 部署范围已验收，实体芯片保护声明未做 |
+| `hardware-software` | 测试替身 | 不是硬件；release 构建拒绝 |

@@ -1,12 +1,12 @@
-# Physical TPM deployment and acceptance
+# TPM root: deployment and acceptance
 
-This page separates three things that are easy to conflate:
+This page separates three setups that are easy to conflate:
 
 | Setup | What it proves | What it does not prove |
 |---|---|---|
 | Software envelope, no `--hardware` | The v2 transaction format and service boundary work | The disk copy plus passphrase still opens the key |
 | `swtpm` / `mssim` emulator (`TPM2TOOLS_TCTI=swtpm:...`) | The TPM code path, persistence and failure handling | Any physical device, firmware or owner-hierarchy property |
-| `/dev/tpmrm0` on bare metal | The device the deployment actually uses | It is still acceptance evidence only after the checks below pass |
+| `/dev/tpmrm0` on bare metal | The device the deployment actually uses | Physical protection until the physical checks below pass |
 
 An `swtpm` run is not physical acceptance evidence. `tpm-acceptance.py` classifies
 the transport and refuses `--attest-physical-hardware` unless it sees a kernel
@@ -75,12 +75,20 @@ The tool checks, in order:
 6. delete the persistent object, then the old envelope must fail;
 7. the effective systemd properties and, when running, the service's groups.
 
-A passing run sets `passed` and, with every optional check, 
+A passing run sets `passed` and, with every optional check,
 `acceptance_scope_complete`. `physical_tpm_acceptance_complete` additionally
 requires `--attest-physical-hardware`. The tool never sets
 `hardware_acceptance_complete` or `protected_supported`.
 
-Still operator-run, and therefore still pending in every report:
+Deployment acceptance covers the device grant, the systemd sandbox, the service
+UID opening the device, cross-process seal/open, cross-UID denial, and refusal
+after deletion. It has been exercised with `swtpm` exposed through the kernel's
+`tpm_vtpm_proxy`, so the device under test is a kernel `/dev/tpmrm0` character
+device rather than a TPM socket. Such a report records `virtualization=docker`,
+`virtual_device_hint=true`, `acceptance_scope_complete=true`, and both physical
+and protected flags false.
+
+Not covered, and therefore still required for a physical protection claim:
 
 - logout/relogin and user switching;
 - sleep/wake and wall-clock rollback;
@@ -104,35 +112,3 @@ Still operator-run, and therefore still pending in every report:
   non-empty owner hierarchy is not supported by this build.
 - Never clear or replace the persistent object to "fix" an envelope. That
   silently makes the existing envelope unopenable.
-
-## Current evidence
-
-The TPM backend, sealing, persistence and failure paths have been exercised
-against `swtpm` as part of the earlier hardware-root work. On 2026-10-17 the
-cross-process probe was also run end to end against `swtpm` in a Linux
-container: `probe` reported usable, process A created a sealed object, process B
-reopened it with the same HS digest, and after `delete` the old envelope was
-refused with `HardwareMissing`.
-
-The same day, the full deployment acceptance scope ran in a privileged systemd
-container with `swtpm` exposed through the kernel's `tpm_vtpm_proxy`, so the
-device under test was a kernel `/dev/tpmrm0` character device rather than a TPM
-socket. `install.py` created the service accounts and the drop-in; the service
-started with `PrivateDevices=no`, `DevicePolicy=closed` and only `/dev/tpmrm0`
-allowed; the service UID opened the device; the cross-process probe passed; a
-second UID was denied; `delete` made the old envelope unopenable. The report
-recorded `virtualization=docker`, `virtual_device_hint=true`,
-`acceptance_scope_complete=true`, and both physical/protected flags false.
-
-That run found three tooling defects, now fixed and regression-tested:
-
-- a device owned by the root group would have added the service to `root`
-  (the shared device policy now refuses it);
-- the probe parser read trailing tss2 stderr as the JSON line;
-- a TPM class entry without a `device` link was reported as driver `"driver"`
-  instead of being flagged virtual; the resolved sysfs path is now checked too.
-
-This is emulator evidence only. No physical TPM device was attached to this
-repository's acceptance, so `protected_supported=false`, the physical flag stays
-false, and the pending list above remains in force.
-

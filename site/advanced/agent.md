@@ -1,21 +1,21 @@
-# Agent 接入
+# 接到 Agent 上
 
-本页介绍 Linux v2。服务须先由管理员部署，Agent 使用独立 UID，获得受保护配置路径、grant_id 和 exact key_id。正式 Linux release 且配置为 `linux-protected-v1` 才声明保护支持。macOS 另有独立 UID 本机预览，始终报告 false，见[本机使用](/guide/local-use)。同 UID 开发模式不提供 Agent 隔离。
+前提：管理员已经装好服务、登记身份、发布策略、创建 grant 并解锁了热钥匙。Agent 需要知道三样东西：
 
-完整协议、管理变更和恢复说明见仓库 [ADAPTER.md](https://github.com/eccstartup/anp-keyd/blob/master/docs/ADAPTER.md)。
+- 受保护配置的路径，通常是 `/etc/anp-keyd/service.json`；
+- `grant_id`；
+- 自己的系统账号（Agent 账号）。
 
-## CLI
+完整协议和管理变更见仓库 [ADAPTER.md](https://github.com/eccstartup/anp-keyd/blob/master/docs/ADAPTER.md)。
 
-把公开请求保存为 request.json，以 Agent UID 运行：
+## 用 CLI 发请求
 
-```sh
-anp-keyd data --config /etc/anp-keyd/service.json --file request.json
-```
+Agent 在自己的账号下，把一个请求保存成文件：
 
 ```json
 {
   "operation": "SIGN_HTTP",
-  "grant_id": "ADMIN_SUPPLIED_GRANT_ID",
+  "grant_id": "管理员给的GRANT_ID",
   "request_id": "6b79d06e-33cf-44e2-8209-81938b6a8ed3",
   "http": {
     "method": "GET",
@@ -27,25 +27,73 @@ anp-keyd data --config /etc/anp-keyd/service.json --file request.json
 }
 ```
 
-grant 和目标须与管理员配置一致。每个新操作生成并保存自己的 UUID，重试使用原 ID，不能重复使用此示例 UUID。CLI 自动封装 v2 版本；成功回复的业务数据在 data 字段。
+```bash
+anp-keyd data --config /etc/anp-keyd/service.json --file request.json
+```
 
-数据操作还有 GET_CAPABILITIES、LIST_AUTHORIZED_KEYS、GET_GRANT_STATUS、GET_DOCUMENT 和 GET_REQUEST_STATUS。数据面没有密码、解锁、根签名、raw、challenge 或生命周期入口。
+每个新操作要自己生成一个 UUID，并在调用前把它和原始输入保存下来。重试时复用同一个 `request_id`；不要重复使用示例里的 UUID。
 
-## 发送与恢复
+其他数据操作：
 
-发送必须使用 daemon 返回的规范化 URL、原始 body 字节和签名头，禁用自动重定向。body 显式区分 absent 与 present；present 空数组也签摘要。当前 body 上限 16384 字节，整帧 65536 字节，URL 仅支持保守 HTTPS DNS 子集。
+| 操作 | 用途 |
+|---|---|
+| `LIST_AUTHORIZED_KEYS` | 看自己当前能用哪些钥匙 |
+| `GET_DOCUMENT` | 取某把钥匙的公开文档，需要 `key_id` |
+| `GET_GRANT_STATUS` | 查 grant 的期限和剩余次数 |
+| `GET_REQUEST_STATUS` | 用原 `request_id` 查签名结果 |
 
-应用在签名前持久保存 request_id 和精确输入。超时后先查询原 ID，不换 ID 自动重签。completed 表示签名结果持久化，不代表远端业务执行；outcome_unknown 需要结合审计和业务状态处理。撤销、过期或重启后不再交付失效缓存。
+数据接口没有解锁、密码、根签名、任意字节签名或生命周期操作。
 
-## Node 和现有 SDK
+## 拿到签名之后
 
-仓库 [adapters/keyd-v2.mjs](https://github.com/eccstartup/anp-keyd/blob/master/adapters/keyd-v2.mjs) 提供 KeydV2Client、keydV2Signer 和 keydV2Connector；Node 18+，通过 Rust CLI 认证 daemon。client.fetch 禁用重定向，不自动重试；它不会替应用持久化操作状态。
+用 daemon 返回的规范化 URL、原始 body 和签名头发送请求，关闭自动重定向。不要重新序列化 body，也不要改签名头里的任何字符。
 
-SDK createConfig/signRequest 接缝已有验收，但已验版本的高层 resolveVerificationKey 错将 hot 指纹与 DID 根指纹比较，尚未兼容。SDK 的 ANP-02 body 与 awiki JSON-RPC envelope 不同；先构造正确 body 再签，不能签后重写。不能自动回退 root grant。
+超时或连接中断时：
 
-## MCP
+1. 用原 `request_id` 查询状态；
+2. 不要生成新 ID 重签；
+3. `outcome_unknown` 表示结果不确定，可能需要管理员核对；
+4. `completed` 只表示签名结果已保存，不表示对方业务已经执行。
 
-启用 mcp feature 后，由 Agent 所属执行域启动：
+## 用 Node
+
+仓库的 [adapters/keyd-v2.mjs](https://github.com/eccstartup/anp-keyd/blob/master/adapters/keyd-v2.mjs) 提供 `KeydV2Client`：
+
+```js
+import { randomUUID } from 'node:crypto'
+import { KeydV2Client } from './adapters/keyd-v2.mjs'
+
+const client = new KeydV2Client({
+  config: '/etc/anp-keyd/service.json',
+  binary: '/usr/local/libexec/anp-keyd',
+})
+const request = {
+  grant_id: 管理员给的GrantId,
+  request_id: randomUUID(),
+  method: 'GET',
+  url: 'https://service.example.com/v1/status',
+}
+await saveOperation(request)          // 由你的应用实现
+const signed = await client.sign(request)
+const response = await fetch(signed.url, {
+  method: signed.method,
+  headers: signed.headers,
+  body: signed.body,
+  redirect: 'manual',
+})
+```
+
+`client.fetch(request)` 把签名和发送合在一起，同样禁用重定向，也不自动重试。
+
+## 用现有 SDK
+
+`keydV2Connector` 接到 `@connectx-sdk/core` 的 `createConfig` / `signRequest` 上，需要你提供一个稳定的 `requestId` 函数。高层热密钥解析要求 SDK 0.4.2 或更新；更早版本可能错误地要求热钥匙匹配根指纹。
+
+SDK 的 ANP-02 登录体和 awiki 的 JSON-RPC envelope 不是同一种 body。先构造正确的 body 再签名，不能签完再包装。
+
+## 用 MCP
+
+构建时启用 `mcp`，然后由 Agent 账号启动：
 
 ```json
 {
@@ -60,20 +108,24 @@ SDK createConfig/signRequest 接缝已有验收，但已验版本的高层 resol
 
 | 工具 | 输入 |
 |---|---|
-| list_my_keys | 空对象 |
-| grant_status | grant_id |
-| get_did_document | key_id |
-| sign_request | grant_id、request_id、http |
-| request_status | request_id |
+| `list_my_keys` | 空对象 |
+| `grant_status` | `grant_id` |
+| `get_did_document` | `key_id` |
+| `sign_request` | `grant_id`、`request_id`、`http` |
+| `request_status` | `request_id` |
 
-配置在启动时固定，工具参数不能覆盖 socket、root、config、DID 或 kid。口令不经 MCP。stdout 属于协议，诊断走 stderr。不带 --config 的 MCP 是旧开发路径，不是失败后的降级方案。
+配置在启动时固定；工具参数不能改 socket、配置路径、DID 或 kid。口令不经过 MCP。
 
-当前 MCP 源码部分描述仍含“M4 未启用”的旧文案，服务端事务执行器已经启用；能力判断以 capabilities 和实际结果为准。这处源码文案仍需单独修正。
+## 管理员做什么
 
-## 管理动作
+管理员通过独立的 `admin` 通道：
 
-管理员通过独立 admin 通道 prepare/commit 建权、撤销和角色确认；注册 proof 与轮换用 complete-secret-operation 短期解封根密钥。挑战来源由可信管理适配器校验，普通 Agent 不代办。
+- `prepare` / `commit`：确认钥匙角色、发布策略、创建或撤销 grant；
+- `unlock`：输入口令解锁指定热钥匙；
+- `complete-secret-operation`：完成注册 proof 或热钥匙轮换。
 
-daemon 重启使旧 grant 失效并锁定密钥。恢复运行需要管理员重新解锁和建权。文档本地生成不代表远端发布或撤销已生效。
+注册、轮换和恢复都必须由管理员或可信管理适配器执行，Agent 不能代办。
 
-写给 Agent 的操作约束见仓库 [skill](https://github.com/eccstartup/anp-keyd/tree/master/skills/anp-keyd)。skill 不授予管理权限，也不能替代 daemon 策略检查。
+服务重启后旧 grant 失效、钥匙锁定，需要管理员重新解锁和建权。文档在本地生成，不代表已经发布到网上。
+
+给 Agent 的操作约束见仓库 [skill](https://github.com/eccstartup/anp-keyd/tree/master/skills/anp-keyd)。

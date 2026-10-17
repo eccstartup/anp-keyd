@@ -23,11 +23,10 @@ sudo bash deploy/macos/check-agent.sh \
 
 Only the human enters sudo locally. This reuses existing accounts and creates
 isolated `/Library/ANPKeydChecks-*` state. It does not change the daily binary,
-keys, launchd job, account records, or model authentication. Native Cancel, timeout, exact-target and masked-input acceptance was already
-completed with candidate `453f5aa6...12b7ee` (see HISTORY.md). This integration
-does not change the UI. By default it reuses that historical result; the optional
-seventh argument `--interactive-ui` explicitly repeats all three windows. Do not
-record a default run as a new UI acceptance.
+keys, launchd job, account records, or model authentication. The default run does
+not exercise the native dialog. The optional seventh argument `--interactive-ui`
+explicitly runs all three windows: Cancel, an untouched 120-second timeout, then
+masked input. Do not record a default run as UI acceptance.
 
 The driver pins and copies executable bytes into a new root-owned directory.
 Its disposable source is installed by the supported offline migrator, with

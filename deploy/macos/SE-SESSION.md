@@ -1,4 +1,4 @@
-# Secure Enclave foreground login helper (U3 preview)
+# Secure Enclave foreground login helper
 
 This bridge lets a trusted human login process perform the hardware portion of
 unlocking one approved hot key while the existing separate-UID daemon continues

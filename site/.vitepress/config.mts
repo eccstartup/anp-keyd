@@ -47,14 +47,14 @@ export default defineConfig({
         text: '概念',
         items: [
           { text: '信封与归档', link: '/concepts/envelope' },
-          { text: '它挡什么,不挡什么', link: '/concepts/trust-model' },
+          { text: '它能保护什么', link: '/concepts/trust-model' },
         ],
       },
       {
         text: '参考',
         items: [
           { text: '命令行', link: '/reference/commands' },
-          { text: '不显然的默认值', link: '/reference/defaults' },
+          { text: '默认行为', link: '/reference/defaults' },
           { text: '磁盘布局', link: '/reference/layout' },
         ],
       },
