@@ -108,6 +108,10 @@ Still operator-run, and therefore still pending in every report:
 ## Current evidence
 
 The TPM backend, sealing, persistence and failure paths have been exercised
-against `swtpm` as part of the earlier hardware-root work. That is emulator
-evidence. No physical TPM device was attached to this repository's acceptance,
-so `protected_supported=false` and the pending list above remain in force.
+against `swtpm` as part of the earlier hardware-root work. On 2026-10-17 the
+cross-process probe was also run end to end against `swtpm` in a Linux
+container: `probe` reported usable, process A created a sealed object, process B
+reopened it with the same HS digest, and after `delete` the old envelope was
+refused with `HardwareMissing`. That is emulator evidence only. No physical TPM
+device was attached to this repository's acceptance, so `protected_supported=false`
+and the pending list above remain in force.

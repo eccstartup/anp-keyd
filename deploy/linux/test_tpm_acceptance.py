@@ -61,6 +61,27 @@ class DeviceFacts(unittest.TestCase):
             with self.assertRaisesRegex(device.DeviceError, 'symlink'):
                 device.report(link)
 
+    def test_resource_manager_device_maps_by_name(self):
+        # /dev/tpmrm0 is a misc device whose major:minor does not match
+        # /sys/class/tpm/tpm0/dev, so the name mapping has to come first.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'tpm0').mkdir()
+            (root / 'tpm0' / 'dev').write_text('253:0\n')
+            meta = SimpleNamespace(st_rdev=os.makedev(253, 1))
+            self.assertEqual(device._sysfs(meta, Path('/dev/tpmrm0'), root),
+                             root / 'tpm0')
+            self.assertIsNone(device._sysfs(meta, Path('/dev/tpmrm1'), root))
+
+    def test_raw_device_maps_by_major_minor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'tpm0').mkdir()
+            (root / 'tpm0' / 'dev').write_text('253:0\n')
+            meta = SimpleNamespace(st_rdev=os.makedev(253, 0))
+            self.assertEqual(device._sysfs(meta, Path('/dev/tpm0'), root),
+                             root / 'tpm0')
+
 
 class StateFile(unittest.TestCase):
     def state(self, directory, **overrides):

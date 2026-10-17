@@ -10,20 +10,34 @@ It reads facts only.  It never writes to the TPM and never changes ownership.
 import grp
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 
 DEVICE = Path('/dev/tpmrm0')
+SYSFS = Path('/sys/class/tpm')
 
 
 class DeviceError(Exception):
     pass
 
 
-def _sysfs(meta):
-    """Find the /sys/class/tpm entry whose major:minor matches this device."""
+def _sysfs(meta, device=DEVICE, root=SYSFS):
+    """Find the /sys/class/tpm entry for a TPM character device.
+
+    `/dev/tpmrm0` is a misc device, so its major:minor does not match
+    `/sys/class/tpm/tpm0/dev`; map it by name first, then fall back to the
+    major:minor match that works for `/dev/tpm0`.
+    """
+    match = re.fullmatch(r'tpmrm(\d+)', device.name)
+    if match:
+        entry = root / f'tpm{match.group(1)}'
+        if (entry / 'dev').exists():
+            return entry
     wanted = (os.major(meta.st_rdev), os.minor(meta.st_rdev))
-    for entry in sorted(Path('/sys/class/tpm').glob('tpm*')):
+    for entry in sorted(root.glob('tpm*')):
+        if not re.fullmatch(r'tpm\d+', entry.name):
+            continue
         try:
             major, minor = (int(part) for part in (entry / 'dev').read_text().split(':'))
         except (OSError, ValueError):
@@ -66,7 +80,7 @@ def report(device=DEVICE):
             f'{device} is owned by gid {meta.st_gid}, which has no group name; create the '
             'group (usually `tss`) before deploying'
         ) from None
-    sysfs = _sysfs(meta)
+    sysfs = _sysfs(meta, device)
     if sysfs is None:
         raise DeviceError(f'{device} has no matching /sys/class/tpm entry; it is not a TPM')
     version = _read(sysfs / 'tpm_version_major')
