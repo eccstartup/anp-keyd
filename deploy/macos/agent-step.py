@@ -2,6 +2,7 @@
 """Public temporary-identity tool executed by the complete Claude Code process.
 No secrets. Its output is checked independently by the parent and HTTPS receiver.
 """
+import ctypes
 import http.client
 import json
 import os
@@ -10,6 +11,20 @@ import ssl
 import subprocess
 import sys
 import uuid
+
+
+def kernel_groups():
+    # macOS os.getgroups() reports the account's configured groups, not the
+    # kernel credential list, so ask libc getgroups(2) directly. Linux agrees
+    # either way.
+    lib = ctypes.CDLL(None, use_errno=True)
+    count = lib.getgroups(0, None)
+    if count < 0:
+        raise OSError(ctypes.get_errno(), 'getgroups')
+    groups = (ctypes.c_uint * count)()
+    if lib.getgroups(count, groups) < 0:
+        raise OSError(ctypes.get_errno(), 'getgroups')
+    return list(groups)
 
 
 def run(spec, action):
@@ -26,7 +41,7 @@ def run(spec, action):
         assert reply['code'] == 'OK', reply
         return reply['data']
     sign = spec['sign']
-    evidence = {'uid': os.getuid(), 'euid': os.geteuid(), 'groups': os.getgroups(),
+    evidence = {'uid': os.getuid(), 'euid': os.geteuid(), 'kernel_groups': kernel_groups(),
                 'home': os.environ['HOME'], 'action': action}
     if action == 'revoked':
         cached = request(sign)

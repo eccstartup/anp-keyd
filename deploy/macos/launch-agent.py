@@ -83,10 +83,14 @@ def main():
     if config['mode'] != 'macos-boundary-preview':
         raise ValueError('macOS preview configuration required')
     user = account(config, args.uid)
+    # sudo -l -U <user> exits 0 for a root caller even when the target is denied,
+    # because the denial answers the query. Sudo's own policy verdict is the
+    # evidence; the exit status carries no permission bit.
     privileges = subprocess.run(['/usr/bin/sudo', '-n', '-l', '-U', user.pw_name],
-        env={'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}, capture_output=True, timeout=15)
-    if privileges.returncode != 1:
-        raise ValueError('Agent has sudo privileges or sudo audit failed; inspect before launch')
+        env={'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}, capture_output=True, text=True, timeout=15)
+    if 'is not allowed to run sudo' not in privileges.stdout:
+        raise ValueError('Agent has sudo privileges or sudo audit failed; inspect before launch: '
+                         + privileges.stdout + privileges.stderr)
     for path in [args.home, args.workspace, args.home / 'tmp']:
         dedicated(path, user.pw_uid, policy.no_acl)
     with args.binary.open('rb') as source:

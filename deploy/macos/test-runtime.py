@@ -279,4 +279,6 @@ if __name__ == '__main__':
     try:
         main()
     except (ValueError, OSError, AssertionError, KeyError, subprocess.SubprocessError) as error:
-        sys.exit(str(error))
+        # An assertion whose message is a dict would otherwise print as a bare
+        # dict and read like ordinary output.
+        sys.exit('FAIL ' + str(error))

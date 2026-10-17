@@ -11,10 +11,14 @@ if [ "$(uname -s)" != Darwin ] || [ "$(id -u)" != 0 ]; then
   echo 'Requires macOS root in the human terminal; enter any sudo password locally.' >&2
   exit 1
 fi
-ui=()
+# macOS /bin/bash 3.2 rejects an empty "${array[@]}" under set -u, so the
+# optional flag is appended to a list that already holds the fixed arguments.
+runtime_args=(--candidate-binary "$1" --candidate-sha256 "$2"
+              --signing-helper "$3" --helper-sha256 "$4"
+              --migrate-fixture --claude-binary "$5" --claude-sha256 "$6")
 if [ "$#" = 7 ]; then
   if [ "$7" != --interactive-ui ]; then echo 'Unknown seventh argument' >&2; exit 2; fi
-  ui=(--interactive-ui)
+  runtime_args+=(--interactive-ui)
 fi
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd -P)"
 /usr/bin/python3 - "$1" "$2" "$3" "$4" "$5" "$6" <<'PY'
@@ -36,8 +40,5 @@ for name, digest in zip(sys.argv[1::2], sys.argv[2::2]):
 print('PASS all reviewed executable digests checked', flush=True)
 PY
 /usr/bin/python3 "$script_dir/test-install.py"
-/usr/bin/python3 "$script_dir/test-runtime.py" \
-  --candidate-binary "$1" --candidate-sha256 "$2" \
-  --signing-helper "$3" --helper-sha256 "$4" \
-  --migrate-fixture --claude-binary "$5" --claude-sha256 "$6" "${ui[@]}"
+/usr/bin/python3 "$script_dir/test-runtime.py" "${runtime_args[@]}"
 echo 'PASS isolated framework acceptance. Daily state unchanged; live model, real-identity migration and U3 hardware/release gates remain separate.'

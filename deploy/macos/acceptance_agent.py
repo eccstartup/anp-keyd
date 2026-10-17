@@ -68,9 +68,13 @@ assert not any(report.values()), 'Agent can access a credential directory or hos
             capture_output=True, text=True, timeout=15)
         assert result.returncode == 0, result.stdout + result.stderr
         if os.uname().sysname == 'Darwin':
-            sudo = subprocess.run(['/usr/bin/sudo', '-n', '-l', '-U', checks.agent.pw_name],
-                capture_output=True, env=checks.env, timeout=15)
-            assert sudo.returncode == 1, 'Agent sudo rights found or sudo audit failed'
+            # sudo -l -U <user> exits 0 for a root caller even when the target is
+            # denied, because the denial answers the query. Sudo's own policy
+            # verdict is the evidence; the exit status carries no permission bit.
+            privileges = subprocess.run(['/usr/bin/sudo', '-n', '-l', '-U', checks.agent.pw_name],
+                capture_output=True, text=True, env=checks.env, timeout=15)
+            assert 'is not allowed to run sudo' in privileges.stdout, \
+                'Agent has sudo privileges or sudo audit failed: ' + privileges.stdout + privileges.stderr
         print('PASS Agent cannot read known human credential directories, protected state/admin socket or known host Docker endpoints; dedicated HOME/workspace and only primary/signing groups', flush=True)
 
     def start_receiver(self):
@@ -134,7 +138,7 @@ assert not any(report.values()), 'Agent can access a credential directory or hos
         assert evidence_path.stat().st_uid == checks.agent.pw_uid
         evidence = json.loads(evidence_path.read_text())
         assert evidence['uid'] == evidence['euid'] == checks.agent.pw_uid, evidence
-        assert set(evidence['groups']) <= {checks.agent.pw_gid, checks.config['agent_gid']}, evidence
+        assert set(evidence['kernel_groups']) <= {checks.agent.pw_gid, checks.config['agent_gid']}, evidence
         assert evidence['home'] == str(self.home), evidence
         print('PASS actual Claude Code and Bash/tool child run as independent Agent UID: ' + json.dumps(evidence), flush=True)
 
