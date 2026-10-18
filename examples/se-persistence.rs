@@ -51,7 +51,9 @@ mod macos {
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
 
-    use anp_keyd::keystore::hardware::se::{acceptance_create, acceptance_delete, acceptance_open};
+    use anp_keyd::keystore::hardware::se::{
+        acceptance_create, acceptance_delete, acceptance_open, acceptance_open_checked,
+    };
     use anp_keyd::keystore::record::HardwareRoot;
     use base64::Engine;
     use serde::{Deserialize, Serialize};
@@ -70,6 +72,9 @@ mod macos {
     }
 
     pub fn run() -> Result<(), String> {
+        // Diagnose OS keychain identity separately from the Unix effective UID.
+        // No key material, password or entitlement secret is included.
+        eprintln!("SE_CONTEXT {}", process_context()?);
         let mut args = std::env::args().skip(1);
         match args.next().as_deref() {
             Some("create") => {
@@ -81,7 +86,12 @@ mod macos {
             Some("open") => {
                 let state = path(args.next(), "STATE")?;
                 no_more(args)?;
-                open(&state)
+                open(&state, false)
+            }
+            Some("open-checked") => {
+                let state = path(args.next(), "STATE")?;
+                no_more(args)?;
+                open(&state, true)
             }
             Some("delete") => {
                 let state = path(args.next(), "STATE")?;
@@ -99,6 +109,32 @@ mod macos {
                 "expected create STATE TAG, open STATE, delete STATE or label STATE; got {other:?}"
             )),
         }
+    }
+
+    fn process_context() -> Result<serde_json::Value, String> {
+        #[link(name = "bsm")]
+        unsafe extern "C" {
+            fn getauid(uid: *mut u32) -> i32;
+        }
+        #[link(name = "Security", kind = "framework")]
+        unsafe extern "C" {
+            fn SessionGetInfo(session: u32, actual: *mut u32, attributes: *mut u32) -> i32;
+        }
+        let mut audit_uid = u32::MAX;
+        let mut session = 0;
+        let mut attributes = 0;
+        if unsafe { getauid(&mut audit_uid) } != 0
+            || unsafe { SessionGetInfo(u32::MAX, &mut session, &mut attributes) } != 0
+        {
+            return Err("could not read kernel audit identity/session".into());
+        }
+        Ok(serde_json::json!({
+            "uid": nix::unistd::getuid().as_raw(),
+            "euid": nix::unistd::geteuid().as_raw(),
+            "audit_uid": audit_uid,
+            "audit_session": session,
+            "session_attributes": attributes,
+        }))
     }
 
     fn path(value: Option<String>, name: &str) -> Result<PathBuf, String> {
@@ -134,12 +170,16 @@ mod macos {
         Ok(())
     }
 
-    fn open(path: &Path) -> Result<(), String> {
+    fn open(path: &Path, checked: bool) -> Result<(), String> {
         let state = read_state(path)?;
         let ciphertext = base64::engine::general_purpose::STANDARD
             .decode(&state.ciphertext_b64)
             .map_err(|error| format!("state ciphertext is not base64: {error}"))?;
-        let hs = acceptance_open(&state.root, &ciphertext).map_err(|error| error.to_string())?;
+        let hs = if checked {
+            acceptance_open_checked(&state.root, &ciphertext)
+        } else {
+            acceptance_open(&state.root, &ciphertext)
+        }.map_err(|error| error.to_string())?;
         let actual = hs.expose(|bytes| hex(&Sha256::digest(bytes)));
         if actual != state.hs_sha256 {
             return Err(format!(

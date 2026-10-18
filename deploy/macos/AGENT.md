@@ -90,6 +90,8 @@ permit offline decryption; preserve it under administrator control.
 ## Daily framework launch
 
 Use `launch-agent.py` to drop the entire framework process to the configured UID.
+Unix UID isolation is not a promise that a program carrying the helper's trusted
+signing identity and keychain group cannot use the human's SE wrapping key.
 Stage the reviewed standalone framework binary root-owned outside Agent-writable
 paths. Prepare a dedicated Agent-owned 0700 HOME, workspace and HOME/tmp beneath
 root/Agent-controlled, non-shared parents. Review shared directories, all readable

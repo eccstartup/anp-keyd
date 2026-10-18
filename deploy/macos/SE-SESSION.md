@@ -9,7 +9,11 @@ accepted formal SE distribution. `protected_supported=false` remains unchanged.
 ## Trust and protocol
 
 The administrator UID, daemon, root-owned code/configuration and OS are trusted.
-Agents must stay in separate non-admin UIDs. The helper runs as the configured
+Agents must stay in separate non-admin UIDs. Neither a different Unix UID nor a
+fresh SessionCreate audit session is a demonstrated keychain boundary for code
+carrying this helper's trusted signature and access group. Production SE seal/open
+also enforce the current local graphical-login identity in software. This policy
+is separate from raw keychain authorization. The helper runs as the configured
 administrator in the active local graphical login session. A second service
 account or a system LaunchDaemon cannot substitute for that login context.
 Unrestricted code in the human UID remains part of the trusted management
@@ -149,7 +153,10 @@ through the existing management workflow in a separate terminal. There is no
 LaunchAgent auto-start or unattended passphrase storage in this initial version.
 
 The cross-process persistence probe is a separate test example, not the helper
-binary and not a release command:
+binary and not a release command. Use a dedicated temporary keychain group.
+Its raw `open` intentionally bypasses the application's login policy; do not
+distribute this signed test capability with access to real production wrapping
+keys. `open-checked` exercises the software policy separately.
 
 ```sh
 cargo build --locked --release --features mcp,hardware-se,se-acceptance \
@@ -173,13 +180,18 @@ python3 deploy/macos/se-persistence.py \
 Run this from the login user's own terminal, never through `sudo`: root has no
 login data protection keychain. `--other-uid` makes sudo run only the denial
 probe as that second user, so the sudo prompt may appear once. On macOS the
-`keychain-access-groups` entitlement is authorized by the code signature and
-Team ID (TN3137), so the bare example is signed with the same entitlement set
-as the helper; it does not embed the provisioning profile.
+`keychain-access-groups` authorization depends on the signing and distribution
+context. Do not assume a development-signed bare example can run without a
+matching provisioning profile. `sign-example --profile` validates profile
+metadata but does not embed or install it. If AMFI reports `No matching profile
+found`, stop and provision a matching development app/profile before hardware
+acceptance. A successful signature preflight does not prove runtime admission.
 
 It creates a persistent SE key in process A, reopens it in a new process B,
-proves another UID is denied by the keychain, deletes the key and proves the old
-envelope no longer opens. The `--unsigned-binary` phase proves that a build
+tests whether another UID is denied, deletes the key and checks that the old
+envelope no longer opens. Raw other-UID access has succeeded on the test host;
+the harness reports that as failed isolation acceptance. The `open-checked`
+mode labels application-policy refusal separately. The `--unsigned-binary` phase checks that a build
 without the entitlement cannot create a persistent key; an unsigned build is
 expected to fail with `errSecMissingEntitlement` (`-34018`). Passing this tool
 does not prove logout/relogin, sleep, reboot, upgrade or distribution.

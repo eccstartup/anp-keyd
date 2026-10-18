@@ -58,6 +58,18 @@ class Policy(unittest.TestCase):
 
 
 class ChildCredentials(unittest.TestCase):
+    def test_runtime_failure_preserves_signal_and_output(self):
+        spec = importlib.util.spec_from_file_location('runtime_failure', Path(__file__).with_name('test-runtime.py'))
+        runtime = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runtime)
+        with self.assertRaisesRegex(ValueError, r'exit=-9 \(signal 9\)'):
+            runtime.require_success(NS(returncode=-9, stdout='', stderr=''), 'admission')
+        with self.assertRaises(ValueError) as raised:
+            runtime.require_success(NS(returncode=1, stdout='progress', stderr='refused'), 'init')
+        self.assertIn('progress', str(raised.exception))
+        self.assertIn('refused', str(raised.exception))
+        runtime.require_success(NS(returncode=0, stdout='', stderr=''), 'ok')
+
     def test_primary_group_survives_darwin_egid_replacement(self):
         spec = importlib.util.spec_from_file_location('runtime_checks', Path(__file__).with_name('test-runtime.py'))
         runtime = importlib.util.module_from_spec(spec)

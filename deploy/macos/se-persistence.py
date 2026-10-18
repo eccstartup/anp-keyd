@@ -54,7 +54,7 @@ class AcceptanceError(Exception):
     pass
 
 
-def run(binary, *arguments, uid=None, timeout=120):
+def run(binary, *arguments, uid=None, timeout=120, isolated_session=False):
     environment = os.environ.copy()
     if uid is not None and uid != os.geteuid():
         try:
@@ -69,6 +69,12 @@ def run(binary, *arguments, uid=None, timeout=120):
         # process. A password prompt, if needed, appears on the operator's tty.
         command = ['/usr/bin/sudo', '-u', account.pw_name, '--',
                    str(binary), *map(str, arguments)]
+        if isolated_session:
+            command = ['/usr/bin/sudo', '--', '/usr/bin/python3',
+                       str(Path(__file__).with_name('se-isolated-open.py').resolve()),
+                       '--uid', str(uid), '--binary', str(binary),
+                       '--sha256', hashlib.sha256(Path(binary).read_bytes()).hexdigest(),
+                       '--', *map(str, arguments)]
         try:
             result = subprocess.run(command, capture_output=True, timeout=timeout)
         except (OSError, subprocess.SubprocessError) as error:
@@ -86,7 +92,17 @@ def run(binary, *arguments, uid=None, timeout=120):
 
 
 def output(result):
-    return (result.stdout + result.stderr).decode(errors='replace').strip()
+    return b'\n'.join((result.stdout, result.stderr)).decode(errors='replace').strip()
+
+
+def process_context(result):
+    for line in output(result).splitlines():
+        if line.startswith('SE_CONTEXT '):
+            context = json.loads(line[len('SE_CONTEXT '):])
+            if not isinstance(context, dict):
+                raise AcceptanceError('probe context must be a dictionary')
+            return context
+    return None
 
 
 def require_success(result, operation):
@@ -127,6 +143,8 @@ def accept(args):
             'keychain. Use --other-uid to have sudo run only the denial probe as a second user')
     if args.unsigned_binary and not args.unsigned_sha256:
         raise AcceptanceError('--unsigned-binary requires its reviewed --unsigned-sha256')
+    if getattr(args, 'isolated_session', False) and args.other_uid is None:
+        raise AcceptanceError('--isolated-session requires --other-uid')
     binary = args.binary.resolve(strict=True)
     signature = verify_binary(binary, args.sha256, args.team_id, args.application_id)
     work = Path(tempfile.mkdtemp(prefix='anp-se-acceptance-'))
@@ -149,14 +167,26 @@ def accept(args):
         'unsigned_persistent_creation_refused': None,
         'hardware_acceptance_complete': False,
         'lifecycle_acceptance_complete': False,
+        'cross_uid_scope': ('independent-security-session' if getattr(args, 'isolated_session', False)
+                            else 'inherited-security-session'),
+        'scope_limitations': ([
+            'independent-session denial does not supersede demonstrated inherited-session access',
+            'the deployed Agent launcher and full helper lifecycle require separate acceptance',
+        ] if getattr(args, 'isolated_session', False) else []),
+        'denial_layer': ('application-login-policy' if getattr(args, 'checked_open', False)
+                         else 'raw-keychain'),
         'pending': PENDING,
     }
+    if getattr(args, 'checked_open', False):
+        report['scope_limitations'].append(
+            'application-policy denial does not establish raw OS keychain separation')
     created = False
     try:
         # 1. Process A creates a persistent SE key and its envelope-side state.
         result = run(binary, 'create', state, tag, timeout=args.timeout)
         require_success(result, 'create')
         created = True
+        report['creator_context'] = process_context(result)
         state_data = read_state(state)
         if state_data['tag_hint'] != tag:
             raise AcceptanceError('created state names a different tag')
@@ -164,7 +194,8 @@ def accept(args):
         report['state_sha256'] = hashlib.sha256(state.read_bytes()).hexdigest()
 
         # 2. Process B reopens it. This is the actual claim.
-        result = run(binary, 'open', state, timeout=args.timeout)
+        open_command = 'open-checked' if getattr(args, 'checked_open', False) else 'open'
+        result = run(binary, open_command, state, timeout=args.timeout)
         text = require_success(result, 'open in a new process')
         if 'PASS ' + tag not in text:
             raise AcceptanceError(f'open did not report PASS for {tag}: {text}')
@@ -175,23 +206,57 @@ def accept(args):
         #    on purpose: the denial has to come from the keychain, not from
         #    file permissions on the state.
         if args.other_uid is not None:
-            public = Path(tempfile.mkdtemp(prefix='anp-se-public-'))
+            # macOS TMPDIR has a user-only (0700) ancestor. Making its child
+            # world-searchable cannot let another UID traverse that ancestor.
+            # Only the public ciphertext/state and signed code go here; the
+            # private work directory and key material remain separate.
+            public = Path(tempfile.mkdtemp(prefix='anp-se-public-', dir='/private/tmp'))
             public_directories.append(public)
             os.chmod(public, 0o755)
             public_state = public / 'state.json'
             shutil.copyfile(state, public_state)
             os.chmod(public_state, 0o644)
-            public_binary = public / 'se-persistence'
-            shutil.copyfile(binary, public_binary)
+            # Preserve the containing app/profile for development signatures;
+            # a bare copied executable may be killed before keychain access.
+            bundle = binary.parent.parent.parent
+            if (binary.parent.name == 'MacOS' and bundle.suffix == '.app'
+                    and (bundle / 'Contents' / 'embedded.provisionprofile').is_file()):
+                copied_bundle = public / bundle.name
+                shutil.copytree(bundle, copied_bundle)
+                public_binary = copied_bundle / 'Contents' / 'MacOS' / binary.name
+            else:
+                public_binary = public / 'se-persistence'
+                shutil.copyfile(binary, public_binary)
             os.chmod(public_binary, 0o755)
             if hashlib.sha256(public_binary.read_bytes()).hexdigest() != args.sha256:
                 raise AcceptanceError('copied acceptance binary changed bytes')
-            denied = run(public_binary, 'open', public_state, uid=args.other_uid,
-                         timeout=args.timeout)
+            extra = {'isolated_session': True} if getattr(args, 'isolated_session', False) else {}
+            denied = run(public_binary, open_command, public_state, uid=args.other_uid,
+                         timeout=args.timeout, **extra)
+            report['other_uid_probe'] = {
+                'requested_uid': args.other_uid,
+                'returncode': denied.returncode,
+                'context': process_context(denied),
+                'output': output(denied),
+            }
+            context = report['other_uid_probe']['context']
+            if (context is None or context.get('uid') != args.other_uid
+                    or context.get('euid') != args.other_uid):
+                raise AcceptanceError('second UID kernel identity was not confirmed')
+            if getattr(args, 'isolated_session', False):
+                creator = report['creator_context']
+                if (creator is None or context.get('audit_uid') != args.other_uid
+                        or context.get('audit_session') in (None, 0, 0xffffffff,
+                                                           creator.get('audit_session'))
+                        or context.get('session_attributes', 0xffffffff) & 0x1011):
+                    raise AcceptanceError('independent security session was not confirmed')
             if denied.returncode == 0:
                 raise AcceptanceError('another UID reopened the Secure Enclave key')
             detail = output(denied)
-            if not any(marker in detail for marker in
+            if getattr(args, 'checked_open', False):
+                if 'SE_LOGIN_SESSION_REQUIRED' not in detail:
+                    raise AcceptanceError('production login policy did not provide the expected refusal: ' + detail)
+            elif not any(marker in detail for marker in
                        ('cannot use it', 'no key with that label', 'not allowed',
                         'HardwareMissing', 'errSecItemNotFound')):
                 raise AcceptanceError('second UID failed for an unexpected reason: ' + detail)
@@ -244,6 +309,11 @@ def accept(args):
             report['unsigned_persistent_creation_refused'] = True
         else:
             report['phases']['unsigned_create_refused'] = 'not tested (no --unsigned-binary)'
+    except AcceptanceError as error:
+        # Preserve the actual identities, partial phases and cleanup result on
+        # failures too; a summary string alone loses the security evidence.
+        error.report = report
+        raise
     finally:
         if created:
             try:
@@ -274,6 +344,10 @@ def main():
     parser.add_argument('--application-id', required=True)
     parser.add_argument('--other-uid', type=int,
                         help='second non-root UID that must be denied; run through sudo')
+    parser.add_argument('--isolated-session', action='store_true',
+                        help='test a fresh non-GUI audit/bootstrap session; does not supersede inherited-session findings')
+    parser.add_argument('--checked-open', action='store_true',
+                        help='test application login policy, separately from raw OS keychain access')
     parser.add_argument('--unsigned-binary', type=Path,
                         help='same example built and signed without the SE entitlement')
     parser.add_argument('--unsigned-sha256',
@@ -286,9 +360,12 @@ def main():
             raise AcceptanceError('expected a lowercase SHA-256')
         report = accept(args)
     except (AcceptanceError, ValueError, OSError) as error:
-        report = {'schema': 1, 'passed': False, 'error': str(error),
+        report = getattr(error, 'report', {'schema': 1,
                   'hardware_acceptance_complete': False,
-                  'lifecycle_acceptance_complete': False}
+                  'lifecycle_acceptance_complete': False})
+        report.update(passed=False, error=str(error))
+        if args.out:
+            args.out.write_text(json.dumps(report, indent=2) + '\n')
         print(json.dumps(report, indent=2))
         return 1
     report['passed'] = report['persistence_across_processes'] and report['deleted_key_rejected']

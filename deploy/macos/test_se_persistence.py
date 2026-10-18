@@ -35,7 +35,7 @@ if command == 'create':
         handle.write(json.dumps(body))
     os.chmod(state, 0o600)
     print('CREATED ' + tag)
-elif command == 'open':
+elif command in ('open', 'open-checked'):
     state = sys.argv[2]
     body = json.load(open(state))
     if os.path.exists(state + '.deleted'):
@@ -102,6 +102,37 @@ class PersistenceHarness(unittest.TestCase):
         self.assertTrue(report['unsigned_persistent_creation_refused'])
         self.assertEqual(report['phases']['unsigned_create_refused'], 'ok')
 
+    def test_cross_uid_probe_preserves_development_bundle_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory) / 'Probe.app'
+            executable_dir = bundle / 'Contents' / 'MacOS'
+            executable_dir.mkdir(parents=True)
+            profile = bundle / 'Contents' / 'embedded.provisionprofile'
+            profile.write_bytes(b'profile fixture')
+            binary = script(executable_dir, 'probe', FAKE)
+            args = self.args(binary)
+            args.other_uid = os.geteuid() + 1
+            original_run = harness.run
+
+            def run(candidate, *arguments, uid=None, timeout=120):
+                if uid is not None:
+                    public = candidate.parent.parent.parent.parent
+                    self.assertEqual(public.parent, Path('/private/tmp'))
+                    self.assertEqual(stat.S_IMODE(public.stat().st_mode), 0o755)
+                    self.assertEqual(stat.S_IMODE(Path(arguments[1]).stat().st_mode), 0o644)
+                    self.assertEqual(candidate.parent.name, 'MacOS')
+                    self.assertEqual((candidate.parent.parent / 'embedded.provisionprofile').read_bytes(),
+                                     profile.read_bytes())
+                    self.assertEqual(candidate.read_bytes(), binary.read_bytes())
+                    return SimpleNamespace(returncode=1, stdout=b'',
+                                           stderr=('SE_CONTEXT ' + json.dumps({'uid': uid, 'euid': uid})
+                                                   + '\nno key with that label').encode())
+                return original_run(candidate, *arguments, timeout=timeout)
+
+            with patch.object(harness, 'verify_binary', return_value={}), patch.object(harness, 'run', side_effect=run):
+                report = harness.accept(args)
+            self.assertTrue(report['cross_uid_denial'])
+
     def test_state_file_must_be_private_and_well_formed(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / 'state.json'
@@ -136,7 +167,7 @@ class PersistenceHarness(unittest.TestCase):
             def fake_run(command, *arguments, uid=None, timeout=120):
                 if uid == 502:
                     return SimpleNamespace(returncode=1, stdout=b'',
-                                           stderr=b'no key with that label')
+                                           stderr=b'SE_CONTEXT {"uid":502,"euid":502}\nno key with that label')
                 return real_run(command, *arguments, timeout=timeout)
 
             with patch.object(harness, 'verify_binary',
@@ -146,6 +177,44 @@ class PersistenceHarness(unittest.TestCase):
                         report = harness.accept(args)
         self.assertTrue(report['cross_uid_denial'])
         self.assertEqual(report['phases']['cross_uid_denied'], 'ok')
+
+    def test_cross_uid_success_remains_failure_and_preserves_context_and_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = script(directory, 'se-persistence', FAKE)
+            args = self.args(binary)
+            args.other_uid = 502
+            real_run = harness.run
+
+            def run(command, *arguments, uid=None, timeout=120):
+                if uid is not None:
+                    return SimpleNamespace(returncode=0, stdout=b'PASS unexpected',
+                        stderr=b'SE_CONTEXT {"uid":502,"euid":502,"audit_uid":501,"audit_session":123}')
+                return real_run(command, *arguments, timeout=timeout)
+
+            with patch.object(harness, 'verify_binary', return_value={}), patch.object(harness, 'run', side_effect=run):
+                with self.assertRaisesRegex(harness.AcceptanceError, 'another UID reopened') as caught:
+                    harness.accept(args)
+            report = caught.exception.report
+            self.assertEqual(report['other_uid_probe']['context']['audit_uid'], 501)
+            self.assertEqual(report['other_uid_probe']['returncode'], 0)
+            self.assertEqual(report['phases']['cleanup'], 'ok')
+            self.assertIsNone(report['cross_uid_denial'])
+
+    def test_missing_kernel_context_is_not_keychain_denial_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = script(directory, 'se-persistence', FAKE)
+            args = self.args(binary)
+            args.other_uid = 502
+            real_run = harness.run
+
+            def run(command, *arguments, uid=None, timeout=120):
+                if uid is not None:
+                    return SimpleNamespace(returncode=1, stdout=b'', stderr=b'no key with that label')
+                return real_run(command, *arguments, timeout=timeout)
+
+            with patch.object(harness, 'verify_binary', return_value={}), patch.object(harness, 'run', side_effect=run):
+                with self.assertRaisesRegex(harness.AcceptanceError, 'kernel identity was not confirmed'):
+                    harness.accept(args)
 
     def test_root_invocation_is_refused(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -169,6 +238,64 @@ class PersistenceHarness(unittest.TestCase):
                          ['/usr/bin/sudo', '-u', 'other', '--', '/tmp/probe'])
         self.assertEqual(command[5:], ['open', '/tmp/state'])
         self.assertNotIn('preexec_fn', started.call_args[1])
+
+    def test_software_policy_denial_is_not_raw_keychain_denial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = script(directory, 'se-persistence', FAKE)
+            args = self.args(binary)
+            args.other_uid = 502
+            real_run = harness.run
+
+            def run(command, *arguments, uid=None, timeout=120):
+                if uid is not None:
+                    return SimpleNamespace(returncode=1, stdout=b'',
+                        stderr=b'SE_CONTEXT {"uid":502,"euid":502}\nmisuse: SE_LOGIN_SESSION_REQUIRED')
+                return real_run(command, *arguments, timeout=timeout)
+
+            with patch.object(harness, 'verify_binary', return_value={}), patch.object(harness, 'run', side_effect=run):
+                with self.assertRaisesRegex(harness.AcceptanceError, 'unexpected reason'):
+                    harness.accept(args)
+                args.checked_open = True
+                report = harness.accept(args)
+            self.assertTrue(report['cross_uid_denial'])
+            self.assertEqual(report['denial_layer'], 'application-login-policy')
+            self.assertIn('application-policy denial does not establish raw OS keychain separation',
+                          report['scope_limitations'])
+
+    def test_independent_probe_requires_new_audit_session_and_target_audit_uid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = script(directory, 'se-persistence', FAKE)
+            args = self.args(binary)
+            args.other_uid = 502
+            args.isolated_session = True
+            real_run = harness.run
+            creator = {'uid': 501, 'euid': 501, 'audit_uid': 501,
+                       'audit_session': 100, 'session_attributes': 0x10}
+            good = {'uid': 502, 'euid': 502, 'audit_uid': 502,
+                    'audit_session': 200, 'session_attributes': 0}
+            for changes in ({}, {'audit_uid': 501}, {'audit_session': 100},
+                            {'session_attributes': 0x10}):
+                other = {**good, **changes}
+
+                def run(command, *arguments, uid=None, timeout=120, isolated_session=False):
+                    if uid is not None:
+                        self.assertTrue(isolated_session)
+                        return SimpleNamespace(returncode=1, stdout=b'',
+                            stderr=('SE_CONTEXT ' + json.dumps(other) + '\nno key with that label').encode())
+                    result = real_run(command, *arguments, timeout=timeout)
+                    if arguments[0] == 'create':
+                        result.stderr += ('SE_CONTEXT ' + json.dumps(creator) + '\n').encode()
+                    return result
+
+                with self.subTest(changes=changes), patch.object(harness, 'verify_binary', return_value={}), patch.object(harness, 'run', side_effect=run):
+                    if changes:
+                        with self.assertRaisesRegex(harness.AcceptanceError, 'independent security session'):
+                            harness.accept(args)
+                    else:
+                        report = harness.accept(args)
+                        self.assertTrue(report['cross_uid_denial'])
+                        self.assertEqual(report['cross_uid_scope'], 'independent-security-session')
+                        self.assertTrue(report['scope_limitations'])
 
 
 if __name__ == '__main__':

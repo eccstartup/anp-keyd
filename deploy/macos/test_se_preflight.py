@@ -90,6 +90,8 @@ class ReleaseGate(unittest.TestCase):
             self.assertFalse(report['hardware_acceptance_complete'])
             self.assertFalse(report['protected_supported'])
             self.assertTrue(report['pending'])
+            self.assertEqual(command.call_args_list[-1].args[0],
+                             ['/usr/bin/codesign', '-d', '--entitlements', ':-', str(binary)])
             for call in command.call_args_list:
                 self.assertEqual(call.args[0][0], '/usr/bin/codesign')
 

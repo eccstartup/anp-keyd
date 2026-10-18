@@ -58,7 +58,7 @@ class ReleasePolicy(unittest.TestCase):
 
     def test_info_plist_matches_bundle_identity(self):
         plist = release.info_plist(APP, '0.1.0')
-        self.assertEqual(plist['CFBundleIdentifier'], APP)
+        self.assertEqual(plist['CFBundleIdentifier'], APP.split('.', 1)[1])
         self.assertEqual(plist['CFBundleExecutable'], 'anp-keyd')
         self.assertEqual(plist['CFBundlePackageType'], 'APPL')
         self.assertIs(plist['LSBackgroundOnly'], True)

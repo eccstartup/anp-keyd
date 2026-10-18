@@ -17,6 +17,15 @@ import threading
 import time
 import uuid
 
+PYTHON = str(Path(sys.executable).resolve())
+
+
+def require_success(result, phase):
+    if result.returncode != 0:
+        signal_note = f' (signal {-result.returncode})' if result.returncode < 0 else ''
+        raise ValueError(f'{phase} failed: exit={result.returncode}{signal_note}; '
+                         f'stdout={result.stdout!r}; stderr={result.stderr!r}')
+
 
 def child_credentials(user, config, extra_admin_group=False):
     groups = [config['agent_gid']]
@@ -42,12 +51,22 @@ def main():
     parser.add_argument('--candidate-sha256')
     parser.add_argument('--signing-helper', type=Path, help='digest-pinned local-preview-fixture example; enables full temporary signing checks')
     parser.add_argument('--helper-sha256')
+    parser.add_argument('--se-login-bundle', type=Path, help='profile-embedded full signed helper; enables real SE joint acceptance with a signed generate-se fixture helper')
+    parser.add_argument('--se-login-sha256')
     parser.add_argument('--interactive-ui', action='store_true', help='human window checks: cancel, 120-second timeout, masked temporary-password unlock')
     parser.add_argument('--migrate-fixture', action='store_true', help='install only the disposable fixture through the supported offline migrator and verify recovery/resume')
     parser.add_argument('--claude-binary', type=Path, help='reviewed standalone Claude Code binary; enables complete framework/tool execution with a local API fixture')
     parser.add_argument('--claude-sha256', help='SHA-256 of the reviewed framework binary')
     parser.add_argument('--container-regression', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.se_login_bundle:
+        args.se_login_bundle = args.se_login_bundle.absolute()
+        if not args.signing_helper or not args.se_login_sha256 or not args.candidate_binary:
+            raise ValueError('SE joint acceptance requires fixture helper, pinned login helper and candidate service')
+        if args.migrate_fixture or args.claude_binary or args.ui_preflight_only or args.container_regression:
+            raise ValueError('SE joint acceptance must run separately from other acceptance modes')
+    elif args.se_login_sha256:
+        raise ValueError('--se-login-sha256 requires --se-login-bundle')
     args.config = args.config.absolute()
     args.binary = args.binary.absolute()
     if args.candidate_binary:
@@ -89,8 +108,14 @@ def main():
     def run(user, *command):
         if command and Path(str(command[0])).name == 'anp-keyd':
             print(f'CHECK uid={user.pw_uid} keyd ' + ' '.join(map(str, command[1:4])), flush=True)
-        return subprocess.run(list(map(str, command)), **credentials(user),
-                              env=env, capture_output=True, text=True, timeout=15, cwd="/")
+        try:
+            return subprocess.run(list(map(str, command)), **credentials(user),
+                                  env=env, capture_output=True, text=True, timeout=15, cwd="/")
+        except subprocess.TimeoutExpired as error:
+            def decoded(value):
+                return value.decode(errors='replace') if isinstance(value, bytes) else (value or '')
+            raise ValueError(f'UID {user.pw_uid} command timed out: {command[0]}; '
+                             f'stdout={decoded(error.stdout)!r}; stderr={decoded(error.stderr)!r}') from error
     parent = '/tmp' if portable else '/Library'
     if portable:
         parent = '/keyd-checks'
@@ -122,9 +147,6 @@ def main():
             os.chown(path, service.pw_uid, gid)
             path.chmod(mode)
         fixture = None
-        if args.signing_helper:
-            import acceptance_signing
-            fixture = acceptance_signing.prepare(base, config, args, admin, service, run)
         path = base / 'service.json'
         path.write_text(json.dumps(config))
         path.chmod(0o644)
@@ -132,13 +154,17 @@ def main():
             return run(user, args.binary, 'admin', '--config', path, *command)
         # Check the effective child credentials and exact config/state access
         # before asking the Rust initializer to operate on this new test state.
-        probe = r'''import ctypes,json,os,sys
+        probe = r'''import sys
+print('python-started',file=sys.stderr,flush=True)
+import ctypes,json,os
 config,state=sys.argv[1:]
 with open(config) as handle: json.load(handle)
+print('config-read',file=sys.stderr,flush=True)
 fd=os.open(state,os.O_RDONLY);os.close(fd)
 name=os.path.join(state,'.acceptance-access-probe')
 fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
 os.write(fd,b'temporary access probe');os.fsync(fd);os.close(fd);os.unlink(name)
+print('state-write-fsync-complete',file=sys.stderr,flush=True)
 lib=ctypes.CDLL(None,use_errno=True)
 count=lib.getgroups(0,None)
 if count<0: raise OSError(ctypes.get_errno(),'getgroups')
@@ -146,11 +172,29 @@ groups=(ctypes.c_uint*count)()
 if lib.getgroups(count,groups)<0: raise OSError(ctypes.get_errno(),'getgroups')
 print(json.dumps({'uid':os.getuid(),'euid':os.geteuid(),'gid':os.getgid(),'kernel_groups':list(groups),'config_read':True,'state_write':True}))
 '''
-        access = run(service, '/usr/bin/python3', '-I', '-c', probe, path, config['state_dir'])
+        print(f'CHECK service UID {service.pw_uid} interpreter/filesystem preflight: {PYTHON}', flush=True)
+        access = run(service, PYTHON, '-I', '-c', probe, path, config['state_dir'])
         assert access.returncode == 0, 'service credential/filesystem preflight failed: ' + access.stderr
         print('PASS service access preflight: ' + access.stdout.strip(), flush=True)
+        # A restricted-entitlement helper copied out of its profile-bearing app
+        # can be killed by AMFI without stderr. Test the actual copied service
+        # executable under its own UID before creating any persistent SE key.
+        info = run(service, args.binary, 'build-info')
+        require_success(info, 'service executable admission')
+        flags = json.loads(info.stdout)
+        if args.se_login_bundle:
+            if not (flags['release'] and flags['hardware_se'] and flags['mcp']) or any(
+                flags[name] for name in ('hardware_software', 'seed_export', 'protected_supported')
+            ):
+                raise ValueError('SE joint service has unexpected build flags')
+        print('PASS service executable admission: ' + info.stdout.strip(), flush=True)
+        # Do not create persistent hardware objects before this no-hardware gate.
+        if args.signing_helper:
+            import acceptance_signing
+            fixture = acceptance_signing.prepare(base, config, args, admin, service, run)
+            path.write_text(json.dumps(config))
         result = run(service, args.binary, 'init-protected-state', '--config', path)
-        assert result.returncode == 0, 'init-protected-state failed: ' + result.stderr
+        require_success(result, 'init-protected-state')
         print('PASS temporary state initialized', flush=True)
         if args.migrate_fixture:
             import acceptance_migration
@@ -199,8 +243,16 @@ print(json.dumps({'uid':os.getuid(),'euid':os.geteuid(),'gid':os.getgid(),'kerne
                 return
             checks = None
             if fixture:
-                checks = acceptance_signing.Checks(base, config, path, args, fixture, admin, agent, credentials, env, cli)
+                if args.se_login_bundle:
+                    import acceptance_se
+                    checks_type = acceptance_se.Checks
+                else:
+                    checks_type = acceptance_signing.Checks
+                checks = checks_type(base, config, path, args, fixture, admin, agent, credentials, env, cli)
                 checks.before_restart()
+                if args.se_login_bundle:
+                    print('PASS real SE/full helper/separate service signing and helper-death checks; OS isolation and host lifecycle remain unaccepted', flush=True)
+                    return
                 if args.claude_binary:
                     import acceptance_agent
                     acceptance_agent.Framework(checks).run()
@@ -219,7 +271,7 @@ if status == 0:
 print('task_for_pid denied')
 '''
             if not portable:
-                result = run(agent, '/usr/bin/python3', '-I', '-c', script, process.pid)
+                result = run(agent, PYTHON, '-I', '-c', script, process.pid)
                 assert result.returncode == 0 and 'task_for_pid denied' in result.stdout, result.stderr
                 print('PASS independent Agent UID cannot obtain daemon task port', flush=True)
             else:

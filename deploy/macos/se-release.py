@@ -99,7 +99,7 @@ def info_plist(application, version):
     return {
         'CFBundleDevelopmentRegion': 'en',
         'CFBundleExecutable': EXECUTABLE,
-        'CFBundleIdentifier': application,
+        'CFBundleIdentifier': application.split('.', 1)[1],
         'CFBundleInfoDictionaryVersion': '6.0',
         'CFBundleName': 'ANPKeyd',
         'CFBundlePackageType': 'APPL',
@@ -233,7 +233,7 @@ def bundle_layout(bundle, team, application):
         plist = plistlib.loads(plist_path.read_bytes())
     except (OSError, plistlib.InvalidFileException) as error:
         raise ReleaseError(f'cannot read bundle Info.plist: {error}') from error
-    if plist.get('CFBundleIdentifier') != application:
+    if plist.get('CFBundleIdentifier') != application.split('.', 1)[1]:
         raise ReleaseError('bundle CFBundleIdentifier differs from the approved identifier')
     if plist.get('CFBundleExecutable') != EXECUTABLE:
         raise ReleaseError('bundle CFBundleExecutable is not the expected helper executable')
@@ -443,10 +443,10 @@ def build(args):
 def sign_example(args):
     """Sign a bare acceptance example with the reviewed entitlement set.
 
-    A macOS command-line tool does not need a provisioning profile for
-    `keychain-access-groups`: TN3137 makes it a code-signing entitlement tied to
-    the Team ID. The example still gets the same exact entitlement set as the
-    helper so the probe exercises the production keychain profile.
+    The example gets the helper's exact entitlement set. Profile requirements
+    depend on the signing context: development signing may require a matching
+    profile for runtime admission. This command does not embed or install one;
+    preflight success alone does not establish that the OS will run the probe.
     """
     validate_identity_fields(args.team_id, args.application_id)
     identity = resolve_identity(args.identity)

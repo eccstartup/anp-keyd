@@ -4,10 +4,10 @@ use std::path::PathBuf;
 fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        Some("generate") => {
+        Some(mode @ ("generate" | "generate-se")) => {
             let path = PathBuf::from(args.next().expect("new fixture directory"));
             assert!(args.next().is_none());
-            generate(path);
+            generate(path, mode == "generate-se");
         }
         Some("verify") => {
             use std::collections::BTreeMap;
@@ -31,15 +31,23 @@ fn main() {
             .expect("independent upstream verification failed");
             println!("VERIFIED");
         }
-        _ => panic!("expected generate NEW_DIRECTORY or verify with public JSON stdin"),
+        _ => panic!("expected generate/generate-se NEW_DIRECTORY or verify with public JSON stdin"),
     }
 }
-fn generate(path: PathBuf) {
+fn generate(path: PathBuf, secure_enclave: bool) {
     use anp_keyd::crypto::kdf::Argon2Config;
     use anp_keyd::did::document::{self, DidDocumentSpec};
     use anp_keyd::keystore::hardware::HardwareChoice;
     use anp_keyd::keystore::layout::KeydLayout;
     use anp_keyd::keystore::{create, device, store, unwrap};
+    // Only the disposable hot key uses SE. The root remains available for
+    // document construction; the independent service must never open SE itself.
+    let hot_hardware = if secure_enclave {
+        "secure-enclave".parse::<HardwareChoice>()
+            .expect("generate-se requires macOS and hardware-se")
+    } else {
+        HardwareChoice::None
+    };
     assert!(!path.exists(), "fixture must be newly generated");
     let layout = KeydLayout::at(path);
     layout.ensure().unwrap();
@@ -61,7 +69,7 @@ fn generate(path: PathBuf) {
     let wrapped = store::load(&layout, &created.wrapped.id.thumbprint).unwrap();
     let key = unwrap::unlock(&wrapped, pass, &device::load(&layout).unwrap()).unwrap();
     let doc = document::publishable(&spec, &created.did, &key).unwrap();
-    let (_, extra) = create::create_extra(
+    let (hot, extra) = create::create_extra(
         &layout,
         &created.did,
         "http-hot",
@@ -73,7 +81,7 @@ fn generate(path: PathBuf) {
             t_cost: 1,
             p_cost: 1,
         },
-        HardwareChoice::None,
+        hot_hardware,
     )
     .unwrap();
     let mut unsigned = anp_keyd::did::lifecycle::strip_proof(&doc).unwrap();
@@ -111,6 +119,8 @@ fn generate(path: PathBuf) {
     store::write_did_document(&layout, &created.did, &doc).unwrap();
     println!(
         "{}",
-        serde_json::json!({"did":created.did,"kid":wrapped.id.kid,"document":doc})
+        serde_json::json!({"did":created.did,"kid":wrapped.id.kid,"document":doc,
+            "hot_kid": hot.id.kid, "hot_hardware": hot.hardware,
+            "fixture_only": true, "protected_supported": false})
     );
 }

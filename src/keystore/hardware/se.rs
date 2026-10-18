@@ -46,11 +46,11 @@
 //! 而那把钥匙不需要签名身份。跑的是 [`seal`](HardwareBackend::seal) 和
 //! [`open`](HardwareBackend::open) 里除了持久化之外的**每一行**。
 //!
-//! **没被验的是持久化那一段**(建持久钥匙 + 按标签找回):本机 `security
-//! find-identity -v -p codesigning` 是 0 个身份,所以拿不到那个 entitlement,
-//! 那一段在这里跑不起来。它在下面被单独隔成了
-//! [`create_persistent_se_key`] / [`find_key`] 两个函数 —— 读的人能一眼看出
-//! 截断在哪里,而不是以为整块都验过了。
+//! 持久化由独立签名验收示例覆盖，普通单元测试不能代替该验收。
+//! 同签名/访问组的原始探针已在另一个 UID 和新审计会话中重开密钥，
+//! 因此不能把这些 OS 属性当成钥匙串拒绝保证。生产 `seal/open` 还会执行
+//! 当前本机图形登录用户检查；原始验收路径保持独立，避免把软件拒绝误记成
+//! 钥匙串拒绝。详细证据和未验项见部署验收记录。
 //!
 //! # 执行上下文也是前置条件
 //!
@@ -64,7 +64,7 @@ use core_foundation::data::CFData;
 use core_foundation::dictionary::CFMutableDictionary;
 use core_foundation::error::{CFError, CFErrorRef};
 use hkdf::Hkdf;
-use security_framework::item::{ItemClass, ItemSearchOptions, Location, Reference, SearchResult};
+use security_framework::item::{ItemClass, ItemSearchOptions, KeyClass, Location, Reference, SearchResult};
 use security_framework::key::{Algorithm, GenerateKeyOptions, KeyType, SecKey, Token};
 use security_framework_sys::item::{
     kSecAttrKeyClass, kSecAttrKeyClassPublic, kSecAttrKeyType, kSecAttrKeyTypeECSECPrimeRandom,
@@ -206,6 +206,9 @@ fn find_key(label: &str) -> Result<SecKey> {
     let mut search = ItemSearchOptions::new();
     search
         .class(ItemClass::key())
+        // Key generation can persist both halves under the same label. ECDH
+        // and deletion must select the private half, never the first match.
+        .key_class(KeyClass::private())
         .label(label)
         // 数据保护钥匙串。SE 私钥必须存在这里(Apple 的规矩),而搜的时候
         // 不指明的话搜的是登录钥匙串 —— 那就永远找不到,症状却又像"钥匙丢
@@ -379,6 +382,20 @@ impl HardwareBackend for SecureEnclave {
     }
 
     fn seal(&self, tag_hint: &str) -> Result<SealedHardware> {
+        crate::security::se_session::require_local_login()?;
+        self.seal_raw(tag_hint)
+    }
+
+    fn open(&self, root: &HardwareRoot, ciphertext: &[u8]) -> Result<LockedBytes> {
+        crate::security::se_session::require_local_login()?;
+        self.open_raw(root, ciphertext)
+    }
+}
+
+impl SecureEnclave {
+    // Raw keychain access is deliberately kept separate from the production
+    // login policy so acceptance probes cannot mistake our guard for OS denial.
+    fn seal_raw(&self, tag_hint: &str) -> Result<SealedHardware> {
         let label = label_for(tag_hint)?;
 
         // 标签撞了就拒绝,不覆盖 —— 覆盖会把上一封信封的第三路熵悄悄换掉,
@@ -410,7 +427,7 @@ impl HardwareBackend for SecureEnclave {
         }
     }
 
-    fn open(&self, root: &HardwareRoot, ciphertext: &[u8]) -> Result<LockedBytes> {
+    fn open_raw(&self, root: &HardwareRoot, ciphertext: &[u8]) -> Result<LockedBytes> {
         let HardwareRoot::SecureEnclave { tag } = root else {
             return Err(KeydError::Protocol(
                 "the Secure Enclave backend was handed a record for a different kind of root".into(),
@@ -577,11 +594,18 @@ pub fn acceptance_create(tag_hint: &str) -> Result<SealedHardware> {
             "SE acceptance tag must begin with {ACCEPTANCE_TAG_PREFIX:?}"
         )));
     }
-    SECURE_ENCLAVE.seal(tag_hint)
+    SECURE_ENCLAVE.seal_raw(tag_hint)
 }
 
 #[cfg(feature = "se-acceptance")]
 pub fn acceptance_open(root: &HardwareRoot, ciphertext: &[u8]) -> Result<LockedBytes> {
+    acceptance_label(root)?;
+    SECURE_ENCLAVE.open_raw(root, ciphertext)
+}
+
+/// Test the production login policy separately from the raw OS keychain path.
+#[cfg(feature = "se-acceptance")]
+pub fn acceptance_open_checked(root: &HardwareRoot, ciphertext: &[u8]) -> Result<LockedBytes> {
     acceptance_label(root)?;
     SECURE_ENCLAVE.open(root, ciphertext)
 }

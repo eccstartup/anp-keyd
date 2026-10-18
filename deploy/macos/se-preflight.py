@@ -87,7 +87,11 @@ def inspect(binary, digest, context, team, application):
     # codesign includes runtime in the parenthesized flag description.
     flags = re.search(r'flags=0x[0-9a-f]+\(([^)]*)\)', details.stderr.decode())
     metadata['flags'] = flags.group(1) if flags else ''
-    raw = command(['/usr/bin/codesign', '-d', '--entitlements', '-', str(binary)]).stdout
+    # Current codesign defaults to a human-readable [Dict] representation.
+    # The colon-prefixed destination serializes DER entitlements as a plist;
+    # --xml alone can return nothing for a DER-only signature. Fail closed if
+    # a future codesign removes this deprecated serialization interface.
+    raw = command(['/usr/bin/codesign', '-d', '--entitlements', ':-', str(binary)]).stdout
     entitlements = plistlib.loads(raw) if raw else {}
     if not isinstance(entitlements, dict):
         raise ValueError('entitlements must be a dictionary')

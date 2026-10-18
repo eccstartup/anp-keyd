@@ -9,6 +9,7 @@ import pwd
 import shutil
 import stat
 import subprocess
+import sys
 import time
 import uuid
 
@@ -23,17 +24,32 @@ def prepare(base, config, args, admin, service, run):
     if len(content) > 128 * 1024 * 1024 or hashlib.sha256(content).hexdigest() != args.helper_sha256:
         raise ValueError('fixture helper digest mismatch')
     helper = base / 'fixture-helper'
-    with helper.open('xb') as target:
-        target.write(content)
+    if getattr(args, 'se_login_bundle', None):
+        from acceptance_se import validate_bundle
+        # Keep the profile beside the signed executable for runtime admission.
+        # executable -> MacOS -> Contents -> App.app
+        bundle = args.signing_helper.parent.parent.parent
+        validate_bundle(bundle)
+        if bundle.suffix != '.app' or not (bundle / 'Contents/embedded.provisionprofile').is_file():
+            raise ValueError('SE fixture helper requires a profile-embedded app bundle')
+        shutil.copytree(bundle, base / 'Fixture.app', symlinks=False)
+        helper = base / 'Fixture.app/Contents/MacOS' / args.signing_helper.name
+        if hashlib.sha256(helper.read_bytes()).hexdigest() != args.helper_sha256:
+            raise ValueError('copied SE fixture digest mismatch')
+    else:
+        with helper.open('xb') as target:
+            target.write(content)
     helper.chmod(0o755)  # new root-owned copy in a root-owned directory
     work = base / 'fixture-work'
     work.mkdir(mode=0o700)
     os.chown(work, admin.pw_uid, admin.pw_gid)
     source = work / 'vault'
     print(f'CHECK generating disposable fixture as administrator UID {admin.pw_uid}', flush=True)
-    made = run(admin, helper, 'generate', source)
+    made = run(admin, helper, 'generate-se' if getattr(args, 'se_login_bundle', None) else 'generate', source)
     assert made.returncode == 0, made.stderr
     manifest = json.loads(made.stdout)
+    if getattr(args, 'se_login_bundle', None):
+        print('SE fixture hardware locator (retain for explicit cleanup): ' + json.dumps(manifest['hot_hardware']), flush=True)
     parent = Path(config['state_dir']) / 'vaults'
     parent.mkdir(mode=0o700)
     os.chown(parent, service.pw_uid, service.pw_gid)
@@ -107,7 +123,7 @@ class Checks:
         # Only these children receive test transport access; account records
         # remain untouched. Native subprocess credential errors retain errno.
         endpoint = self.config['admin_socket' if management else 'sign_socket']
-        result = subprocess.run(['/usr/bin/python3', '-I', '-c', REQUEST, endpoint,
+        result = subprocess.run([str(Path(sys.executable).resolve()), '-I', '-c', REQUEST, endpoint,
                                  str(self.config['service_uid']), 'refuse' if extra_admin_group else ('yes' if secret else 'no')],
                                 input=json.dumps({'version': 2, 'request': operation}),
                                 capture_output=True, text=True, **self.credentials(user, extra_admin_group),
@@ -179,6 +195,9 @@ class Checks:
         self.expect_locked()
         refused = self.cli(self.agent, 'unlock', '--native-ui', '--vault-id', self.fixture['vault_id'], '--did', self.key['did'], '--kid', self.key['kid'])
         assert refused.returncode != 0 and 'ADMIN_REQUIRED' in refused.stderr, refused.stderr
+        self.exercise_signing()
+
+    def exercise_signing(self):
         self.unlock()
         self.request = self.signing()
         result = self.request_as(self.agent, self.request)
