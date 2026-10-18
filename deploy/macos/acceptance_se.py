@@ -88,8 +88,21 @@ class Checks(acceptance_signing.Checks):
                     capture_output=True, text=True, timeout=15, **self.credentials(self.admin), env=self.env, cwd='/')
                 assert rejected.returncode != 0
                 assert self.request_as(self.agent, request)['data'] == reply['data']
-                helper.send_signal(signal.SIGKILL)
-                helper.wait(timeout=10)
+                # Prepare an approval before lease loss; it must not recreate
+                # authority after teardown advances the management epoch.
+                change = self.base / 'stale-grant.json'
+                change.write_text(json.dumps({'kind': 'Grant', 'change': {'action': 'Create',
+                    'principal_id': self.config['principals'][0]['principal_id'],
+                    'key_id': self.key['key_id'], 'policy_id': self.policy_id,
+                    'policy_version': 1, 'expiry': int(time.time()) + 240, 'max_uses': 1}}))
+                change.chmod(0o644)
+                prepared = self.cli(self.admin, 'prepare', '--file', change)
+                assert prepared.returncode == 0, prepared.stderr
+                pending = json.loads(prepared.stdout)['prepared']
+                ending = getattr(self.args, 'se_ending', 'kill')
+                helper.send_signal(signal.SIGSTOP if ending == 'hang' else signal.SIGKILL)
+                if ending == 'kill':
+                    helper.wait(timeout=10)
                 # Allow the documented observation deadline; then require both
                 # cached-result suppression and no authorized keys.
                 deadline = time.monotonic() + 10
@@ -102,9 +115,18 @@ class Checks(acceptance_signing.Checks):
                     time.sleep(.2)
                 keys = self.request_as(self.agent, {'operation': 'LIST_AUTHORIZED_KEYS'})
                 assert keys['code'] == 'OK' and keys['data']['keys'] == [], keys
+                stale = self.cli(self.admin, 'commit', '--operation-id', pending['operation_id'],
+                                 '--digest', pending['digest'])
+                assert stale.returncode != 0, 'old approval survived SE session loss'
+                if ending == 'hang':
+                    assert helper.poll() is None, 'hang test requires a live stopped helper'
+                    helper.send_signal(signal.SIGCONT)
+                    helper.wait(timeout=10)
+                    replay = self.request_as(self.agent, request)
+                    assert replay['code'] != 'OK' or 'result' not in replay.get('data', {}), replay
                 fresh = self.grant()
                 self.expect_locked(fresh)
-                print('PASS independently verified SE hot-key signature, retry, changed-target refusal, helper SIGKILL, cache suppression, revocation and locked key', flush=True)
+                print(f'PASS independently verified SE hot-key signature, retry, changed-target refusal, helper {ending}, cache suppression, revocation, stale-approval refusal and locked key', flush=True)
             finally:
                 if helper.poll() is None:
                     helper.kill()

@@ -53,6 +53,8 @@ def main():
     parser.add_argument('--helper-sha256')
     parser.add_argument('--se-login-bundle', type=Path, help='profile-embedded full signed helper; enables real SE joint acceptance with a signed generate-se fixture helper')
     parser.add_argument('--se-login-sha256')
+    parser.add_argument('--se-ending', choices=('kill', 'hang'), default='kill',
+                        help='real SE helper failure: SIGKILL or SIGSTOP with a live socket')
     parser.add_argument('--interactive-ui', action='store_true', help='human window checks: cancel, 120-second timeout, masked temporary-password unlock')
     parser.add_argument('--migrate-fixture', action='store_true', help='install only the disposable fixture through the supported offline migrator and verify recovery/resume')
     parser.add_argument('--claude-binary', type=Path, help='reviewed standalone Claude Code binary; enables complete framework/tool execution with a local API fixture')
@@ -65,6 +67,8 @@ def main():
             raise ValueError('SE joint acceptance requires fixture helper, pinned login helper and candidate service')
         if args.migrate_fixture or args.claude_binary or args.ui_preflight_only or args.container_regression:
             raise ValueError('SE joint acceptance must run separately from other acceptance modes')
+    elif args.se_ending != 'kill':
+        raise ValueError('--se-ending requires --se-login-bundle')
     elif args.se_login_sha256:
         raise ValueError('--se-login-sha256 requires --se-login-bundle')
     args.config = args.config.absolute()
