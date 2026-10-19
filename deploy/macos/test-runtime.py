@@ -131,6 +131,8 @@ def main():
     admin = pwd.getpwuid(installed['admin_uids'][0])
     agent = pwd.getpwuid(installed['principals'][0]['uid'])
     if args.se_ending == 'logout':
+        import acceptance_process
+        args.process_broker = acceptance_process.Broker()
         import acceptance_graphical
         from acceptance_console import console_uid
         if console_uid() != admin.pw_uid:
@@ -152,6 +154,8 @@ def main():
                 import acceptance_graphical
                 return subprocess.run(acceptance_graphical.command(user, path, command),
                     env=env, capture_output=True, text=True, timeout=30, cwd='/')
+            if args.se_ending == 'logout':
+                return args.process_broker.run(command, credentials(user), env, timeout=15)
             return subprocess.run(list(map(str, command)), **credentials(user),
                                   env=env, capture_output=True, text=True, timeout=15, cwd="/")
         except subprocess.TimeoutExpired as error:

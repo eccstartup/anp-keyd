@@ -133,10 +133,16 @@ class Checks:
         # Only these children receive test transport access; account records
         # remain untouched. Native subprocess credential errors retain errno.
         endpoint = self.config['admin_socket' if management else 'sign_socket']
+        command = [str(Path(sys.executable).resolve()), '-I', '-c', REQUEST, endpoint,
+                   str(self.config['service_uid']), 'refuse' if extra_admin_group else ('yes' if secret else 'no')]
+        payload = json.dumps({'version': 2, 'request': operation})
         try:
-            result = subprocess.run([str(Path(sys.executable).resolve()), '-I', '-c', REQUEST, endpoint,
-                                 str(self.config['service_uid']), 'refuse' if extra_admin_group else ('yes' if secret else 'no')],
-                                input=json.dumps({'version': 2, 'request': operation}),
+            broker = getattr(self.args, 'process_broker', None)
+            if broker:
+                result = broker.run(command, self.credentials(user, extra_admin_group), self.env,
+                                    input=payload, timeout=20)
+            else:
+                result = subprocess.run(command, input=payload,
                                 capture_output=True, text=True, **self.credentials(user, extra_admin_group),
                                 env=self.env, cwd='/', timeout=20)
         except subprocess.TimeoutExpired as error:
