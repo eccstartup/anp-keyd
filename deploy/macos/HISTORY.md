@@ -18,6 +18,13 @@ Do not purchase a certificate on the assumption that it makes this deployment
 SE-capable. Non-persistent ECDH tests in a human login session do not demonstrate
 persistent service access. The existing local preview remains usable without SE.
 
+This limitation was probed against the real keychain on 2026-10-19: the same
+signed SE example running as `_anpagent` under one-shot system LaunchDaemons —
+both raw and with `SessionCreate` — was refused with `errSecNotAvailable`
+(`-25291`), while the login-session open and post-delete refusal passed. See
+[the validation record](../../docs/validation/macos-se-system-context-2026-10-19.md)
+and `deploy/macos/se-system-context.py`.
+
 The read-only release prerequisite gate never runs or signs the candidate and
 never touches a keychain, account, service or vault:
 

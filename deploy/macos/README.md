@@ -16,6 +16,16 @@ explicit, limited hot-key grants. PTY/TTY, executable names and socket-group
 membership cannot replace kernel UID authorization. Same-UID arbitrary code is one
 principal.
 
+For Secure Enclave use, the launch context is part of the boundary. Agents and
+any process that must not hold SE capability run as root-owned system
+LaunchDaemons in a non-login audit session, where the data protection keychain is
+unavailable (tested on 2026-10-19; see
+[the validation record](../../docs/validation/macos-se-system-context-2026-10-19.md)).
+Code started in the administrator's graphical login session, including through
+`sudo`, is trusted management input: it can reach the login keychain and is not
+separated by UID. The signed foreground helper is the only component intended to
+run there; see [SE session scope](SE-SESSION.md).
+
 The installer requires local APFS, symlink-free trusted paths and no extended ACLs
 on protected installation paths. It refuses insecure existing permissions instead
 of loosening checks. PT_DENY_ATTACH/core-dump restrictions are additional

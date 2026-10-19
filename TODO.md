@@ -4,7 +4,7 @@
 
 - [x] Linux systemd 真实主机验收已完成；仅正式 Linux release 且显式受保护模式声明支持。
 - [x] macOS 持久 SE 与主机生命周期验收：真实 SE＋开发签名助手＋独立 UID 服务通过；用户切换、注销/重新登录、短/长休眠、整机重启、升级、密钥丢失、签名身份与钥匙串权限变化均已验收，临时密钥均按精确标签删除并复查。保护声明仍为 `macos-boundary-preview`、`protected_supported=false`。
-- [ ] macOS 原始钥匙串跨 UID 隔离：同签名、同访问组的探针仍能在 Agent UID 重算 HS（含新 SessionCreate 会话），反例保留；需解决该 OS 层隔离问题或重述产品边界。软件登录身份拒绝不能替代 OS 隔离。
+- [x] macOS 非登录 launchd 上下文与边界重述：2026-10-19 用一次性 system job（`UserName=_anpagent`，raw 与 `SessionCreate` 两种）运行同一签名探针，数据保护钥匙串均以 `errSecNotAvailable (-25291)` 拒绝；登录会话正对照与删除后拒绝通过。边界据此重述为“Agent 必须运行于非登录 system LaunchDaemon；管理员图形登录会话内（包括 `sudo` 启动）的代码属于受信管理输入”。同签名、同访问组探针在登录/继承会话内跨 UID 重算 HS 的反例仍保留，不宣称 UID 隔离；证据见 `docs/validation/macos-se-system-context-2026-10-19.md`。
 - [ ] macOS 物理 Secure Enclave/设备故障路径：本机无法诱发，仅验证了软件可见拒绝（探测报告 NOT USABLE、删除密钥后报“no key with that label”）。
 - [ ] macOS SE 正式分发：当前只有本机 Apple Development 身份与短期 profile；需 Developer ID 证书、公证、长期安装身份、正式发行产物与分发审核。
 - [ ] macOS 本机预览的一条命令初始化（`install.sh --bootstrap`）：在预览模式下生成身份、登记主体、创建 grant 并解锁；当前该参数只支持 Linux 受保护部署，macOS 按 `deploy/macos/AGENT.md` 手动完成。

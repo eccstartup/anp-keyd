@@ -16,6 +16,22 @@ also enforce the current local graphical-login identity in software. This policy
 is separate from raw keychain authorization. The helper runs as the configured
 administrator in the active local graphical login session. A second service
 account or a system LaunchDaemon cannot substitute for that login context.
+
+A one-shot system LaunchDaemon was used to test the reverse direction on
+2026-10-19: the same signed probe running as `_anpagent` (UID 601), both in a raw
+non-login job and with `SessionCreate`, could not reach any keychain
+(`errSecNotAvailable`, `-25291`), while the login-session positive control and
+the post-delete refusal passed. The accepted deployment constraint is therefore:
+
+- Agents and any process that must not hold SE capability run as root-owned
+  system LaunchDaemons in a non-login audit session.
+- Code started inside the administrator's graphical login session, including
+  through `sudo`, is trusted management input. An arbitrary process under a
+  different UID in that inherited session can still open the keychain item; that
+  counterexample stands and is not called UID isolation.
+
+Details: [validation record](../../docs/validation/macos-se-system-context-2026-10-19.md).
+
 Unrestricted code in the human UID remains part of the trusted management
 principal; a native dialog is not an independent authorization boundary.
 
@@ -198,6 +214,22 @@ without the entitlement cannot create a persistent key; an unsigned build is
 expected to fail with `errSecMissingEntitlement` (`-34018`). Passing this tool
 does not prove logout/relogin, sleep, reboot, upgrade or distribution.
 
+The non-login launchd context has its own probe. It requires the current signed
+example (one that reports `SE_CONTEXT`) inside an app bundle with its embedded
+profile, and root through `sudo` for the system phase:
+
+```sh
+python3 deploy/macos/se-system-context.py \
+  --binary target/se-release/SESystemContext.app/Contents/MacOS/se-persistence \
+  --sha256 VERIFIED_SIGNED_EXAMPLE_SHA256 --team-id TEAMID \
+  --application-id TEAMID.org.example.keyd --session-create
+```
+
+It creates and opens a temporary key in the login session as the positive
+control, runs one-shot system jobs as `_anpagent` (raw and `SessionCreate`),
+deletes the key and checks the old envelope. A start in the login session is
+mandatory; the tool refuses to create the key as root.
+
 ## Verification boundaries
 
 Ordinary regressions cover HS/password/device binding, envelope tampering,
@@ -232,10 +264,13 @@ profile/team/application identity and failures separately.
 
 Still open before any formal protection claim:
 
-- **Raw keychain isolation between UIDs failed.** A probe carrying the same
-  signature and access group re-derived HS under the Agent UID, including in a
-  fresh SessionCreate audit session. The software login-identity policy is not
-  a substitute for an OS keychain boundary; this counterexample stands.
+- **Raw keychain isolation between UIDs failed inside a login context.** A probe
+  carrying the same signature and access group re-derived HS under the Agent UID,
+  including in a fresh SessionCreate audit session. A non-login system launchd
+  job was tested separately on 2026-10-19 and is refused by the data protection
+  keychain; the deployment constraint above relies on that tested refusal, not
+  on UID-based isolation. The software login-identity policy is not a substitute
+  for an OS keychain boundary; the in-session counterexample stands.
 - **Physical Secure Enclave or device failure was not induced.** Only the
   software-visible refusal paths were observed: the probe reports the root
   unusable when a persistent key cannot be created, and a deleted key yields

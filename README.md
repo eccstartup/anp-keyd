@@ -132,6 +132,7 @@ anp-keyd data --config /etc/anp-keyd/service.json --file request.json
 - 重启后所有 grant 作废、钥匙重新锁定，需要管理员重新解锁和建权。
 - 撤销只阻止新签名，已经发出去的签名收不回来。
 - 同一个系统账号里的程序属于同一个主体；只隔离签名子进程不够，整个 Agent 都要在 Agent 账号下运行。
+- macOS 的 Secure Enclave 只在图形登录会话内可用：Agent 必须以非登录 system LaunchDaemon 运行；在管理员登录会话里（包括 `sudo` 启动）的代码属于受信管理输入，不按 UID 隔离。
 - 管理员、root、内核和 daemon 本身是信任前提。
 - macOS 目前只有本机预览，`protected_supported=false`；受保护部署在 Linux。
 
