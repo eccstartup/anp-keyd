@@ -9,18 +9,19 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parent
+ACCEPTANCE = HERE.parent / 'acceptance'
 
 
 def load(name, filename):
-    spec = importlib.util.spec_from_file_location(name, HERE / filename)
+    spec = importlib.util.spec_from_file_location(name, filename)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-device = load('tpm_device', 'tpm-device.py')
-harness = load('tpm_acceptance', 'tpm-acceptance.py')
+device = load('tpm_device', ACCEPTANCE / 'tpm-device.py')
+harness = load('tpm_acceptance', ACCEPTANCE / 'tpm-acceptance.py')
 
 DEVICE_REPORT = {
     'path': '/dev/tpmrm0', 'exists': True, 'char_device': True, 'uid': 0, 'gid': 123,
@@ -33,7 +34,7 @@ ACCOUNT = SimpleNamespace(pw_name='anp-keyd', pw_uid=321, pw_gid=321,
 
 class DeviceFacts(unittest.TestCase):
     def test_dropin_template_keeps_the_device_boundary(self):
-        template = (HERE / 'anp-keyd-tpm.conf.in').read_text()
+        template = (HERE.parent / 'anp-keyd-tpm.conf.in').read_text()
         for line in ('PrivateDevices=no', 'DevicePolicy=closed',
                      'DeviceAllow=@TPM_DEVICE@ rw',
                      'SupplementaryGroups=@SUPPLEMENTARY_GROUPS@',

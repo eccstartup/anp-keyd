@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-spec = importlib.util.spec_from_file_location('se_preflight', Path(__file__).with_name('se-preflight.py'))
+spec = importlib.util.spec_from_file_location('se_preflight', Path(__file__).resolve().parents[1] / 'se-preflight.py')
 gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate)
 

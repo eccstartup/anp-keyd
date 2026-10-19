@@ -35,7 +35,7 @@ def main():
     if hashlib.sha256(binary.read_bytes()).hexdigest() != args.sha256:
         raise ValueError('probe digest mismatch')
     spec = importlib.util.spec_from_file_location('probe_security_session',
-        Path(__file__).with_name('security-session.py'))
+        Path(__file__).resolve().parents[1] / 'security-session.py')
     policy = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(policy)
     policy.isolate(account.pw_uid)

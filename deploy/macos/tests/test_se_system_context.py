@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location(
-    'se_system_context', Path(__file__).with_name('se-system-context.py'))
+    'se_system_context', Path(__file__).resolve().parents[1] / 'acceptance' / 'se-system-context.py')
 probe = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(probe)
 

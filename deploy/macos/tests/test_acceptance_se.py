@@ -1,10 +1,13 @@
 """Privileged bundle-copy guards; these tests make no hardware claims."""
+import sys
 from pathlib import Path
 import tempfile
 import unittest
 import hashlib
 from types import SimpleNamespace
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'acceptance'))
 
 from acceptance_se import validate_bundle, sleep_times, verify_sleep_transition, wait_for_sleep_transition
 import acceptance_signing

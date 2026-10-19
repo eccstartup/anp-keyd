@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parents[1]
 
 
 def load(name, filename):

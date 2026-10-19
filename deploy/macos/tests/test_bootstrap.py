@@ -6,7 +6,7 @@ from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import patch
 
-spec = importlib.util.spec_from_file_location('mac_bootstrap', Path(__file__).with_name('bootstrap.py'))
+spec = importlib.util.spec_from_file_location('mac_bootstrap', Path(__file__).resolve().parents[1] / 'bootstrap.py')
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
@@ -102,7 +102,7 @@ class ServiceRecovery(unittest.TestCase):
 
 class InstallIntegration(unittest.TestCase):
     def test_install_script_offers_bootstrap_on_macos(self):
-        script = (Path(__file__).parents[2] / 'install.sh').read_text()
+        script = (Path(__file__).resolve().parents[3] / 'install.sh').read_text()
         self.assertIn('deploy/macos/bootstrap.py', script)
         self.assertIn('--agent-user "_anpagent"', script)
         self.assertNotIn('--bootstrap 目前只支持 Linux', script)

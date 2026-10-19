@@ -47,4 +47,4 @@ jobs:
           -e ANP_KEYD_TEST_MCP=${{ matrix.test_mcp }}
           -v "$GITHUB_WORKSPACE:/src:ro" -w /src
           "${{ matrix.image }}"
-          bash deploy/linux/test-container.sh
+          bash deploy/linux/acceptance/test-container.sh

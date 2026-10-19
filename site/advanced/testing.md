@@ -41,6 +41,18 @@ cargo clippy --locked --offline --all-targets --features mcp,hardware-software -
 | `tests/hardware.rs` | 硬件绑定路径的形状 |
 | `tests/no_key_material_on_disk.rs` | 跑完一遍后，磁盘上有没有密钥材料 |
 
+## 目录约定
+
+部署与验收脚本按运行时机分成两层：
+
+| 路径 | 运行方式 | 修改本机状态吗 |
+|---|---|---|
+| `deploy/<platform>/tests/` | CI 每次跑；`python3 -m unittest discover` | 不修改 |
+| `deploy/<platform>/acceptance/` | 人工在目标机或一次性容器里跑，需要 root | 只操作显式隔离的临时实例 |
+| `deploy/<platform>/` 根目录 | 安装、更新、迁移和日常运维入口 | 会，需按文档确认 |
+
+命名规则：下划线 `test_*.py` 属于 CI 单元测试，连字符 `test-*.py` 或 `acceptance_*.py` 属于真机验收。看到两种名字不是笔误，是刻意区分。
+
 ## 向量测试失败了该怀疑谁
 
 `tests/vectors/` 里每条 JSON 都带 `_source`，写明出处。分两类：
@@ -63,8 +75,8 @@ cargo clippy --locked --offline --all-targets --features mcp,hardware-software -
 
 ## 部署与故障验收
 
-`deploy/linux` 下的 `test-boundary`、`systemd-checks`、`systemd-boot-check`、`anp-service-acceptance` 只对显式隔离环境操作；故障注入不在日常主机执行。
+`deploy/linux/acceptance` 下的 `test-boundary.py`、`systemd-checks.py`、`systemd-boot-check.py`、`anp-service-acceptance.py` 只对显式隔离环境操作；故障注入不在日常主机执行。
 
-macOS 使用 `check-local-use.sh`、`check-agent.sh` 和 `se-persistence.py`，同样只对临时实例操作。
+macOS 使用 `deploy/macos/acceptance` 下的 `check-local-use.sh`、`check-agent.sh` 和 `se-persistence.py`，同样只对临时实例操作。
 
 所有验收都使用临时身份，并记录代码基线、feature、部署模式、实际范围和未验项。历史结果不能当作当前运行结果，也不能扩大支持声明。

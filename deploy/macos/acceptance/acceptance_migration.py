@@ -21,7 +21,7 @@ def install(base, config, path, args, fixture):
     for node in [*source.rglob('*'), source, source.parent]:
         os.chown(node, 0, 0, follow_symlinks=False)
         node.chmod(0o700 if node.is_dir() else 0o600)
-    migration = Path(__file__).parents[1] / ('linux' if args.container_regression else 'macos') / 'migrate-vault.py'
+    migration = Path(__file__).parents[2] / ('linux' if args.container_regression else 'macos') / 'migrate-vault.py'
     recovery = base / 'recovery'
     command = [sys.executable, str(migration), '--source', str(source), '--config', str(path), '--binary', str(args.binary)]
     before = path.read_bytes()

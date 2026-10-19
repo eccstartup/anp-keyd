@@ -9,6 +9,10 @@ A release build without seed export or software hardware, explicitly deployed as
 declaration, not proof that every new machine is configured safely. Physical TPM
 protection is a separate claim; see [TPM.md](TPM.md).
 
+Layout: this directory holds the install, update and migration entry points.
+Root-only, container and boot acceptance tools live in [`acceptance/`](acceptance/);
+CI unit tests live in [`tests/`](tests/). Normal use needs neither.
+
 ## New installation
 
 Use a human-controlled checkout and a separate non-admin Agent account for each
@@ -90,7 +94,7 @@ creates disposable accounts and is not a general host installation test:
 
 ```sh
 docker run --rm -v "$PWD:/src:ro" -w /src rust:1.90-bookworm \
-  bash deploy/linux/test-container.sh
+  bash deploy/linux/acceptance/test-container.sh
 ```
 
 This harness requires dependencies/network or a separately mounted Cargo cache.
@@ -207,10 +211,10 @@ whose PID 1 is systemd and whose root-owned mode-0600
 `security_boundary::disposable_linux_fixture` copied under `/tmp`, run as root:
 
 ```sh
-python3 deploy/linux/test-boundary.py --systemd --binary /path/to/release/anp-keyd
-python3 deploy/linux/systemd-boot-check.py prepare
+python3 deploy/linux/acceptance/test-boundary.py --systemd --binary /path/to/release/anp-keyd
+python3 deploy/linux/acceptance/systemd-boot-check.py prepare
 # Completely shut down and boot this disposable VM, then:
-python3 deploy/linux/systemd-boot-check.py verify
+python3 deploy/linux/acceptance/systemd-boot-check.py verify
 ```
 
 The harness checks actual sandbox effects using a temporary ExecStartPost hook,

@@ -1,6 +1,10 @@
 """A re-signed helper copy must be refused before it can obtain an SE session."""
+import sys
+from pathlib import Path
 import plistlib
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'acceptance'))
 
 import acceptance_se
 

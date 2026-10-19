@@ -1,9 +1,12 @@
 """Exercise real diagnostic child execution and timeout without credentials or SE."""
 import os
 import sys
+from pathlib import Path
 import unittest
 from unittest.mock import Mock, patch, call
 import subprocess
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'acceptance'))
 
 from acceptance_process import execute, credential_exec
 

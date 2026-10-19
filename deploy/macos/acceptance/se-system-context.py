@@ -53,7 +53,7 @@ MAX_STATE = 64 * 1024
 
 def load_preflight():
     spec = importlib.util.spec_from_file_location(
-        'se_preflight', Path(__file__).with_name('se-preflight.py'))
+        'se_preflight', Path(__file__).resolve().parents[1] / 'se-preflight.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

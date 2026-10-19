@@ -2,12 +2,15 @@
 ANP_KEYD_TEST_CLAUDE must name a reviewed standalone executable. For full
 cross-UID signing acceptance use test-runtime.py, not this smoke check.
 """
+import sys
 import os
 from pathlib import Path
 import shlex
 import subprocess
 import tempfile
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'acceptance'))
 
 import claude_fixture
 

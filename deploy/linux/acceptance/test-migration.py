@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-spec = importlib.util.spec_from_file_location('migration', Path(__file__).with_name('migrate-vault.py'))
+spec = importlib.util.spec_from_file_location('migration', Path(__file__).resolve().parents[1] / 'migrate-vault.py')
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 

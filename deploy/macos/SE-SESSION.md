@@ -186,7 +186,7 @@ python3 deploy/macos/se-release.py sign-example --team-id TEAMID \
   --binary target/release/examples/se-persistence \
   --sha256 VERIFIED_UNSIGNED_EXAMPLE_SHA256 \
   --out target/se-release/se-persistence.signed
-python3 deploy/macos/se-persistence.py \
+python3 deploy/macos/acceptance/se-persistence.py \
   --binary target/se-release/se-persistence.signed \
   --sha256 VERIFIED_SIGNED_EXAMPLE_SHA256 --team-id TEAMID \
   --application-id TEAMID.org.example.keyd \
@@ -219,7 +219,7 @@ example (one that reports `SE_CONTEXT`) inside an app bundle with its embedded
 profile, and root through `sudo` for the system phase:
 
 ```sh
-python3 deploy/macos/se-system-context.py \
+python3 deploy/macos/acceptance/se-system-context.py \
   --binary target/se-release/SESystemContext.app/Contents/MacOS/se-persistence \
   --sha256 VERIFIED_SIGNED_EXAMPLE_SHA256 --team-id TEAMID \
   --application-id TEAMID.org.example.keyd --session-create

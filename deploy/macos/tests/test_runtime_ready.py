@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-spec = importlib.util.spec_from_file_location('runtime_ready', Path(__file__).with_name('test-runtime.py'))
+spec = importlib.util.spec_from_file_location('runtime_ready', Path(__file__).resolve().parents[1] / 'acceptance' / 'test-runtime.py')
 runtime = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runtime)
 

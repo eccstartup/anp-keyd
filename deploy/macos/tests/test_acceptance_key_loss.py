@@ -1,4 +1,5 @@
 """Losing the SE key must leave the daemon locked and the helper unable to start."""
+import sys
 import hashlib
 from pathlib import Path
 import subprocess
@@ -6,6 +7,8 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'acceptance'))
 
 import acceptance_se
 

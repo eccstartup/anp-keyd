@@ -6,6 +6,10 @@ Rust and the macOS build toolchain are needed to build from source. This mode
 always reports `protected_supported=false`; it is not a formally accepted
 protected macOS distribution.
 
+Layout: this directory holds the install, update and migration entry points.
+Root-only acceptance tools live in [`acceptance/`](acceptance/); CI unit tests
+live in [`tests/`](tests/). Normal use needs neither.
+
 ## What the boundary requires
 
 A trusted human administrator, a separate non-login service UID, and a distinct
@@ -74,7 +78,7 @@ Check the installed instance:
 ```sh
 /Library/ANPKeyd/bin/anp-keyd admin --config /Library/ANPKeyd/service.json status
 /Library/ANPKeyd/bin/anp-keyd admin --config /Library/ANPKeyd/service.json catalog
-sudo /usr/bin/python3 deploy/macos/test-install.py
+sudo /usr/bin/python3 deploy/macos/acceptance/test-install.py
 ```
 
 `OK` is necessary but does not prove real signing or a fully isolated Agent.
@@ -92,7 +96,7 @@ Build the public test-only fixture/verifier and record both reviewed hashes:
 cargo build --locked --release --example local-preview-fixture
 shasum -a 256 /Library/ANPKeyd/bin/anp-keyd target/release/anp-keyd \
   target/release/examples/local-preview-fixture
-sudo bash deploy/macos/check-local-use.sh INSTALLED_SHA256 \
+sudo bash deploy/macos/acceptance/check-local-use.sh INSTALLED_SHA256 \
   "$PWD/target/release/anp-keyd" CANDIDATE_SHA256 \
   "$PWD/target/release/examples/local-preview-fixture" HELPER_SHA256
 ```

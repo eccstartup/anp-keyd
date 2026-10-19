@@ -1,4 +1,5 @@
 """Logout requires a new graphical audit session, not just console UID changes."""
+import sys
 import importlib.util
 import json
 from pathlib import Path
@@ -9,16 +10,18 @@ import unittest
 from unittest.mock import Mock, patch, call
 from types import SimpleNamespace
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'acceptance'))
+
 from acceptance_console import wait_logout
 import acceptance_graphical as graphical
 import acceptance_se
 import acceptance_signing
 
-spec = importlib.util.spec_from_file_location('logout_launcher', Path(__file__).with_name('launch-logout-test.py'))
+spec = importlib.util.spec_from_file_location('logout_launcher', Path(__file__).resolve().parents[1] / 'acceptance' / 'launch-logout-test.py')
 launcher = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(launcher)
 
-spec = importlib.util.spec_from_file_location('post_relogin', Path(__file__).with_name('post-relogin.py'))
+spec = importlib.util.spec_from_file_location('post_relogin', Path(__file__).resolve().parents[1] / 'acceptance' / 'post-relogin.py')
 post_relogin = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(post_relogin)
 

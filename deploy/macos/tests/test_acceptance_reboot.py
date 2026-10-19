@@ -1,4 +1,5 @@
 """Whole-machine reboot must discard runtime authority and keep the key locked."""
+import sys
 import importlib.util
 import json
 from pathlib import Path
@@ -8,13 +9,15 @@ import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'acceptance'))
+
 import acceptance_se
 
-spec = importlib.util.spec_from_file_location('reboot_launcher', Path(__file__).with_name('launch-reboot-test.py'))
+spec = importlib.util.spec_from_file_location('reboot_launcher', Path(__file__).resolve().parents[1] / 'acceptance' / 'launch-reboot-test.py')
 launcher = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(launcher)
 
-spec = importlib.util.spec_from_file_location('post_reboot', Path(__file__).with_name('post-reboot.py'))
+spec = importlib.util.spec_from_file_location('post_reboot', Path(__file__).resolve().parents[1] / 'acceptance' / 'post-reboot.py')
 post_reboot = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(post_reboot)
 

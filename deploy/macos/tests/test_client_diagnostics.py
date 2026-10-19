@@ -1,9 +1,12 @@
 """Client timeout diagnostics identify phases without echoing request contents."""
+import sys
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'acceptance'))
 
 import acceptance_signing
 

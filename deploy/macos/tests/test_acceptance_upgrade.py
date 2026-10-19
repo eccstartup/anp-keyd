@@ -1,4 +1,5 @@
 """In-place helper upgrade must preserve identity and leave failures recoverable."""
+import sys
 import hashlib
 from pathlib import Path
 import shutil
@@ -6,6 +7,8 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'acceptance'))
 
 import acceptance_se
 

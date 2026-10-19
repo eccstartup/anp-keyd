@@ -4,7 +4,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import Mock, patch
 
-spec = importlib.util.spec_from_file_location('session_policy', Path(__file__).with_name('security-session.py'))
+spec = importlib.util.spec_from_file_location('session_policy', Path(__file__).resolve().parents[1] / 'security-session.py')
 policy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(policy)
 

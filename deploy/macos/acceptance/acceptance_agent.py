@@ -36,7 +36,7 @@ class Framework:
             target.write(content)
         self.binary.chmod(0o755)  # root-owned, outside writable HOME/workspace
         self.step = self.base / 'agent-step.py'
-        self.step.write_bytes(Path(__file__).with_name('agent-step.py').read_bytes())
+        self.step.write_bytes(Path(__file__).resolve().parents[1] / 'agent-step.py'.read_bytes())
         self.step.chmod(0o644)
         self.home = self.base / 'home'
         self.work = self.base / 'work'

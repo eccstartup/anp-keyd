@@ -20,7 +20,7 @@ Resolve the installed Claude symlink to its standalone binary, review provenance
 and SHA-256 for all three executables, then run from a trusted reviewed checkout:
 
 ```sh
-sudo bash deploy/macos/check-agent.sh \
+sudo bash deploy/macos/acceptance/check-agent.sh \
   /ABS/target/release/anp-keyd CANDIDATE_SHA256 \
   /ABS/target/release/examples/local-preview-fixture HELPER_SHA256 \
   /ABS/claude/versions/2.1.173 CLAUDE_SHA256

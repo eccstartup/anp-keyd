@@ -40,14 +40,17 @@ PENDING = [
 
 
 def load(name, filename):
-    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(filename))
+    path = Path(filename)
+    if not path.is_absolute():
+        path = Path(__file__).with_name(filename)
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-PREFLIGHT = load('se_preflight', 'se-preflight.py')
-RELEASE = load('se_release', 'se-release.py')
+PREFLIGHT = load('se_preflight', Path(__file__).resolve().parents[1] / 'se-preflight.py')
+RELEASE = load('se_release', Path(__file__).resolve().parents[1] / 'se-release.py')
 
 
 class AcceptanceError(Exception):

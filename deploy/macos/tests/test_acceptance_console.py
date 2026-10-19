@@ -1,6 +1,10 @@
 """Console transitions must be real, bounded and independently checked while away."""
+import sys
+from pathlib import Path
 import unittest
 from unittest.mock import Mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'acceptance'))
 
 from acceptance_console import wait_user_switch
 

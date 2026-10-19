@@ -375,7 +375,7 @@ _release_tool = None
 def load_release_tool():
     global _release_tool
     if _release_tool is None:
-        path = Path(__file__).resolve().parent / 'se-release.py'
+        path = Path(__file__).resolve().parent.parent / 'se-release.py'
         spec = importlib.util.spec_from_file_location('anp_se_release', path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)

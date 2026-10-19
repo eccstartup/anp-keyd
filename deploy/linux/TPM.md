@@ -70,7 +70,7 @@ acceptance feature enabled and keep it out of the installed binary:
 cargo build --locked --release --features hardware-tpm,tpm-acceptance \
   --example tpm-persistence
 sha256sum target/release/examples/tpm-persistence
-sudo python3 deploy/linux/tpm-acceptance.py \
+sudo python3 deploy/linux/acceptance/tpm-acceptance.py \
   --binary target/release/examples/tpm-persistence \
   --sha256 VERIFIED_SHA256 \
   --other-uid 1001 \

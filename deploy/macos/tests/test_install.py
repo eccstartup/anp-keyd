@@ -5,7 +5,7 @@ from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import patch
 
-spec = importlib.util.spec_from_file_location('mac_install', Path(__file__).with_name('install.py'))
+spec = importlib.util.spec_from_file_location('mac_install', Path(__file__).resolve().parents[1] / 'install.py')
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
@@ -72,7 +72,7 @@ class Layout(unittest.TestCase):
 
 class ChildCredentials(unittest.TestCase):
     def test_runtime_failure_preserves_signal_and_output(self):
-        spec = importlib.util.spec_from_file_location('runtime_failure', Path(__file__).with_name('test-runtime.py'))
+        spec = importlib.util.spec_from_file_location('runtime_failure', Path(__file__).resolve().parents[1] / 'acceptance' / 'test-runtime.py')
         runtime = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(runtime)
         with self.assertRaisesRegex(ValueError, r'exit=-9 \(signal 9\)'):
@@ -84,7 +84,7 @@ class ChildCredentials(unittest.TestCase):
         runtime.require_success(NS(returncode=0, stdout='', stderr=''), 'ok')
 
     def test_primary_group_survives_darwin_egid_replacement(self):
-        spec = importlib.util.spec_from_file_location('runtime_checks', Path(__file__).with_name('test-runtime.py'))
+        spec = importlib.util.spec_from_file_location('runtime_checks', Path(__file__).resolve().parents[1] / 'acceptance' / 'test-runtime.py')
         runtime = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(runtime)
         config = {'service_uid': 600, 'admin_uids': [501], 'agent_gid': 602, 'admin_gid': 603}
@@ -107,7 +107,7 @@ class ChildCredentials(unittest.TestCase):
 class UpdateWrites(unittest.TestCase):
     def test_archive_keeps_bytes_and_refuses_existing_destination(self):
         import tempfile
-        spec = importlib.util.spec_from_file_location('local_update', Path(__file__).with_name('update-local.py'))
+        spec = importlib.util.spec_from_file_location('local_update', Path(__file__).resolve().parents[1] / 'update-local.py')
         update = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(update)
         with tempfile.TemporaryDirectory() as directory:
@@ -127,7 +127,7 @@ class UpdateWrites(unittest.TestCase):
     def test_backup_and_stage_are_exclusive_and_ignore_restrictive_umask(self):
         import os
         import tempfile
-        spec = importlib.util.spec_from_file_location('local_update', Path(__file__).with_name('update-local.py'))
+        spec = importlib.util.spec_from_file_location('local_update', Path(__file__).resolve().parents[1] / 'update-local.py')
         update = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(update)
         with tempfile.TemporaryDirectory() as directory:

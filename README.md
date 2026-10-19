@@ -98,6 +98,23 @@ macOS 用 `./install.sh` 安装本机预览，始终 `protected_supported=false`
 
 手动校验发行包和更新见 [Linux 部署](deploy/linux/README.md)。
 
+## 仓库结构
+
+正式安装只需要 `./install.sh`，其余目录按需查阅：
+
+| 路径 | 是什么 | 用户需要吗 |
+|---|---|---|
+| `install.sh` | 唯一的安装入口，按平台分发 | 需要，正式安装只跑它 |
+| `src/`、`tests/` | 服务本体和 Rust 回归测试 | 开发时需要 |
+| `deploy/linux/`、`deploy/macos/` | 安装、更新、迁移和身份接入入口 | 按对应文档单独执行 |
+| `deploy/*/acceptance/` | 真机验收工具，要 root，只操作临时实例 | 只在复核安全边界时用 |
+| `deploy/*/tests/` | 安装器和验收工具的单元测试，不碰主机 | CI 自动跑，用户不用管 |
+
+`tests/` 与 `acceptance/` 的区别是运行时机，不是重要性：
+
+- `deploy/*/tests/test_*.py`（下划线）在 CI 里跑，不需要 root，不修改本机状态；
+- `deploy/*/acceptance/` 下的脚本需要 root、真实硬件或一次性容器，按文档人工执行，结果只对当次运行有效。
+
 ## Agent 怎么用
 
 Agent 在自己的系统账号下提交一个请求文件：

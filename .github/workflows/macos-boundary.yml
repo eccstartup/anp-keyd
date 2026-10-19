@@ -15,7 +15,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Installer identity policy (no host changes)
-        run: python3 -m unittest discover -s deploy/macos -p 'test_*.py'
+        run: python3 -m unittest discover -s deploy/macos/tests -p 'test_*.py'
       - name: Regression tests
         env:
           RUST_LOG: info
@@ -42,4 +42,4 @@ jobs:
         run: >-
           docker run --rm -v "$GITHUB_WORKSPACE:/src:ro" -w /src
           rust:1.90-bookworm@sha256:3914072ca0c3b8aad871db9169a651ccfce30cf58303e5d6f2db16d1d8a7e58f
-          bash deploy/macos/test-signing-container.sh
+          bash deploy/macos/acceptance/test-signing-container.sh
