@@ -2,8 +2,10 @@
 import os
 import sys
 import unittest
+from unittest.mock import Mock, patch, call
+import subprocess
 
-from acceptance_process import execute
+from acceptance_process import execute, credential_exec
 
 
 class ProcessExecution(unittest.TestCase):
@@ -27,3 +29,39 @@ class ProcessExecution(unittest.TestCase):
     def test_real_child_still_reports_actual_uid(self):
         result = execute(self.request('import os;print(os.getuid())'),sample=False)
         self.assertEqual(int(result['stdout']),os.getuid())
+
+    @unittest.skipUnless(getattr(subprocess, '_USE_POSIX_SPAWN', False), 'posix_spawn unavailable')
+    def test_actual_child_uses_posix_spawn(self):
+        original = subprocess.Popen._posix_spawn
+        calls = []
+        def observed(process, *args, **kwargs):
+            calls.append(True)
+            return original(process, *args, **kwargs)
+        with patch.object(subprocess.Popen, '_posix_spawn', observed):
+            result = execute(self.request('print("spawned")'),sample=False)
+        self.assertEqual(result['stdout'],'spawned\n')
+        self.assertEqual(calls,[True])
+
+    def test_explicit_credential_drop_preserves_primary_first_order_before_exec(self):
+        creds = {'user':501,'group':20,'extra_groups':[20,602]}
+        with patch('acceptance_process.os.geteuid',return_value=0), \
+             patch('acceptance_process.os.getuid',return_value=501), \
+             patch('acceptance_process.os.getgid',return_value=20), \
+             patch('acceptance_process.os.setgroups') as groups, \
+             patch('acceptance_process.os.setregid') as gid, \
+             patch('acceptance_process.os.setreuid') as uid, \
+             patch('acceptance_process.os.execve') as execute_child, \
+             patch('acceptance_process.sys.stderr'):
+            sequence = Mock()
+            for name, method in [('groups',groups),('gid',gid),('uid',uid),('exec',execute_child)]:
+                sequence.attach_mock(method,name)
+            credential_exec(creds,['/fixture','status'])
+        self.assertEqual(sequence.mock_calls[:3],[call.groups([20,602]),call.gid(20,20),call.uid(501,501)])
+        self.assertEqual(sequence.mock_calls[3].args[:2],('/fixture',['/fixture','status']))
+
+    def test_unprivileged_wrapper_cannot_attempt_credential_change(self):
+        with patch('acceptance_process.os.geteuid',return_value=501), \
+             patch('acceptance_process.os.setgroups') as groups:
+            with self.assertRaises(ValueError):
+                credential_exec({'user':601,'group':601,'extra_groups':[601]},['/fixture'])
+        groups.assert_not_called()

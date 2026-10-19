@@ -12,9 +12,45 @@ import subprocess
 import sys
 
 
+def native_stack(pid):
+    try:
+        captured = subprocess.run(['/usr/bin/sample', str(pid), '1', '-file', '/dev/stdout'],
+            capture_output=True, text=True, timeout=5, close_fds=False)
+        return (captured.stdout + captured.stderr)[-24576:]
+    except (OSError, subprocess.SubprocessError) as error:
+        return 'native stack unavailable: ' + str(type(error).__name__)
+
+
+def child_command(request):
+    if not request['credentials']:
+        return request['argv']
+    return [str(Path(sys.executable).resolve()), '-I', str(Path(__file__).resolve()),
+            '--exec', json.dumps(request['credentials']), *request['argv']]
+
+
+def credential_exec(credentials, argv):
+    if os.geteuid() != 0 or set(credentials) != {'user', 'group', 'extra_groups'}:
+        raise ValueError('expected root and exact acceptance child credentials')
+    def stage(value):
+        print('CREDENTIAL_STAGE ' + value, file=sys.stderr, flush=True)
+    stage('wrapper-started')
+    os.setgroups(credentials['extra_groups'])
+    stage('groups-set')
+    os.setregid(credentials['group'], credentials['group'])
+    stage('gid-set')
+    os.setreuid(credentials['user'], credentials['user'])
+    stage('uid-set')
+    if os.getuid() != credentials['user'] or os.getgid() != credentials['group']:
+        raise ValueError('credential drop did not match requested identity')
+    stage('exec-client')
+    os.execve(argv[0], argv, dict(os.environ))
+
+
 def execute(request, sample=True):
-    with subprocess.Popen(request['argv'], **request['credentials'], env=request['env'],
-                          cwd='/', stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    # No cwd or uid/gid subprocess options: CPython can use posix_spawn rather
+    # than fork with credential changes before exec. The broker already runs /.
+    with subprocess.Popen(child_command(request), env=request['env'], close_fds=False,
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, text=True) as child:
         try:
             out, err = child.communicate(request.get('input'), timeout=request['timeout'])
@@ -22,12 +58,7 @@ def execute(request, sample=True):
         except subprocess.TimeoutExpired:
             stack = 'sampling disabled'
             if sample and sys.platform == 'darwin':
-                try:
-                    captured = subprocess.run(['/usr/bin/sample', str(child.pid), '1', '-file', '/dev/stdout'],
-                        capture_output=True, text=True, timeout=5)
-                    stack = (captured.stdout + captured.stderr)[-24576:]
-                except (OSError, subprocess.SubprocessError) as error:
-                    stack = 'native stack unavailable: ' + str(type(error).__name__)
+                stack = native_stack(child.pid)
             child.kill()
             out, err = child.communicate(timeout=5)
             return {'timeout':True, 'pid':child.pid, 'stdout':out, 'stderr':err, 'stack':stack}
@@ -50,6 +81,8 @@ class Broker:
         self.process.stdin.write(json.dumps(request) + '\n')
         self.process.stdin.flush()
         if not select.select([self.process.stdout], [], [], timeout + 12)[0]:
+            if sys.platform == 'darwin':
+                print(f'BROKER_TIMEOUT_STACK pid={self.process.pid}\n' + native_stack(self.process.pid), flush=True)
             raise ValueError('subprocess broker response timed out; no retry attempted')
         line = self.process.stdout.readline(4 * 1024 * 1024 + 1)
         if not line or len(line) > 4 * 1024 * 1024:
@@ -77,6 +110,7 @@ class Broker:
 def main():
     if os.geteuid() != 0:
         raise ValueError('test subprocess broker requires root')
+    os.chdir('/')
     for line in sys.stdin:
         try:
             reply = execute(json.loads(line))
@@ -86,4 +120,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    if sys.argv[1:2] == ['--exec']:
+        credential_exec(json.loads(sys.argv[2]), sys.argv[3:])
+    else:
+        main()
