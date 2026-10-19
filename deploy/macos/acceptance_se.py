@@ -256,6 +256,98 @@ def wait_for_post_relogin_result(base, timeout=600):
     return outcome
 
 
+POST_REBOOT_LAUNCHER = Path('/Library/ANPKeydRebootChecks-post-reboot.sh')
+
+
+def host_boottime():
+    """Seconds since the epoch at which the running kernel booted."""
+    result = subprocess.run(['/usr/sbin/sysctl', '-n', 'kern.boottime'],
+                            capture_output=True, text=True, timeout=10)
+    match = re.search(r'sec = (\d+), usec = (\d+)', result.stdout)
+    if result.returncode or not match:
+        raise ValueError('kernel boot time unavailable: ' + result.stderr)
+    seconds, micros = map(int, match.groups())
+    if not 0 <= micros < 1_000_000:
+        raise ValueError('invalid kernel boot timestamp')
+    return seconds + micros / 1_000_000
+
+
+def write_post_reboot_state(checks, request, pending):
+    """Serialize only what the fresh-boot checker needs; root-owned, 0600."""
+    base = checks.base
+    result = base / 'post-reboot-result.json'
+    try:
+        result.unlink()
+    except FileNotFoundError:
+        pass
+    status = checks.cli(checks.admin, 'status')
+    if status.returncode != 0:
+        raise ValueError('pre-reboot status failed: ' + status.stderr)
+    current = json.loads(status.stdout)
+    if current['instance_id'] != checks.config['instance_id']:
+        raise ValueError('pre-reboot instance mismatch')
+    state = {
+        'config': checks.config,
+        'path': str(checks.path),
+        'base': str(base),
+        'binary': str(Path(checks.args.binary).resolve()),
+        'admin_uid': checks.admin.pw_uid,
+        'agent_uid': checks.agent.pw_uid,
+        'key': checks.key,
+        'policy_id': checks.policy_id,
+        'request': request,
+        'pending': pending,
+        'env': checks.env,
+        'admin_credentials': checks.credentials(checks.admin),
+        'agent_credentials': checks.credentials(checks.agent),
+        'pre_boottime': host_boottime(),
+        'pre_boot_epoch': current['boot_epoch'],
+        'instance_id': current['instance_id'],
+        'fixture': {'document': checks.fixture['manifest']['document'],
+                    'helper': str(checks.fixture['helper']),
+                    'vault_id': checks.fixture['vault_id']},
+        'helper': str(base / 'LoginHelper.app/Contents/MacOS/anp-keyd'),
+        'helper_sha256': str(checks.args.se_login_sha256),
+        'hardware': checks.fixture['manifest']['hot_hardware'],
+    }
+    state_path = base / 'post-reboot-state.json'
+    state_path.write_text(json.dumps(state))
+    state_path.chmod(0o600)
+    return state_path
+
+
+def write_post_reboot_launcher(state_path):
+    """Fixed root-only entry point so the operator does not type stage paths."""
+    launcher = POST_REBOOT_LAUNCHER
+    if launcher.is_symlink() or launcher.exists():
+        meta = launcher.lstat()
+        if not stat.S_ISREG(meta.st_mode) or meta.st_uid != 0:
+            raise ValueError('refusing to replace untrusted post-reboot launcher')
+    module = Path(__file__).resolve().parent / 'post-reboot.py'
+    script = ('#!/bin/sh\n'
+              'state=' + shlex.quote(str(state_path)) + '\n'
+              'if [ ! -f "$state" ]; then\n'
+              '  echo "no pending reboot acceptance at $state; start a new run" >&2\n'
+              '  exit 1\n'
+              'fi\n'
+              'exec /usr/bin/python3 ' + shlex.quote(str(module)) + ' "$state"\n')
+    launcher.write_text(script)
+    launcher.chmod(0o700)
+    return launcher
+
+
+def wait_for_manual_reboot(timeout=1800):
+    """Hold the runner open until the machine reboots and kills this process."""
+    print('READY FOR MANUAL REBOOT: save work and restart the Mac now. '
+          'This script does not restart the machine. '
+          'After logging in again, run the post-reboot command printed above.', flush=True)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(1)
+    raise ValueError('machine did not reboot within '
+                     f'{timeout} seconds; the prepared approval is abandoned')
+
+
 def validate_bundle(bundle):
     """Bound a privileged copy and refuse links, including the bundle itself."""
     if bundle.suffix != '.app' or bundle.is_symlink():
@@ -279,7 +371,7 @@ class Checks(acceptance_signing.Checks):
     def approval_seconds(self, ending):
         # The fixture policy's duration bound and the approval expiry must come
         # from one source; a longer approval is refused as ADMIN_OPERATION_INVALID.
-        return self.grant_limit() if ending == 'logout' else 240
+        return self.grant_limit() if ending in ('logout', 'reboot') else 240
 
     def exercise_signing(self):
         manifest = self.fixture['manifest']
@@ -311,7 +403,7 @@ class Checks(acceptance_signing.Checks):
         print('UI: check the temporary exact key and enter ONLY the public test password: '
               + acceptance_signing.PASSWORD, flush=True)
         helper_credentials = self.credentials(self.admin)
-        if self.args.se_ending == 'logout':
+        if self.args.se_ending in ('logout', 'reboot'):
             import acceptance_graphical
             old_session = acceptance_graphical.session(self.admin, self.path)
             print('OLD_GRAPHICAL_AUDIT_SESSION ' + str(old_session), flush=True)
@@ -406,9 +498,17 @@ class Checks(acceptance_signing.Checks):
                             helper.wait(timeout=10)
                     else:
                         print('SE_HELPER_STATE exited_after_relogin', flush=True)
+                elif ending == 'reboot':
+                    # The runner is killed by the reboot; the fresh-boot checker
+                    # runs from the operator's new login and writes the verdict.
+                    state_path = write_post_reboot_state(self, request, pending)
+                    launcher = write_post_reboot_launcher(state_path)
+                    print('ACTION REQUIRED after you log in following the reboot: sudo sh '
+                          + str(launcher), flush=True)
+                    wait_for_manual_reboot()
                 else:
                     helper.send_signal(signal.SIGSTOP if ending == 'hang' else signal.SIGKILL)
-                if ending != 'logout':
+                if ending not in ('logout', 'reboot'):
                     if ending == 'kill':
                         helper.wait(timeout=10)
                     # Allow the documented observation deadline; then require both

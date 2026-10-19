@@ -237,7 +237,7 @@ class GrantWindow(unittest.TestCase):
             SimpleNamespace(se_ending=end), None, None, None, None, {}, None)
 
     def test_approval_never_exceeds_the_published_policy_limit(self):
-        for ending, seconds in (('logout', 900), ('kill', 240)):
+        for ending, seconds in (('logout', 900), ('reboot', 900), ('kill', 240)):
             checks = self.checks(ending)
             limit = checks.policy_content()['grant_limits']['max_duration_seconds']
             self.assertEqual(checks.grant_limit(), limit)

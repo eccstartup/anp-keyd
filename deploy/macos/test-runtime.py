@@ -4,6 +4,7 @@ Requires the explicitly provisioned accounts and root. Never touches the running
 installation's state, keys, configuration or launchd job. No new accounts created.
 """
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -70,8 +71,8 @@ def main():
     parser.add_argument('--helper-sha256')
     parser.add_argument('--se-login-bundle', type=Path, help='profile-embedded full signed helper; enables real SE joint acceptance with a signed generate-se fixture helper')
     parser.add_argument('--se-login-sha256')
-    parser.add_argument('--se-ending', choices=('kill', 'hang', 'sleep', 'long-sleep', 'user-switch', 'logout', 'restart', 'crash'), default='kill',
-                        help='real SE lease loss: helper kill/hang, operator sleep/user switch, or isolated service restart/crash')
+    parser.add_argument('--se-ending', choices=('kill', 'hang', 'sleep', 'long-sleep', 'user-switch', 'logout', 'reboot', 'restart', 'crash'), default='kill',
+                        help='real SE lease loss: helper kill/hang, operator sleep/user switch/logout/reboot, or isolated service restart/crash')
     parser.add_argument('--interactive-ui', action='store_true', help='human window checks: cancel, 120-second timeout, masked temporary-password unlock')
     parser.add_argument('--migrate-fixture', action='store_true', help='install only the disposable fixture through the supported offline migrator and verify recovery/resume')
     parser.add_argument('--claude-binary', type=Path, help='reviewed standalone Claude Code binary; enables complete framework/tool execution with a local API fixture')
@@ -86,9 +87,9 @@ def main():
         raise ValueError('--post-relogin-probes requires --se-ending logout')
     if args.logout_diagnostics and args.se_ending != 'logout':
         raise ValueError('--logout-diagnostics requires the system logout runner')
-    if args.se_ending == 'logout':
+    if args.se_ending in ('logout', 'reboot'):
         if os.getppid() != 1 or os.geteuid() != 0:
-            raise ValueError('logout mode requires the temporary system launchd runner')
+            raise ValueError(f'{args.se_ending} mode requires the temporary system launchd runner')
     if args.se_login_bundle:
         args.se_login_bundle = args.se_login_bundle.absolute()
         if not args.signing_helper or not args.se_login_sha256 or not args.candidate_binary:
@@ -134,16 +135,18 @@ def main():
     service = pwd.getpwuid(installed['service_uid'])
     admin = pwd.getpwuid(installed['admin_uids'][0])
     agent = pwd.getpwuid(installed['principals'][0]['uid'])
-    if args.se_ending == 'logout':
-        import acceptance_process
-        args.process_broker = acceptance_process.Broker()
+    if args.se_ending in ('logout', 'reboot'):
         import acceptance_graphical
         from acceptance_console import console_uid
+        if args.se_ending == 'logout':
+            import acceptance_process
+            args.process_broker = acceptance_process.Broker()
         if console_uid() != admin.pw_uid:
-            raise ValueError('logout test must start on the configured administrator desktop')
+            raise ValueError(f'{args.se_ending} test must start on the configured administrator desktop')
         graphical = acceptance_graphical.session(admin, args.config)
-        args.runner_audit_context = acceptance_graphical.require_runner_session(graphical)
-        print('SYSTEM_RUNNER_AUDIT_CONTEXT ' + json.dumps(args.runner_audit_context), flush=True)
+        if args.se_ending == 'logout':
+            args.runner_audit_context = acceptance_graphical.require_runner_session(graphical)
+            print('SYSTEM_RUNNER_AUDIT_CONTEXT ' + json.dumps(args.runner_audit_context), flush=True)
         if acceptance_graphical.relogin_session(admin) != graphical:
             raise ValueError('native console audit session does not match graphical bridge')
         print(f'PASS system runner pid={os.getpid()} ppid=1; graphical audit bridge session={graphical}; no SE key created yet', flush=True)
@@ -154,7 +157,7 @@ def main():
         if command and Path(str(command[0])).name == 'anp-keyd':
             print(f'CHECK uid={user.pw_uid} keyd ' + ' '.join(map(str, command[1:4])), flush=True)
         try:
-            if args.se_ending == 'logout' and len(command) > 1 and command[1] == 'generate-se':
+            if args.se_ending in ('logout', 'reboot') and len(command) > 1 and command[1] == 'generate-se':
                 import acceptance_graphical
                 return subprocess.run(acceptance_graphical.command(user, path, command),
                     env=env, capture_output=True, text=True, timeout=30, cwd='/')
@@ -171,7 +174,11 @@ def main():
     if portable:
         parent = '/keyd-checks'
         Path(parent).mkdir(mode=0o755, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='ANPKeydChecks-', dir=parent) as directory:
+    directory_context = (tempfile.TemporaryDirectory(prefix='ANPKeydChecks-', dir=parent)
+                         if args.se_ending != 'reboot'
+                         else contextlib.nullcontext(
+                             tempfile.mkdtemp(prefix='ANPKeydChecks-', dir=parent)))
+    with directory_context as directory:
         base = Path(directory)
         base.chmod(0o755)
         if args.candidate_binary:
@@ -416,7 +423,7 @@ print('task_for_pid denied')
                 if process is not None and process.poll() is None:
                     stop(process)
             finally:
-                if args.se_ending == 'logout' and daemon_log.exists():
+                if args.se_ending in ('logout', 'reboot') and daemon_log.exists():
                     print('TEMPORARY_DAEMON_LOG_TAIL\n' + daemon_log.read_text()[-16384:], flush=True)
 
 

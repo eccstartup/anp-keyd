@@ -175,10 +175,9 @@ class Checks:
         assert result['code'] == 'OK', result
 
     def grant_limit(self):
-        # A logout approval must stay valid while the operator logs out, waits
-        # at the login window and returns; every other ending is bounded by the
-        # check itself.
-        return 900 if getattr(self.args, 'se_ending', 'kill') == 'logout' else 300
+        # A logout or reboot approval must stay valid while the operator leaves
+        # and returns; every other ending is bounded by the check itself.
+        return 900 if getattr(self.args, 'se_ending', 'kill') in ('logout', 'reboot') else 300
 
     def policy_content(self):
         return {'schema_version': 1, 'name': 'local-temporary-test', 'purpose': 'http-authentication',
