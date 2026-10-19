@@ -2,6 +2,7 @@
 The public fixture password is not a production secret. No automatic UI consent.
 """
 import hashlib
+import importlib.util
 import json
 import os
 import plistlib
@@ -14,6 +15,7 @@ import stat
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import acceptance_signing
 
@@ -367,11 +369,151 @@ def validate_bundle(bundle):
         raise ValueError('bundle lacks an embedded profile')
 
 
+_release_tool = None
+
+
+def load_release_tool():
+    global _release_tool
+    if _release_tool is None:
+        path = Path(__file__).resolve().parent / 'se-release.py'
+        spec = importlib.util.spec_from_file_location('anp_se_release', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _release_tool = module
+    return _release_tool
+
+
+def install_helper(source, destination, team, application, upgrade):
+    """Use the shipped release path, so ownership, identity and atomicity are real."""
+    release = load_release_tool()
+    return release.install(SimpleNamespace(
+        bundle=Path(source), destination=Path(destination), upgrade=upgrade,
+        team_id=team, application_id=application,
+        profile_sha256=None, require_notarized=False))
+
+
+def helper_digest(bundle):
+    return hashlib.sha256((Path(bundle) / 'Contents/MacOS/anp-keyd').read_bytes()).hexdigest()
+
+
 class Checks(acceptance_signing.Checks):
     def approval_seconds(self, ending):
         # The fixture policy's duration bound and the approval expiry must come
         # from one source; a longer approval is refused as ADMIN_OPERATION_INVALID.
         return self.grant_limit() if ending in ('logout', 'reboot') else 240
+
+    def exercise_upgrade(self, destination, upgrade_bundle):
+        release = load_release_tool()
+        old_digest = helper_digest(destination)
+
+        tampered = self.base / 'TamperedHelper.app'
+        shutil.copytree(upgrade_bundle, tampered)
+        binary = tampered / 'Contents/MacOS/anp-keyd'
+        data = bytearray(binary.read_bytes())
+        data[len(data) // 2] ^= 0xff
+        binary.write_bytes(data)
+        try:
+            install_helper(tampered, destination, self.args.helper_team_id,
+                           self.args.helper_application_id, True)
+        except (release.ReleaseError, ValueError):
+            pass
+        else:
+            raise ValueError('tampered upgrade helper was installed')
+        if helper_digest(destination) != old_digest:
+            raise ValueError('failed upgrade changed the installed helper')
+        release.verify_bundle(destination, self.args.helper_team_id,
+                              self.args.helper_application_id, installed=True)
+        print('PASS failed upgrade left the installed helper intact', flush=True)
+
+        backup = destination.with_name(destination.name + '.previous')
+        backup.mkdir()
+        try:
+            install_helper(upgrade_bundle, destination, self.args.helper_team_id,
+                           self.args.helper_application_id, True)
+        except release.ReleaseError as error:
+            if 'backup' not in str(error):
+                raise
+        else:
+            raise ValueError('upgrade proceeded with an existing backup')
+        finally:
+            backup.rmdir()
+        if helper_digest(destination) != old_digest:
+            raise ValueError('backup-collision check changed the installed helper')
+        print('PASS interrupted-replacement backup blocks another upgrade', flush=True)
+
+        report = install_helper(upgrade_bundle, destination, self.args.helper_team_id,
+                                self.args.helper_application_id, True)
+        if not report['upgrade_continuity']:
+            raise ValueError('upgrade continuity was not established')
+        if report['candidate_sha256'] != self.args.upgrade_sha256:
+            raise ValueError('upgrade candidate digest mismatch')
+        if helper_digest(destination) != self.args.upgrade_sha256:
+            raise ValueError('installed upgrade digest mismatch')
+        if helper_digest(backup) != old_digest:
+            raise ValueError('upgrade backup digest mismatch')
+        print('PASS helper upgrade continuity ' + json.dumps({
+            'continuity': report['upgrade_continuity'], 'old_sha256': old_digest,
+            'new_sha256': helper_digest(destination)}), flush=True)
+
+    def upgraded_helper_sign(self, binary):
+        command = [str(binary), 'admin', '--config', str(self.path), 'se-session',
+                   '--vault-id', self.fixture['vault_id'], '--did', self.key['did'],
+                   '--kid', self.key['kid']]
+        denied = subprocess.run(command, capture_output=True, text=True, timeout=15,
+                                **self.credentials(self.agent), env=self.env, cwd='/')
+        if denied.returncode == 0 or 'ADMIN_REQUIRED' not in denied.stderr:
+            raise ValueError('upgraded helper accepted the Agent identity')
+        print('UI: check the temporary exact key again for the upgraded helper and enter ONLY '
+              'the public test password: ' + acceptance_signing.PASSWORD, flush=True)
+        log = self.base / 'se-upgrade-helper.log'
+        with log.open('w+') as output:
+            helper = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output,
+                                      stderr=output, **self.credentials(self.admin),
+                                      env=self.env, cwd='/')
+            try:
+                deadline = time.monotonic() + 145
+                while time.monotonic() < deadline:
+                    if helper.poll() is not None:
+                        raise ValueError('upgraded helper exited: ' + log.read_text())
+                    if 'SE session active for exact key' in log.read_text():
+                        break
+                    time.sleep(.2)
+                else:
+                    raise ValueError('upgraded helper did not establish a real SE session')
+                grant = self.grant()
+                request = self.signing(grant)
+                reply = self.request_as(self.agent, request)
+                if reply['code'] != 'OK' or reply['data']['state'] != 'completed':
+                    raise ValueError('upgraded helper signature failed: ' + json.dumps(reply))
+                public = {'document': self.fixture['manifest']['document'],
+                          **reply['data']['result']}
+                verified = subprocess.run([str(self.fixture['helper']), 'verify'],
+                    input=json.dumps(public), capture_output=True, text=True, timeout=15,
+                    **self.credentials(self.admin), env=self.env, cwd='/')
+                if verified.returncode != 0 or verified.stdout.strip() != 'VERIFIED':
+                    raise ValueError('upgraded signature verification failed: ' + verified.stderr)
+                changed = {**public, 'url': 'https://example.com/other'}
+                rejected = subprocess.run([str(self.fixture['helper']), 'verify'],
+                    input=json.dumps(changed), capture_output=True, text=True, timeout=15,
+                    **self.credentials(self.admin), env=self.env, cwd='/')
+                if rejected.returncode == 0:
+                    raise ValueError('independent verifier accepted a changed target')
+                if self.request_as(self.agent, request)['data'] != reply['data']:
+                    raise ValueError('upgraded helper retry returned a different result')
+                print('PASS upgraded helper signed and retried consistently', flush=True)
+            finally:
+                if helper.poll() is None:
+                    helper.terminate()
+                    try:
+                        helper.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        helper.kill()
+                        helper.wait(timeout=10)
+                print('SE upgraded helper log: ' + log.read_text(errors='replace'), flush=True)
+        # Replacing and exiting the helper revokes the session's grants; a new
+        # grant must still observe the locked key.
+        final = self.grant()
+        self.expect_locked(final)
 
     def exercise_signing(self):
         manifest = self.fixture['manifest']
@@ -382,12 +524,27 @@ class Checks(acceptance_signing.Checks):
         # Keep the tag even if later UI/service checks fail: no claim that
         # removing the disposable filesystem also removes a keychain key.
         print('SE temporary wrapping-key locator: ' + json.dumps(hardware), flush=True)
+        ending = getattr(self.args, 'se_ending', 'kill')
         bundle = self.args.se_login_bundle
         validate_bundle(bundle)
         source = bundle / 'Contents/MacOS/anp-keyd'
         assert hashlib.sha256(source.read_bytes()).hexdigest() == self.args.se_login_sha256
-        destination = self.base / 'LoginHelper.app'
-        shutil.copytree(bundle, destination)
+        if ending == 'upgrade':
+            upgrade_bundle = self.args.upgrade_bundle
+            validate_bundle(upgrade_bundle)
+            if helper_digest(upgrade_bundle) != self.args.upgrade_sha256:
+                raise ValueError('upgrade helper digest mismatch')
+            if self.args.upgrade_sha256 == self.args.se_login_sha256:
+                raise ValueError('upgrade helper must be a different build')
+            destination = self.base / 'InstalledHelper.app'
+            installed = install_helper(bundle, destination, self.args.helper_team_id,
+                                       self.args.helper_application_id, False)
+            if installed['candidate_sha256'] != self.args.se_login_sha256:
+                raise ValueError('initial helper install digest mismatch')
+            print('PASS initial helper installed through the release path', flush=True)
+        else:
+            destination = self.base / 'LoginHelper.app'
+            shutil.copytree(bundle, destination)
         binary = destination / 'Contents/MacOS/anp-keyd'
         assert hashlib.sha256(binary.read_bytes()).hexdigest() == self.args.se_login_sha256
         info = subprocess.run([str(binary), 'build-info'], capture_output=True, text=True, timeout=15, **self.credentials(self.admin), env=self.env, cwd='/')
@@ -437,7 +594,6 @@ class Checks(acceptance_signing.Checks):
                 assert self.request_as(self.agent, request)['data'] == reply['data']
                 # Prepare an approval before lease loss; it must not recreate
                 # authority after teardown advances the management epoch.
-                ending = getattr(self.args, 'se_ending', 'kill')
                 change = self.base / 'stale-grant.json'
                 change.write_text(json.dumps({'kind': 'Grant', 'change': {'action': 'Create',
                     'principal_id': self.config['principals'][0]['principal_id'],
@@ -506,6 +662,16 @@ class Checks(acceptance_signing.Checks):
                     print('ACTION REQUIRED after you log in following the reboot: sudo sh '
                           + str(launcher), flush=True)
                     wait_for_manual_reboot()
+                elif ending == 'upgrade':
+                    # End the live session before replacing the helper, as an
+                    # installed upgrade does; everything after must re-earn trust.
+                    helper.terminate()
+                    try:
+                        helper.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        helper.kill()
+                        helper.wait(timeout=10)
+                    self.exercise_upgrade(destination, upgrade_bundle)
                 else:
                     helper.send_signal(signal.SIGSTOP if ending == 'hang' else signal.SIGKILL)
                 if ending not in ('logout', 'reboot'):
@@ -542,8 +708,12 @@ class Checks(acceptance_signing.Checks):
                         helper.wait(timeout=10)
                     fresh = self.grant()
                     self.expect_locked(fresh)
+                if ending == 'upgrade':
+                    self.upgraded_helper_sign(destination / 'Contents/MacOS/anp-keyd')
                 authority = ('expired authority remains unusable' if ending == 'long-sleep'
                              else 'revocation and stale-approval refusal')
+                if ending == 'upgrade':
+                    authority += ', failed-upgrade recovery and upgraded-helper signing'
                 print(f'PASS independently verified SE hot-key signature, retry, changed-target refusal, helper {ending}, cache suppression, {authority} and fresh-grant locked key', flush=True)
             finally:
                 if helper.poll() is None:

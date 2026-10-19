@@ -95,13 +95,27 @@ class ReleaseProfile(unittest.TestCase):
                 'Entitlements': {'com.apple.application-identifier': app},
                 'ExpirationDate': expires, 'Platform': list(platforms)}
 
-    def decode(self, value):
+    def decode(self, value, capture=None):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'profile'
             path.write_bytes(b'profile')
             with patch.object(release, 'checked',
-                              return_value=SimpleNamespace(stdout=plistlib.dumps(value))):
-                return release.profile_metadata(path, TEAM, APP)
+                              return_value=SimpleNamespace(stdout=plistlib.dumps(value))) as checked:
+                result = release.profile_metadata(path, TEAM, APP)
+                if capture is not None:
+                    capture.append(checked.call_args.args[0])
+                return result
+
+    def test_profile_decoding_does_not_require_a_keychain(self):
+        # Installation runs as root, which has no default keychain; `security
+        # cms -D` failed there before the bundle could be verified.
+        arguments = []
+        self.decode(self.profile(), arguments)
+        command = arguments[0]
+        self.assertEqual(command[:7], ['/usr/bin/openssl', 'cms', '-verify', '-noverify',
+                                       '-inform', 'der', '-in'])
+        self.assertTrue(command[7].endswith('/profile'))
+        self.assertNotIn('/usr/bin/security', command)
 
     def test_valid_profile_is_accepted(self):
         metadata = self.decode(self.profile())
@@ -159,6 +173,21 @@ class BundleVerification(unittest.TestCase):
             with self.assertRaisesRegex(release.ReleaseError, 'CFBundleIdentifier'):
                 release.bundle_layout(bundle, TEAM, APP)
 
+    def test_upgrade_continuity_is_reported_on_the_candidate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old = self.bundle(directory)
+            new = self.bundle(Path(directory) / 'new')
+            report = self.verify(new, previous=old, requirement=lambda path: 'same')
+        self.assertEqual(report['upgrade_continuity'],
+                         'profile unchanged; Team ID and application identifier match')
+
+    def test_upgrade_without_readable_requirements_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old = self.bundle(directory)
+            new = self.bundle(Path(directory) / 'new')
+            with self.assertRaisesRegex(release.ReleaseError, 'designated requirement'):
+                self.verify(new, previous=old, requirement=lambda path: None)
+
     def test_upgrade_with_a_different_designated_requirement_is_refused(self):
         with tempfile.TemporaryDirectory() as directory:
             old = self.bundle(directory)
@@ -166,6 +195,17 @@ class BundleVerification(unittest.TestCase):
             requirement = lambda path: 'old' if str(path).startswith(str(old)) else 'new'
             with self.assertRaisesRegex(release.ReleaseError, 'designated requirement'):
                 self.verify(new, previous=old, requirement=requirement)
+
+
+class DesignatedRequirement(unittest.TestCase):
+    def test_requirement_is_read_from_whichever_stream_carries_it(self):
+        line = b'designated => identifier "x" and anchor apple generic'
+        for stdout, stderr in ((line, b''), (b'', line)):
+            with self.subTest(stdout=stdout), \
+                 patch.object(release, 'checked', return_value=SimpleNamespace(
+                     stdout=stdout, stderr=stderr)):
+                self.assertEqual(release.designated_requirement(Path('/bundle')),
+                                 'identifier "x" and anchor apple generic')
 
 
 class SignExample(unittest.TestCase):
@@ -229,6 +269,26 @@ class InstallSafety(unittest.TestCase):
         with patch.object(release.os, 'geteuid', return_value=501):
             with self.assertRaisesRegex(release.ReleaseError, 'root'):
                 release.install(args)
+
+    def test_install_compares_upgrade_against_installed_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / 'source'
+            (source / 'Contents' / 'MacOS').mkdir(parents=True)
+            (source / 'Contents' / 'MacOS' / 'anp-keyd').write_bytes(b'new')
+            destination = base / 'ANPKeyd.app'
+            destination.mkdir()
+            report = {'upgrade_continuity': 'profile unchanged'}
+            args = SimpleNamespace(bundle=source, destination=destination, upgrade=True,
+                                   team_id=TEAM, application_id=APP, profile_sha256=None,
+                                   require_notarized=False)
+            with patch.object(release.os, 'geteuid', return_value=0), \
+                 patch.object(release.os, 'chown'), \
+                 patch.object(release, 'verify_bundle', return_value=report) as verify:
+                result = release.install(args)
+        self.assertEqual(verify.call_args_list[0].kwargs['previous'], destination)
+        self.assertIs(result, report)
+        self.assertEqual(result['upgrade_continuity'], 'profile unchanged')
 
     def test_build_refuses_existing_output(self):
         with tempfile.TemporaryDirectory() as directory:

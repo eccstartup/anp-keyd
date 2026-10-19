@@ -71,8 +71,13 @@ def main():
     parser.add_argument('--helper-sha256')
     parser.add_argument('--se-login-bundle', type=Path, help='profile-embedded full signed helper; enables real SE joint acceptance with a signed generate-se fixture helper')
     parser.add_argument('--se-login-sha256')
-    parser.add_argument('--se-ending', choices=('kill', 'hang', 'sleep', 'long-sleep', 'user-switch', 'logout', 'reboot', 'restart', 'crash'), default='kill',
-                        help='real SE lease loss: helper kill/hang, operator sleep/user switch/logout/reboot, or isolated service restart/crash')
+    parser.add_argument('--se-ending', choices=('kill', 'hang', 'sleep', 'long-sleep', 'user-switch', 'logout', 'reboot', 'upgrade', 'restart', 'crash'), default='kill',
+                        help='real SE lease loss: helper kill/hang, operator sleep/user switch/logout/reboot, in-place helper upgrade, or isolated service restart/crash')
+    parser.add_argument('--upgrade-bundle', type=Path,
+                        help='different real build with the same signing identity; replaces the installed helper in place')
+    parser.add_argument('--upgrade-sha256')
+    parser.add_argument('--helper-team-id')
+    parser.add_argument('--helper-application-id')
     parser.add_argument('--interactive-ui', action='store_true', help='human window checks: cancel, 120-second timeout, masked temporary-password unlock')
     parser.add_argument('--migrate-fixture', action='store_true', help='install only the disposable fixture through the supported offline migrator and verify recovery/resume')
     parser.add_argument('--claude-binary', type=Path, help='reviewed standalone Claude Code binary; enables complete framework/tool execution with a local API fixture')
@@ -100,12 +105,21 @@ def main():
         raise ValueError('--se-ending requires --se-login-bundle')
     elif args.se_login_sha256:
         raise ValueError('--se-login-sha256 requires --se-login-bundle')
+    upgrade = (args.upgrade_bundle, args.upgrade_sha256,
+               args.helper_team_id, args.helper_application_id)
+    if args.se_ending == 'upgrade':
+        if not all(upgrade) or not args.se_login_bundle:
+            raise ValueError('upgrade mode requires the upgrade bundle/digest and signed identity fields')
+    elif any(upgrade):
+        raise ValueError('upgrade options require --se-ending upgrade')
     args.config = args.config.absolute()
     args.binary = args.binary.absolute()
     if args.candidate_binary:
         args.candidate_binary = args.candidate_binary.absolute()
     elif args.candidate_sha256:
         raise ValueError('--candidate-sha256 requires --candidate-binary')
+    if args.upgrade_bundle:
+        args.upgrade_bundle = args.upgrade_bundle.absolute()
     if args.signing_helper:
         args.signing_helper = args.signing_helper.absolute()
     elif (args.interactive_ui and not args.ui_preflight_only) or args.helper_sha256:

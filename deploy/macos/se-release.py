@@ -130,7 +130,10 @@ def resolve_identity(wanted):
 
 
 def profile_metadata(path, team, application):
-    result = checked(['/usr/bin/security', 'cms', '-D', '-i', str(path)], env=ENV)
+    # `security cms -D` needs a default keychain, which the root install context
+    # does not have, so installation failed before it could inspect the bundle.
+    result = checked(['/usr/bin/openssl', 'cms', '-verify', '-noverify', '-inform', 'der',
+                      '-in', str(path)], env=ENV)
     try:
         decoded = plistlib.loads(result.stdout)
     except plistlib.InvalidFileException as error:
@@ -209,7 +212,9 @@ def code_signature(path):
 def designated_requirement(path):
     result = checked(['/usr/bin/codesign', '-d', '-r-', str(path)], env=ENV)
     prefix = 'designated => '
-    for line in result.stderr.decode(errors='replace').splitlines():
+    # codesign versions differ on which stream carries the requirement.
+    text = (result.stdout + b'\n' + result.stderr).decode(errors='replace')
+    for line in text.splitlines():
         if line.startswith(prefix):
             return line[len(prefix):].strip()
     return None
@@ -274,7 +279,10 @@ def verify_bundle(bundle, team, application, *, installed=False, expected_profil
             continuity = 'profile unchanged; Team ID and application identifier match'
         old_requirement = designated_requirement(previous_executable)
         new_requirement = designated_requirement(executable)
-        if old_requirement and new_requirement and old_requirement != new_requirement:
+        if not old_requirement or not new_requirement:
+            raise ReleaseError(
+                'cannot read the designated requirement for the upgrade identity comparison')
+        if old_requirement != new_requirement:
             raise ReleaseError(
                 'the new helper has a different designated requirement; an upgrade would be a '
                 f'different code identity: {old_requirement!r} != {new_requirement!r}'
@@ -509,9 +517,11 @@ def install(args):
         raise ReleaseError('macOS only')
     source = args.bundle.resolve(strict=True)
     destination = Path(args.destination)
+    upgrading = args.upgrade and destination.exists()
     candidate = verify_bundle(source, args.team_id, args.application_id,
                               expected_profile=args.profile_sha256,
-                              require_notarized=args.require_notarized)
+                              require_notarized=args.require_notarized,
+                              previous=destination if upgrading else None)
     if destination.exists() and not args.upgrade:
         raise ReleaseError(f'{destination} exists; pass --upgrade for an in-place upgrade')
     backup = destination.with_name(destination.name + '.previous')
@@ -521,7 +531,7 @@ def install(args):
         raise ReleaseError('--upgrade was requested but no installed helper exists')
     if args.upgrade:
         verify_bundle(destination, args.team_id, args.application_id,
-                      installed=True, require_notarized=False, previous=source)
+                      installed=True, require_notarized=False)
     destination.parent.mkdir(parents=True, exist_ok=True)
     staged = Path(tempfile.mkdtemp(prefix='.ANPKeyd.app.', dir=destination.parent)) / 'bundle'
     try:
