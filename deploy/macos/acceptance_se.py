@@ -3,6 +3,7 @@ The public fixture password is not a production secret. No automatic UI consent.
 """
 import hashlib
 import json
+import re
 from pathlib import Path
 import shutil
 import signal
@@ -11,6 +12,67 @@ import subprocess
 import time
 
 import acceptance_signing
+
+
+def sleep_times(output):
+    values = {}
+    for name in ('sleeptime', 'waketime'):
+        match = re.search(r'^kern\.' + name + r': \{ sec = (\d+), usec = (\d+) \}', output, re.M)
+        if not match:
+            raise ValueError('missing kernel sleep/wake evidence: ' + name)
+        seconds, micros = map(int, match.groups())
+        if not 0 <= micros < 1_000_000:
+            raise ValueError('invalid kernel timestamp')
+        values[name] = seconds + micros / 1_000_000
+    return values
+
+
+def kernel_sleep_times():
+    result = subprocess.run(['/usr/sbin/sysctl', 'kern.sleeptime', 'kern.waketime'],
+                            capture_output=True, text=True, timeout=10)
+    if result.returncode:
+        raise ValueError('kernel sleep evidence unavailable: ' + result.stderr)
+    return sleep_times(result.stdout)
+
+
+def verify_sleep_transition(before, after, started, finished):
+    sleep, wake = after['sleeptime'], after['waketime']
+    if sleep <= before['sleeptime'] or wake <= before['waketime']:
+        raise ValueError('no new kernel sleep/wake pair')
+    if not started <= sleep < wake <= finished:
+        raise ValueError('sleep/wake pair outside acceptance interval')
+    if wake - sleep < 6:
+        raise ValueError('sleep must exceed the five-second heartbeat window')
+    if finished - started > 90:
+        raise ValueError('transition exceeded short acceptance window; approval expiry could confound evidence')
+
+
+def wait_for_sleep_transition(before, started, read_times=None, clock=None, pause=None):
+    read_times = read_times or kernel_sleep_times
+    clock = clock or time.time
+    pause = pause or time.sleep
+    while True:
+        after = read_times()
+        finished = clock()
+        if finished < started:
+            raise ValueError('wall clock moved backwards during sleep acceptance')
+        if finished - started > 90:
+            raise ValueError('no valid sleep/wake pair within 90 seconds')
+        if after['sleeptime'] > before['sleeptime'] and after['waketime'] > before['waketime']:
+            verify_sleep_transition(before, after, started, finished)
+            return after, finished
+        pause(.5)
+
+
+def operator_sleep_transition():
+    before = kernel_sleep_times()
+    started = time.time()
+    print('READY FOR MANUAL SLEEP: use Apple menu Sleep now; wait at least 6 seconds, '
+          'then wake within 90 seconds. Wake detection is automatic; DO NOT press Enter. '
+          'This script does not trigger sleep.', flush=True)
+    after, finished = wait_for_sleep_transition(before, started)
+    print('KERNEL_SLEEP_EVIDENCE ' + json.dumps({'before': before, 'after': after,
+          'started': started, 'finished': finished}), flush=True)
 
 
 def validate_bundle(bundle):
@@ -100,7 +162,12 @@ class Checks(acceptance_signing.Checks):
                 assert prepared.returncode == 0, prepared.stderr
                 pending = json.loads(prepared.stdout)['prepared']
                 ending = getattr(self.args, 'se_ending', 'kill')
-                helper.send_signal(signal.SIGSTOP if ending == 'hang' else signal.SIGKILL)
+                if ending in ('restart', 'crash'):
+                    self.restart_service(ending == 'crash')
+                elif ending == 'sleep':
+                    operator_sleep_transition()
+                else:
+                    helper.send_signal(signal.SIGSTOP if ending == 'hang' else signal.SIGKILL)
                 if ending == 'kill':
                     helper.wait(timeout=10)
                 # Allow the documented observation deadline; then require both
@@ -111,10 +178,11 @@ class Checks(acceptance_signing.Checks):
                     if replay['code'] != 'OK' or 'result' not in replay.get('data', {}):
                         break
                     if time.monotonic() >= deadline:
-                        raise ValueError('helper death did not suppress cached signature')
+                        raise ValueError('SE session loss did not suppress cached signature')
                     time.sleep(.2)
                 keys = self.request_as(self.agent, {'operation': 'LIST_AUTHORIZED_KEYS'})
                 assert keys['code'] == 'OK' and keys['data']['keys'] == [], keys
+                assert time.time() + 5 < pending['expires_at'], 'approval expired before teardown check'
                 stale = self.cli(self.admin, 'commit', '--operation-id', pending['operation_id'],
                                  '--digest', pending['digest'])
                 assert stale.returncode != 0, 'old approval survived SE session loss'
@@ -124,6 +192,8 @@ class Checks(acceptance_signing.Checks):
                     helper.wait(timeout=10)
                     replay = self.request_as(self.agent, request)
                     assert replay['code'] != 'OK' or 'result' not in replay.get('data', {}), replay
+                if ending in ('sleep', 'restart', 'crash'):
+                    helper.wait(timeout=10)
                 fresh = self.grant()
                 self.expect_locked(fresh)
                 print(f'PASS independently verified SE hot-key signature, retry, changed-target refusal, helper {ending}, cache suppression, revocation, stale-approval refusal and locked key', flush=True)

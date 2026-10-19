@@ -27,6 +27,23 @@ def require_success(result, phase):
                          f'stdout={result.stdout!r}; stderr={result.stderr!r}')
 
 
+def wait_ready(proc, probe, instance_id, timeout=10):
+    deadline = time.monotonic() + timeout
+    last_error = 'no successful management response'
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise ValueError('temporary service failed to start')
+        result = probe()
+        if result.returncode == 0:
+            status = json.loads(result.stdout)
+            if status.get('instance_id') != instance_id:
+                raise ValueError('startup management instance mismatch')
+            return
+        last_error = result.stderr.strip()
+        time.sleep(.05)
+    raise ValueError('temporary service startup timed out: ' + last_error)
+
+
 def child_credentials(user, config, extra_admin_group=False):
     groups = [config['agent_gid']]
     if user.pw_uid == config['service_uid']:
@@ -53,8 +70,8 @@ def main():
     parser.add_argument('--helper-sha256')
     parser.add_argument('--se-login-bundle', type=Path, help='profile-embedded full signed helper; enables real SE joint acceptance with a signed generate-se fixture helper')
     parser.add_argument('--se-login-sha256')
-    parser.add_argument('--se-ending', choices=('kill', 'hang'), default='kill',
-                        help='real SE helper failure: SIGKILL or SIGSTOP with a live socket')
+    parser.add_argument('--se-ending', choices=('kill', 'hang', 'sleep', 'restart', 'crash'), default='kill',
+                        help='real SE lease loss: helper kill/hang, operator sleep, or isolated service restart/crash')
     parser.add_argument('--interactive-ui', action='store_true', help='human window checks: cancel, 120-second timeout, masked temporary-password unlock')
     parser.add_argument('--migrate-fixture', action='store_true', help='install only the disposable fixture through the supported offline migrator and verify recovery/resume')
     parser.add_argument('--claude-binary', type=Path, help='reviewed standalone Claude Code binary; enables complete framework/tool execution with a local API fixture')
@@ -209,15 +226,18 @@ print(json.dumps({'uid':os.getuid(),'euid':os.geteuid(),'gid':os.getgid(),'kerne
             proc = subprocess.Popen([str(args.binary), 'serve-protected', '--config', str(path)],
                                     **credentials(service), env=env, cwd="/",
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            for _ in range(100):
-                if proc.poll() is not None:
-                    raise ValueError('temporary service failed to start')
-                if Path(config['admin_socket']).exists():
-                    return proc
-                time.sleep(0.05)
-            proc.terminate()
-            proc.wait(timeout=10)
-            raise ValueError('temporary service startup timed out')
+            try:
+                wait_ready(proc, lambda: cli(admin, 'status'), config['instance_id'])
+                return proc
+            except BaseException:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                raise
         def stop(proc):
             proc.terminate()
             try:
@@ -253,9 +273,26 @@ print(json.dumps({'uid':os.getuid(),'euid':os.geteuid(),'gid':os.getgid(),'kerne
                 else:
                     checks_type = acceptance_signing.Checks
                 checks = checks_type(base, config, path, args, fixture, admin, agent, credentials, env, cli)
+                if args.se_login_bundle:
+                    def restart_se_service(abrupt):
+                        nonlocal process
+                        before = json.loads(cli(admin, 'status').stdout)['boot_epoch']
+                        if abrupt:
+                            process.kill()
+                            process.wait(timeout=10)
+                        else:
+                            stop(process)
+                        process = None
+                        process = start()
+                        result = cli(admin, 'status')
+                        assert result.returncode == 0, result.stderr
+                        after = json.loads(result.stdout)['boot_epoch']
+                        assert after > before, 'service restart did not advance boot epoch'
+                        print(f'PASS isolated service restart boot epoch {before} -> {after}; abrupt={abrupt}', flush=True)
+                    checks.restart_service = restart_se_service
                 checks.before_restart()
                 if args.se_login_bundle:
-                    print('PASS real SE/full helper/separate service signing and helper-death checks; OS isolation and host lifecycle remain unaccepted', flush=True)
+                    print(f'PASS real SE/full helper/separate service signing and {args.se_ending} checks; raw OS isolation and other host lifecycle cases remain unaccepted', flush=True)
                     return
                 if args.claude_binary:
                     import acceptance_agent

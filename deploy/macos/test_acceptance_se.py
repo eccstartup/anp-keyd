@@ -6,7 +6,7 @@ import hashlib
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from acceptance_se import validate_bundle
+from acceptance_se import validate_bundle, sleep_times, verify_sleep_transition, wait_for_sleep_transition
 import acceptance_signing
 
 
@@ -65,3 +65,54 @@ class BundleChecks(unittest.TestCase):
                 (bundle / str(index)).touch()
             with self.assertRaises(ValueError):
                 validate_bundle(bundle)
+
+
+class SleepEvidence(unittest.TestCase):
+    def test_kernel_format_and_microseconds(self):
+        result = sleep_times('kern.sleeptime: { sec = 100, usec = 500000 } date\n'
+                             'kern.waketime: { sec = 110, usec = 250000 } date\n')
+        self.assertEqual(result, {'sleeptime': 100.5, 'waketime': 110.25})
+
+    def test_unavailable_or_invalid_timestamp_is_not_sleep(self):
+        for text in ('permission denied', 'kern.sleeptime: { sec = 1, usec = 1000000 }\n'
+                     'kern.waketime: { sec = 3, usec = 0 }'):
+            with self.assertRaises(ValueError):
+                sleep_times(text)
+
+    def test_only_new_bounded_sleep_pair_is_accepted(self):
+        before = {'sleeptime': 10, 'waketime': 20}
+        verify_sleep_transition(before, {'sleeptime': 102, 'waketime': 110}, 100, 115)
+        for after, end in [
+            (before, 115),
+            ({'sleeptime': 99, 'waketime': 110}, 115),
+            ({'sleeptime': 102, 'waketime': 104}, 115),
+            ({'sleeptime': 102, 'waketime': 120}, 115),
+            ({'sleeptime': 102, 'waketime': 110}, 195),
+        ]:
+            with self.assertRaises(ValueError):
+                verify_sleep_transition(before, after, 100, end)
+
+
+class AutomaticWakeDetection(unittest.TestCase):
+    def test_wake_resumes_checks_without_terminal_input(self):
+        before = {'sleeptime': 10, 'waketime': 20}
+        after = {'sleeptime': 102, 'waketime': 110}
+        reads = iter([before, after])
+        ticks = iter([101, 111])
+        pauses = []
+        self.assertEqual(wait_for_sleep_transition(before, 100,
+            read_times=lambda: next(reads), clock=lambda: next(ticks), pause=pauses.append),
+            (after, 111))
+        self.assertEqual(pauses, [.5])
+
+    def test_no_sleep_times_out_without_reading_stdin(self):
+        before = {'sleeptime': 10, 'waketime': 20}
+        with self.assertRaisesRegex(ValueError, 'within 90 seconds'):
+            wait_for_sleep_transition(before, 100, read_times=lambda: before,
+                                      clock=lambda: 191, pause=lambda _: None)
+
+    def test_clock_rollback_fails_closed(self):
+        before = {'sleeptime': 10, 'waketime': 20}
+        with self.assertRaisesRegex(ValueError, 'backwards'):
+            wait_for_sleep_transition(before, 100, read_times=lambda: before,
+                                      clock=lambda: 99, pause=lambda _: None)
