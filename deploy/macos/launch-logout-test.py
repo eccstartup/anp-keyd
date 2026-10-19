@@ -19,6 +19,7 @@ def job_spec(stage, python, arguments, diagnostic=False):
         'ProgramArguments': [str(python), '-u', str(stage / 'test-runtime.py'),
                              '--se-ending', 'logout', *(['--logout-diagnostics'] if diagnostic else []), *arguments],
         'RunAtLoad': True, 'KeepAlive': False, 'LaunchOnlyOnce': True,
+        'SessionCreate': True,
         'ProcessType': 'Background', 'WorkingDirectory': '/',
         'StandardOutPath': str(stage / 'host.log'),
         'StandardErrorPath': str(stage / 'host.log'),

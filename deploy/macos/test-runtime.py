@@ -136,6 +136,8 @@ def main():
         if console_uid() != admin.pw_uid:
             raise ValueError('logout test must start on the configured administrator desktop')
         graphical = acceptance_graphical.session(admin, args.config)
+        args.runner_audit_context = acceptance_graphical.require_runner_session(graphical)
+        print('SYSTEM_RUNNER_AUDIT_CONTEXT ' + json.dumps(args.runner_audit_context), flush=True)
         if acceptance_graphical.relogin_session(admin) != graphical:
             raise ValueError('native console audit session does not match graphical bridge')
         print(f'PASS system runner pid={os.getpid()} ppid=1; graphical audit bridge session={graphical}; no SE key created yet', flush=True)
@@ -283,6 +285,8 @@ print(json.dumps({'uid':os.getuid(),'euid':os.geteuid(),'gid':os.getgid(),'kerne
                 for index in range(3):
                     print(f'CHECK nondisruptive system console/client round {index + 1}', flush=True)
                     session = acceptance_graphical.relogin_session(admin)
+                    assert acceptance_graphical.require_runner_session(session,
+                        args.runner_audit_context) == args.runner_audit_context
                     print(f'PASS native graphical audit session {session}', flush=True)
                     result = cli(admin, 'status')
                     require_success(result, 'post-console management subprocess')

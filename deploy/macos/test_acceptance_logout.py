@@ -70,6 +70,7 @@ class SystemJob(unittest.TestCase):
         stage = Path('/Library/ANPKeydLogoutChecks-example')
         job = launcher.job_spec(stage, Path('/usr/bin/python3'), ['--candidate-binary', '/fixture'])
         self.assertFalse(job['KeepAlive'])
+        self.assertTrue(job['SessionCreate'])
         self.assertTrue(job['LaunchOnlyOnce'])
         self.assertEqual(job['WorkingDirectory'], '/')
         self.assertNotIn('UserName', job)  # root runner drops each child's credentials
@@ -79,6 +80,18 @@ class SystemJob(unittest.TestCase):
 
 
 class GraphicalBridge(unittest.TestCase):
+    def test_runner_session_must_be_distinct_nongraphical_and_unchanged(self):
+        valid = {'session':123, 'attributes':0}
+        with patch.object(graphical, 'audit_context', return_value=valid):
+            self.assertEqual(graphical.require_runner_session(500, valid), valid)
+            with self.assertRaisesRegex(ValueError, 'changed'):
+                graphical.require_runner_session(500, {'session':122,'attributes':0})
+        for context in ({'session':500,'attributes':0}, {'session':0,'attributes':0},
+                        {'session':123,'attributes':0x10}):
+            with patch.object(graphical, 'audit_context', return_value=context):
+                with self.assertRaisesRegex(ValueError, 'own non-graphical'):
+                    graphical.require_runner_session(500)
+
     def state(self):
         return {'UID':501, 'SessionInfo':[{'kCGSSessionUserIDKey':501,
             'kCGSSessionOnConsoleKey':True, 'kCGSessionLoginDoneKey':True,

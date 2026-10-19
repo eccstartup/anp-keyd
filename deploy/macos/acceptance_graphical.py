@@ -15,19 +15,35 @@ def command(user, config, argv):
             str(Path(__file__).resolve()), str(config), str(user.pw_uid), *map(str, argv)]
 
 
-def current_session(requested=0xffffffff):
+def audit_context(requested=0xffffffff):
     lib = ctypes.CDLL('/System/Library/Frameworks/Security.framework/Security')
     lib.SessionGetInfo.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32),
                                    ctypes.POINTER(ctypes.c_uint32)]
     lib.SessionGetInfo.restype = ctypes.c_int32
     actual, attrs = ctypes.c_uint32(), ctypes.c_uint32()
     if lib.SessionGetInfo(requested, ctypes.byref(actual), ctypes.byref(attrs)) != 0:
-        raise ValueError('graphical audit session unavailable')
-    if actual.value in (0, 0xffffffff) or not attrs.value & 0x10 or attrs.value & 0x1001:
+        raise ValueError('audit session unavailable')
+    return {'session': actual.value, 'attributes': attrs.value}
+
+
+def require_runner_session(graphical_session, expected=None):
+    context = audit_context()
+    if context['session'] in (0, 0xffffffff, graphical_session) or context['attributes'] & 0x10:
+        raise ValueError('system runner requires its own non-graphical audit session')
+    if expected is not None and context != expected:
+        raise ValueError('system runner audit context changed across lifecycle test')
+    return context
+
+
+def current_session(requested=0xffffffff):
+    context = audit_context(requested)
+    actual = context['session']
+    attrs = context['attributes']
+    if actual in (0, 0xffffffff) or not attrs & 0x10 or attrs & 0x1001:
         raise ValueError('not an eligible graphical audit session')
-    if requested != 0xffffffff and actual.value != requested:
+    if requested != 0xffffffff and actual != requested:
         raise ValueError('graphical audit session mismatch')
-    return actual.value
+    return actual
 
 
 def relogin_session(user, timeout=20):

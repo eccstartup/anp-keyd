@@ -221,6 +221,9 @@ class Checks(acceptance_signing.Checks):
                         print('PASS old cache suppressed and authorized keys empty at login window', flush=True)
                     operator_logout(self.admin.pw_uid, old_session, check_logged_out,
                         lambda: acceptance_graphical.relogin_session(self.admin))
+                    context = acceptance_graphical.require_runner_session(
+                        acceptance_graphical.relogin_session(self.admin), self.args.runner_audit_context)
+                    print('PASS unchanged independent system runner audit context ' + json.dumps(context), flush=True)
                 else:
                     helper.send_signal(signal.SIGSTOP if ending == 'hang' else signal.SIGKILL)
                 if ending == 'kill':
