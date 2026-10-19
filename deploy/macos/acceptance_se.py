@@ -195,6 +195,15 @@ class Checks(acceptance_signing.Checks):
                     self.restart_service(ending == 'crash')
                 elif ending in ('sleep', 'long-sleep'):
                     operator_sleep_transition(long_sleep=ending == 'long-sleep')
+                elif ending == 'user-switch':
+                    from acceptance_console import operator_user_switch
+                    def check_away():
+                        cached = self.request_as(self.agent, request)
+                        assert cached['code'] != 'OK' or 'result' not in cached.get('data', {}), cached
+                        listed = self.request_as(self.agent, {'operation': 'LIST_AUTHORIZED_KEYS'})
+                        assert listed['code'] == 'OK' and listed['data']['keys'] == [], listed
+                        print('PASS cached signature suppressed and authorized keys empty while other user owns console', flush=True)
+                    operator_user_switch(self.admin.pw_uid, check_away)
                 else:
                     helper.send_signal(signal.SIGSTOP if ending == 'hang' else signal.SIGKILL)
                 if ending == 'kill':
@@ -226,7 +235,7 @@ class Checks(acceptance_signing.Checks):
                     helper.wait(timeout=10)
                     replay = self.request_as(self.agent, request)
                     assert replay['code'] != 'OK' or 'result' not in replay.get('data', {}), replay
-                if ending in ('sleep', 'long-sleep', 'restart', 'crash'):
+                if ending in ('sleep', 'long-sleep', 'user-switch', 'restart', 'crash'):
                     helper.wait(timeout=10)
                 fresh = self.grant()
                 self.expect_locked(fresh)

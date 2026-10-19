@@ -70,8 +70,8 @@ def main():
     parser.add_argument('--helper-sha256')
     parser.add_argument('--se-login-bundle', type=Path, help='profile-embedded full signed helper; enables real SE joint acceptance with a signed generate-se fixture helper')
     parser.add_argument('--se-login-sha256')
-    parser.add_argument('--se-ending', choices=('kill', 'hang', 'sleep', 'long-sleep', 'restart', 'crash'), default='kill',
-                        help='real SE lease loss: helper kill/hang, operator sleep, or isolated service restart/crash')
+    parser.add_argument('--se-ending', choices=('kill', 'hang', 'sleep', 'long-sleep', 'user-switch', 'restart', 'crash'), default='kill',
+                        help='real SE lease loss: helper kill/hang, operator sleep/user switch, or isolated service restart/crash')
     parser.add_argument('--interactive-ui', action='store_true', help='human window checks: cancel, 120-second timeout, masked temporary-password unlock')
     parser.add_argument('--migrate-fixture', action='store_true', help='install only the disposable fixture through the supported offline migrator and verify recovery/resume')
     parser.add_argument('--claude-binary', type=Path, help='reviewed standalone Claude Code binary; enables complete framework/tool execution with a local API fixture')
