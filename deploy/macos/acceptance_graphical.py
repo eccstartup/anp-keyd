@@ -4,8 +4,10 @@ import json
 import os
 from pathlib import Path
 import pwd
+import re
 import subprocess
 import sys
+import time
 
 
 def command(user, config, argv):
@@ -13,17 +15,47 @@ def command(user, config, argv):
             str(Path(__file__).resolve()), str(config), str(user.pw_uid), *map(str, argv)]
 
 
-def current_session():
+def current_session(requested=0xffffffff):
     lib = ctypes.CDLL('/System/Library/Frameworks/Security.framework/Security')
     lib.SessionGetInfo.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32),
                                    ctypes.POINTER(ctypes.c_uint32)]
     lib.SessionGetInfo.restype = ctypes.c_int32
     actual, attrs = ctypes.c_uint32(), ctypes.c_uint32()
-    if lib.SessionGetInfo(0xffffffff, ctypes.byref(actual), ctypes.byref(attrs)) != 0:
+    if lib.SessionGetInfo(requested, ctypes.byref(actual), ctypes.byref(attrs)) != 0:
         raise ValueError('graphical audit session unavailable')
     if actual.value in (0, 0xffffffff) or not attrs.value & 0x10 or attrs.value & 0x1001:
         raise ValueError('not an eligible graphical audit session')
+    if requested != 0xffffffff and actual.value != requested:
+        raise ValueError('graphical audit session mismatch')
     return actual.value
+
+
+def domain_session(output, uid):
+    context = re.search(r'^\s*security context = \{\s*uid = (\d+)\s*asid = (\d+)\s*\}', output, re.M)
+    if not context or int(context[1]) != uid:
+        raise ValueError('graphical bootstrap security context missing or wrong UID')
+    value = int(context[2])
+    if value in (0, 0xffffffff):
+        raise ValueError('invalid graphical bootstrap audit session')
+    return value
+
+
+def relogin_session(user, timeout=20):
+    """Read-only readiness probe; never enter a GUI context or restart a helper."""
+    deadline = time.monotonic() + timeout
+    last = 'graphical bootstrap not ready'
+    while time.monotonic() < deadline:
+        try:
+            result = subprocess.run(['/bin/launchctl', 'print', f'gui/{user.pw_uid}'],
+                capture_output=True, text=True, timeout=min(3, max(.01, deadline - time.monotonic())))
+            if result.returncode:
+                raise ValueError('graphical bootstrap unavailable: ' + result.stderr)
+            value = domain_session(result.stdout, user.pw_uid)
+            return current_session(value)
+        except (ValueError, subprocess.TimeoutExpired) as error:
+            last = str(error)
+            time.sleep(.2)
+    raise ValueError('relogin graphical session readiness timed out: ' + last)
 
 
 def session(user, config):

@@ -42,6 +42,9 @@ def main():
         status = subprocess.run(['/bin/launchctl', 'print', 'system/' + label],
                                 capture_output=True, text=True, timeout=10)
         if status.returncode:
+            if status.returncode == 113 and 'Could not find service' in status.stderr:
+                print('One-shot test job already removed; evidence retained at ' + str(stage))
+                return
             raise ValueError('cannot verify test job status: ' + status.stderr)
         if 'state = running' in status.stdout:
             raise ValueError('test job is still running; wait for completion')

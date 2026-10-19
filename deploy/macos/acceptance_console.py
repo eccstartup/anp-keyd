@@ -107,6 +107,9 @@ def wait_logout(actor, old_session, check_away, read_session, read_uid=console_u
                 if not checked:
                     raise ValueError('login window must remain active for at least six seconds')
                 new_session = read_session()
+                finished = clock()
+                if finished < now or finished - started > 90:
+                    raise ValueError('logout session readiness exceeded acceptance interval')
                 if new_session in (0, 0xffffffff, old_session):
                     raise ValueError('graphical audit session did not change; logout not proven')
                 return new_session

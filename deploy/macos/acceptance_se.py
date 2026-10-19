@@ -220,7 +220,7 @@ class Checks(acceptance_signing.Checks):
                         assert listed['code'] == 'OK' and listed['data']['keys'] == [], listed
                         print('PASS old cache suppressed and authorized keys empty at login window', flush=True)
                     operator_logout(self.admin.pw_uid, old_session, check_logged_out,
-                        lambda: acceptance_graphical.session(self.admin, self.path))
+                        lambda: acceptance_graphical.relogin_session(self.admin))
                 else:
                     helper.send_signal(signal.SIGSTOP if ending == 'hang' else signal.SIGKILL)
                 if ending == 'kill':

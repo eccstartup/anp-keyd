@@ -15,7 +15,7 @@ spec.loader.exec_module(launcher)
 
 class Logout(unittest.TestCase):
     def run_logout(self, users, times, session=200, check=None):
-        users, times = iter(users), iter(times)
+        users, times = iter(users), iter([*times, times[-1]])
         return wait_logout(501, 100, check or Mock(), lambda: session,
             read_uid=lambda: next(users), clock=lambda: next(times), pause=lambda _: None)
 
@@ -73,6 +73,31 @@ class SystemJob(unittest.TestCase):
 
 
 class GraphicalBridge(unittest.TestCase):
+    def test_bootstrap_session_bound_to_requested_uid(self):
+        output = 'gui/501 = {\n security context = {\n uid = 501\n asid = 105541\n }\n}'
+        self.assertEqual(graphical.domain_session(output, 501), 105541)
+        for text in (output.replace('uid = 501', 'uid = 504'),
+                     output.replace('105541', '0'), 'handle = 105541'):
+            with self.assertRaises(ValueError):
+                graphical.domain_session(text, 501)
+
+    def test_bootstrap_readiness_does_not_spawn_asuser(self):
+        ready = SimpleNamespace(returncode=0,
+            stdout='security context = {\n uid = 501\n asid = 105541\n}')
+        with patch.object(graphical.subprocess, 'run', side_effect=[
+                SimpleNamespace(returncode=1, stderr='not ready'), ready]) as run, \
+             patch.object(graphical, 'current_session', return_value=105541) as validate, \
+             patch.object(graphical.time, 'sleep'):
+            self.assertEqual(graphical.relogin_session(SimpleNamespace(pw_uid=501)), 105541)
+        validate.assert_called_once_with(105541)
+        for args in run.call_args_list:
+            self.assertEqual(args.args[0], ['/bin/launchctl', 'print', 'gui/501'])
+
+    def test_bootstrap_readiness_deadline_is_bounded(self):
+        with patch.object(graphical.time, 'monotonic', side_effect=[0, 21]):
+            with self.assertRaisesRegex(ValueError, 'readiness timed out'):
+                graphical.relogin_session(SimpleNamespace(pw_uid=501))
+
     def test_drops_credentials_before_exec(self):
         with patch.object(graphical.os, 'geteuid', return_value=0), \
              patch.object(graphical.sys, 'argv', ['bridge', '/config', '501', '/helper', 'generate-se']), \
