@@ -1,6 +1,6 @@
 # TODO
 
-当前受保护改造的进度以本地 `docs/plan-security-v5.md` 为准；此处列未完成的发行工作。
+当前受保护改造的进度以本地 `docs/plan-security-v6.md` 为准；此处列未完成的发行工作。
 
 - [x] Linux systemd 真实主机验收已完成；仅正式 Linux release 且显式受保护模式声明支持。
 - [x] macOS 持久 SE 与主机生命周期验收：真实 SE＋开发签名助手＋独立 UID 服务通过；用户切换、注销/重新登录、短/长休眠、整机重启、升级、密钥丢失、签名身份与钥匙串权限变化均已验收，临时密钥均按精确标签删除并复查。保护声明仍为 `macos-boundary-preview`、`protected_supported=false`。
