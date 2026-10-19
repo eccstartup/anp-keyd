@@ -153,10 +153,17 @@ class Checks(acceptance_signing.Checks):
         assert denied.returncode != 0 and 'ADMIN_REQUIRED' in denied.stderr, denied.stderr
         print('UI: check the temporary exact key and enter ONLY the public test password: '
               + acceptance_signing.PASSWORD, flush=True)
+        helper_credentials = self.credentials(self.admin)
+        if self.args.se_ending == 'logout':
+            import acceptance_graphical
+            old_session = acceptance_graphical.session(self.admin, self.path)
+            print('OLD_GRAPHICAL_AUDIT_SESSION ' + str(old_session), flush=True)
+            command = acceptance_graphical.command(self.admin, self.path, command)
+            helper_credentials = {}
         log = self.base / 'se-helper.log'
         with log.open('w+') as output:
             helper = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output, stderr=output,
-                                      **self.credentials(self.admin), env=self.env, cwd='/')
+                                      **helper_credentials, env=self.env, cwd='/')
             try:
                 deadline = time.monotonic() + 145
                 while time.monotonic() < deadline:
@@ -204,6 +211,16 @@ class Checks(acceptance_signing.Checks):
                         assert listed['code'] == 'OK' and listed['data']['keys'] == [], listed
                         print('PASS cached signature suppressed and authorized keys empty while other user owns console', flush=True)
                     operator_user_switch(self.admin.pw_uid, check_away)
+                elif ending == 'logout':
+                    from acceptance_console import operator_logout
+                    def check_logged_out():
+                        cached = self.request_as(self.agent, request)
+                        assert cached['code'] != 'OK' or 'result' not in cached.get('data', {}), cached
+                        listed = self.request_as(self.agent, {'operation': 'LIST_AUTHORIZED_KEYS'})
+                        assert listed['code'] == 'OK' and listed['data']['keys'] == [], listed
+                        print('PASS old cache suppressed and authorized keys empty at login window', flush=True)
+                    operator_logout(self.admin.pw_uid, old_session, check_logged_out,
+                        lambda: acceptance_graphical.session(self.admin, self.path))
                 else:
                     helper.send_signal(signal.SIGSTOP if ending == 'hang' else signal.SIGKILL)
                 if ending == 'kill':
@@ -235,7 +252,7 @@ class Checks(acceptance_signing.Checks):
                     helper.wait(timeout=10)
                     replay = self.request_as(self.agent, request)
                     assert replay['code'] != 'OK' or 'result' not in replay.get('data', {}), replay
-                if ending in ('sleep', 'long-sleep', 'user-switch', 'restart', 'crash'):
+                if ending in ('sleep', 'long-sleep', 'user-switch', 'logout', 'restart', 'crash'):
                     helper.wait(timeout=10)
                 fresh = self.grant()
                 self.expect_locked(fresh)

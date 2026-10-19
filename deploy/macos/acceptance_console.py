@@ -74,3 +74,57 @@ def operator_user_switch(actor, check_away):
         raise ValueError('sleep occurred during user-switch test; evidence is confounded')
     print(f'PASS observed graphical console UID {actor} -> {other} -> {actor}; '
           'away-state checks ran; no kernel sleep transition', flush=True)
+
+
+def wait_logout(actor, old_session, check_away, read_session, read_uid=console_uid,
+                clock=time.time, pause=time.sleep, observe=None):
+    started = previous = clock()
+    if read_uid() != actor:
+        raise ValueError('administrator must initially own the graphical console')
+    since = None
+    checked = False
+    last_uid = actor
+    while True:
+        now = clock()
+        if now < previous:
+            raise ValueError('wall clock moved backwards during logout')
+        previous = now
+        if now - started > 90:
+            raise ValueError('logout and relogin must complete within 90 seconds')
+        uid = read_uid()
+        if uid != last_uid:
+            if observe:
+                observe({'uid': uid, 'wall': now, 'started': started})
+            last_uid = uid
+        if uid == 0:
+            if since is None:
+                since = now
+            if not checked and now - since >= 6:
+                check_away()
+                checked = True
+        elif uid == actor:
+            if since is not None:
+                if not checked:
+                    raise ValueError('login window must remain active for at least six seconds')
+                new_session = read_session()
+                if new_session in (0, 0xffffffff, old_session):
+                    raise ValueError('graphical audit session did not change; logout not proven')
+                return new_session
+        else:
+            raise ValueError('unexpected console UID during logout acceptance')
+        pause(.2)
+
+
+def operator_logout(actor, old_session, check_away, read_session):
+    from acceptance_se import kernel_sleep_times
+    before = kernel_sleep_times()
+    print('READY FOR MANUAL LOGOUT: save your work before starting this test. '
+          'Use Apple menu Log Out; stay at the login window for 10 seconds, then '
+          'log back into the SAME account within 90 seconds. Do not switch users, '
+          'sleep or reboot. The system test runner continues without this terminal.', flush=True)
+    new_session = wait_logout(actor, old_session, check_away, read_session,
+        observe=lambda evidence: print('LOGOUT_EVIDENCE ' + json.dumps(evidence), flush=True))
+    if kernel_sleep_times() != before:
+        raise ValueError('sleep occurred during logout acceptance')
+    print(f'PASS logout/relogin graphical audit session {old_session} -> {new_session}; '
+          'login-window checks ran; no kernel sleep transition', flush=True)
