@@ -42,16 +42,23 @@ provisions the accounts and starts the local preview:
 ./install.sh
 ```
 
+Add `--bootstrap --did-host HOST --target https://...` (or answer the terminal
+prompts) to create a disposable preview identity, migrate it into protected
+state and issue one grant in the same run. This path always uses
+`_anpagent` and `--hardware none`; it still reports `protected_supported=false`.
+Passphrases are read by anp-keyd from the human terminal only. Use a disposable
+identity and a public password, never real keys.
+
 The script asks for sudo only after the build. It creates `_anpkeyd` / `_anpagent`,
 four groups, root-owned installation/configuration and a launchd job, starts the
 service and runs limited read-only checks. It refuses existing or partial setup.
 It is not an update or repair command. Do not repeat `launchctl bootstrap` after
 successful setup: the job is already loaded. Log out/in to refresh group
-membership. Initial state contains no user keys. `--bootstrap` is not available
-on macOS; create and register the identity with the operator procedure in
-[AGENT.md](AGENT.md). Further Agents need their own independently provisioned
-non-admin UIDs, transport membership and explicit principal registration; this
-setup creates one Agent.
+membership. Initial state contains no user keys. `--bootstrap` only applies to a
+fresh empty installation; use the operator procedure in [AGENT.md](AGENT.md) to
+import an existing identity or real keys. Further Agents need their own
+independently provisioned non-admin UIDs, transport membership and explicit
+principal registration; this setup creates one Agent.
 
 For a manually reviewed release, the same steps are:
 

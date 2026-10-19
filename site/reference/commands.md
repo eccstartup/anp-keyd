@@ -16,7 +16,7 @@
   --target https://api.example.com/v1/status
 ```
 
-它调用 `deploy/linux/bootstrap.py`，按顺序生成身份、创建热钥匙、离线迁入、登记 vault、确认角色、发布策略、创建 grant 并解锁。只安装服务时去掉 `--bootstrap`。下面的管理命令用于之后的日常操作。
+它按平台调用 `deploy/linux/bootstrap.py` 或 `deploy/macos/bootstrap.py`，按顺序生成身份、创建热钥匙、离线迁入、登记 vault、确认角色、发布策略、创建 grant 并解锁。macOS 只用于本机预览，固定使用 `_anpagent` 和 `--hardware none`。只安装服务时去掉 `--bootstrap`。下面的管理命令用于之后的日常操作。
 
 | 命令 | 谁用 | 做什么 |
 |---|---|---|

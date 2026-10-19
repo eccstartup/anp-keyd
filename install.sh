@@ -28,7 +28,7 @@ usage() {
   --dry-run           只打印计划，不做任何修改
   -h, --help          显示本帮助
 
-初始化身份和 grant（仅 Linux，安装后在同一个命令里继续）:
+初始化身份和 grant（安装后在同一个命令里继续；macOS 只用于本机预览）:
   --bootstrap         安装后创建新身份、迁入受保护状态并创建一张 grant
   --did-host HOST     DID 文档所在域名，例如 agents.example.com
   --did-path PATH     DID 路径，默认 agents/anp-keyd
@@ -149,7 +149,6 @@ if [[ "$PLATFORM" == macos ]]; then
 fi
 
 if ((BOOTSTRAP)); then
-  [[ "$PLATFORM" == linux ]] || die "--bootstrap 目前只支持 Linux 受保护部署；macOS 预览请按 deploy/LOCAL-USE.md 手动初始化"
   [[ "$GRANT_DAYS" =~ ^[0-9]+$ ]] || die "--grant-days 必须是整数"
   [[ "$MAX_USES" =~ ^[0-9]+$ ]] || die "--max-uses 必须是整数"
   [[ "$BODY_BYTES" =~ ^[0-9]+$ ]] || die "--body-bytes 必须是整数"
@@ -300,9 +299,21 @@ case "$PLATFORM" in
     echo "==> 安装 macOS 本机预览"
     bash "$REPO_ROOT/deploy/macos/setup-local.sh" "$ADMIN_USER" "$SHA256" "$BINARY"
     echo
-    echo "安装完成。本机预览始终 protected_supported=false。"
-    echo "管理员: $ADMIN_USER    Agent: _anpagent"
-    echo "下一步见 deploy/LOCAL-USE.md。"
+    if ((BOOTSTRAP)); then
+      args=(/usr/bin/python3 "$REPO_ROOT/deploy/macos/bootstrap.py"
+        --config /Library/ANPKeyd/service.json
+        --binary /Library/ANPKeyd/bin/anp-keyd
+        --plist /Library/LaunchDaemons/org.anp-keyd.local.plist
+        --admin-user "$ADMIN_USER" --agent-user "_anpagent"
+        --did-host "$DID_HOST" --did-path "$DID_PATH" --target "$TARGET"
+        --body-bytes "$BODY_BYTES" --grant-days "$GRANT_DAYS" --max-uses "$MAX_USES")
+      for method in "${METHODS[@]}"; do args+=(--method "$method"); done
+      "${args[@]}"
+    else
+      echo "安装完成。本机预览始终 protected_supported=false。"
+      echo "管理员: $ADMIN_USER    Agent: _anpagent"
+      echo "下一步见 deploy/LOCAL-USE.md。"
+    fi
     ;;
 esac
 

@@ -110,7 +110,9 @@ macOS 预览不要求完整 Xcode、付费开发者会员或 Secure Enclave。�
 ./install.sh
 ```
 
-安装器建立独立账号和 launchd 服务，拒绝覆盖已有安装。它始终报告 `protected_supported=false`。
+加上 `--bootstrap --did-host HOST --target https://...` 可以在同一次运行里用一次性身份创建身份、迁入受保护状态并创建首张 grant；这条路径固定使用 `_anpagent` 和 `--hardware none`。
+
+安装器建立独立账号和 launchd 服务，拒绝覆盖已有安装。它始终报告 `protected_supported=false`。已有身份或真实密钥不在 `--bootstrap` 范围内，需按 `deploy/macos/AGENT.md` 手动迁入。
 
 整个 Agent 必须在独立的非管理员账号下运行。只切换签名子进程的账号不构成隔离。
 

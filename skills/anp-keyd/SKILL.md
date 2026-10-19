@@ -52,7 +52,7 @@ sudo -u ADMIN_USER /usr/local/libexec/anp-keyd admin \
   --config /etc/anp-keyd/service.json status
 ```
 
-macOS 使用同一条命令安装本机预览，始终 `protected_supported=false`。macOS 不支持 `--bootstrap`；身份和授权按 `deploy/macos/AGENT.md` 手动完成。安装完成后必须收回 Agent 账号的 sudo，否则受保护边界不成立。
+macOS 使用同一条命令安装本机预览，始终 `protected_supported=false`。macOS 的 `--bootstrap` 只用于全新的本机预览：使用 `_anpagent`、`--hardware none` 和一次性身份完成身份、授权与首次解锁；真实身份或已有密钥按 `deploy/macos/AGENT.md` 手动迁入。安装完成后必须收回 Agent 账号的 sudo，否则受保护边界不成立。
 
 ## 普通 Agent 工作流
 

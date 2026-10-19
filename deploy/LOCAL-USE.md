@@ -55,7 +55,7 @@ Linux 上在仓库根目录执行：
 
 手动校验发行包、更新和离线迁移见 [Linux 部署](linux/README.md)。
 
-macOS 用同一条命令安装本机预览，始终 `protected_supported=false`。本机预览不支持 `--bootstrap`；用一次性身份和公开口令按下面的手动步骤初始化，不要用真实密钥试错。
+macOS 用同一条命令安装本机预览，始终 `protected_supported=false`；`--bootstrap` 同样可用，只使用 `_anpagent` 和 `--hardware none`，流程与 Linux 一致（生成身份、创建热钥匙、离线迁入、登记 vault、确认角色、发布策略、创建 grant 并解锁）。本机预览请用一次性身份和公开口令试跑，不要用真实密钥试错。已有身份或需要迁入真实密钥时仍按 `deploy/macos/AGENT.md` 手动完成。
 
 ## 2. 手动完成身份和授权
 

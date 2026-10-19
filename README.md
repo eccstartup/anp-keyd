@@ -94,7 +94,7 @@ git clone https://github.com/eccstartup/anp-keyd.git && cd anp-keyd
 
 `--method` 可以重复，默认只允许 `GET`；`--body-bytes` 限制请求体大小，`--grant-days` 和 `--max-uses` 限制这张 grant 的有效期和签名次数。指定多个 Agent 账号时，`--bootstrap` 只为第一个账号创建 grant。
 
-macOS 用 `./install.sh` 安装本机预览，始终 `protected_supported=false`；身份和授权按[本机使用指南](deploy/LOCAL-USE.md)手动完成。
+macOS 用 `./install.sh` 安装本机预览，始终 `protected_supported=false`；加上 `--bootstrap` 可以在同一条命令里用一次性身份完成身份、授权和首次解锁。真实身份或已有密钥仍按[本机使用指南](deploy/LOCAL-USE.md)手动迁入。
 
 手动校验发行包和更新见 [Linux 部署](deploy/linux/README.md)。
 

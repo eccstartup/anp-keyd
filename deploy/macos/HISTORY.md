@@ -393,3 +393,28 @@ U2 is complete for the operator's selected local-use preview scope.
 whole-machine reboot acceptance remain separate; the earlier intermittent
 EINVAL remains an observation with unknown root cause. Only Agents actually
 running under the independent Agent UID receive this isolation boundary.
+
+
+## One-command preview bootstrap (implementation, 2026-10-19)
+
+`install.sh --bootstrap` now works on macOS in addition to Linux. On macOS it
+runs `deploy/macos/setup-local.sh` and then `deploy/macos/bootstrap.py`, which
+uses the same fixed order as the Linux path: generate a disposable did:wba
+identity under `/var/root`, create a daily hot key, stop the launchd job, migrate
+the identity offline through `deploy/macos/migrate-vault.py`, restart the job,
+enroll the vault, confirm root/hot roles, publish a narrow policy, create one
+grant and unlock the hot key. It is fixed to `_anpagent` and `--hardware none`,
+refuses a configuration that already has vaults, and keeps management commands
+under the administrator UID via `sudo -n -u`; passphrases are still read only by
+anp-keyd from the human terminal.
+
+Verified in this change: 12 pure policy/command-construction unit tests
+(`deploy/macos/test_bootstrap.py`), the Python syntax check and `bash -n
+install.sh`. **The full interactive bootstrap has not yet run on a fresh macOS
+host**: this machine already has a preview installation, and `--bootstrap`
+accepts only empty state. The pending acceptance is one human-terminal run of
+`./install.sh --bootstrap --did-host HOST --target https://...` on a fresh
+installation, confirming the four password stages, `signing_available=true` and
+`protected_supported=false`. This is preview convenience only and does not change
+the macOS protection claim.
+

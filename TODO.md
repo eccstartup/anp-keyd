@@ -7,7 +7,7 @@
 - [x] macOS 非登录 launchd 上下文与边界重述：2026-10-19 用一次性 system job（`UserName=_anpagent`，raw 与 `SessionCreate` 两种）运行同一签名探针，数据保护钥匙串均以 `errSecNotAvailable (-25291)` 拒绝；登录会话正对照与删除后拒绝通过。边界据此重述为“Agent 必须运行于非登录 system LaunchDaemon；管理员图形登录会话内（包括 `sudo` 启动）的代码属于受信管理输入”。同签名、同访问组探针在登录/继承会话内跨 UID 重算 HS 的反例仍保留，不宣称 UID 隔离；证据见 `docs/validation/macos-se-system-context-2026-10-19.md`。
 - [ ] macOS 物理 Secure Enclave/设备故障路径：本机无法诱发，仅验证了软件可见拒绝（探测报告 NOT USABLE、删除密钥后报“no key with that label”）。
 - [ ] macOS SE 正式分发：当前只有本机 Apple Development 身份与短期 profile；需 Developer ID 证书、公证、长期安装身份、正式发行产物与分发审核。
-- [ ] macOS 本机预览的一条命令初始化（`install.sh --bootstrap`）：在预览模式下生成身份、登记主体、创建 grant 并解锁；当前该参数只支持 Linux 受保护部署，macOS 按 `deploy/macos/AGENT.md` 手动完成。
+- [ ] macOS 本机预览的一条命令初始化（`install.sh --bootstrap`）：实现已完成——`install.sh` 在 macOS 调用 `deploy/macos/bootstrap.py`，复用 `_anpagent`、`--hardware none`，按 Linux 同样的顺序生成身份、创建热钥匙、停机离线迁入、登记 vault、确认角色、发布策略、创建 grant 并解锁；新增 12 项纯策略/命令构造单测。**尚未在全新 macOS 主机上跑通完整交互流程**（本机已有安装，`--bootstrap` 只接受空状态；口令只能由人从终端输入）。验收需在一台全新安装上以人类终端执行 `./install.sh --bootstrap --did-host HOST --target https://...`，确认四段口令、`signing_available=true` 与 `protected_supported=false`，并把结果记入 `deploy/macos/HISTORY.md`。
 - [x] TPM 部署范围验收（Docker + 内核 `tpm_vtpm_proxy`）：安装、设备权限、systemd 沙箱、服务 UID、跨进程封存/打开、跨 UID 拒绝、删除后拒绝全部通过；`acceptance_scope_complete=true`，报告仍记录 `virtualization=docker`、`physical_tpm_acceptance_complete=false`。
 - [ ] 实体 TPM 硬件保护声明（可选）：用真芯片复跑并覆盖句柄/设备丢失、权限变化、设备故障、升级与恢复、换机复制；不作该声明前保持 physical=false，`swtpm` 结果不得当作物理验收。
 - [x] U4 独立审计采集器、SSH 固定端点、原子保管、回滚/分叉/崩溃/断网验收；交付部署模板与两容器验收。保持本地审计签名继续策略，不承诺在线强制锚定或非审计状态保护。

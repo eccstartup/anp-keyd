@@ -7,6 +7,11 @@ A deterministic loopback Messages API drives the tool call; it performs no model
 inference and uses no human model credential. This does not accept a live model
 provider, arbitrary plugin set, remote business service, or real identity.
 
+For a fresh disposable preview, `./install.sh --bootstrap` now creates the
+identity, migrates it, publishes a policy, issues one grant and unlocks the hot
+key automatically. This document remains the procedure for the complete
+framework, existing-identity cutover and real keys.
+
 ## Temporary acceptance, human terminal
 
 Build `anp-keyd` with `cargo build --locked --release --features mcp` and the public
