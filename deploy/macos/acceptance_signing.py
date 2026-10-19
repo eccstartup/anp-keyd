@@ -84,11 +84,17 @@ def prepare(base, config, args, admin, service, run):
 
 
 # Client authenticates kernel UID before sending the test-only binary password.
-REQUEST = r'''import ctypes,json,socket,struct,sys
+REQUEST = r'''import sys
+def stage(name): print('CLIENT_STAGE '+name,file=sys.stderr,flush=True)
+stage('interpreter-started')
+import ctypes,json,socket,struct
+stage('imports-ready')
 endpoint, expected_uid, wants_secret=sys.argv[1:]
 request=sys.stdin.buffer.read(65537)
 assert len(request)<=65536
+stage('input-read')
 s=socket.socket(socket.AF_UNIX);s.settimeout(15);s.connect(endpoint)
+stage('socket-connected')
 if sys.platform=='darwin':
  lib=ctypes.CDLL('/usr/lib/libSystem.B.dylib');uid=ctypes.c_uint();gid=ctypes.c_uint()
  assert lib.getpeereid(s.fileno(),ctypes.byref(uid),ctypes.byref(gid))==0
@@ -96,7 +102,9 @@ if sys.platform=='darwin':
 else:
  _,actual_uid,_=struct.unpack('3i',s.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
 assert actual_uid==int(expected_uid), 'wrong daemon UID'
+stage('peer-uid-verified')
 if wants_secret!='refuse': s.sendall(struct.pack('!I',len(request))+request)
+stage('request-frame-sent')
 if wants_secret=='yes':
  secret=b'temporary-boundary-test-secret'
  s.sendall(struct.pack('!I',len(secret))+secret)
@@ -108,7 +116,9 @@ def exact(n):
   out+=part
  return out
 length=struct.unpack('!I',exact(4))[0];assert length<=65536
+stage('reply-length-read')
 print(exact(length).decode())
+stage('reply-complete')
 '''
 
 
@@ -123,11 +133,20 @@ class Checks:
         # Only these children receive test transport access; account records
         # remain untouched. Native subprocess credential errors retain errno.
         endpoint = self.config['admin_socket' if management else 'sign_socket']
-        result = subprocess.run([str(Path(sys.executable).resolve()), '-I', '-c', REQUEST, endpoint,
+        try:
+            result = subprocess.run([str(Path(sys.executable).resolve()), '-I', '-c', REQUEST, endpoint,
                                  str(self.config['service_uid']), 'refuse' if extra_admin_group else ('yes' if secret else 'no')],
                                 input=json.dumps({'version': 2, 'request': operation}),
                                 capture_output=True, text=True, **self.credentials(user, extra_admin_group),
                                 env=self.env, cwd='/', timeout=20)
+        except subprocess.TimeoutExpired as error:
+            phases = error.stderr or b''
+            if isinstance(phases, bytes):
+                phases = phases.decode(errors='replace')
+            raise ValueError(f'client timeout uid={user.pw_uid} operation={operation.get("operation")} '
+                             f'after 20 seconds; stages={phases!r}') from error
+        if getattr(self.args, 'logout_diagnostics', False):
+            print(result.stderr.strip(), flush=True)
         assert result.returncode == 0, result.stderr
         reply = json.loads(result.stdout)
         if reply['code'] == 'OK':

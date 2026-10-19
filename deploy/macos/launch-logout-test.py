@@ -14,10 +14,10 @@ import sys
 import tempfile
 
 
-def job_spec(stage, python, arguments):
+def job_spec(stage, python, arguments, diagnostic=False):
     return {'Label': 'org.anp-keyd.logout-check.' + stage.name,
         'ProgramArguments': [str(python), '-u', str(stage / 'test-runtime.py'),
-                             '--se-ending', 'logout', *arguments],
+                             '--se-ending', 'logout', *(['--logout-diagnostics'] if diagnostic else []), *arguments],
         'RunAtLoad': True, 'KeepAlive': False, 'LaunchOnlyOnce': True,
         'ProcessType': 'Background', 'WorkingDirectory': '/',
         'StandardOutPath': str(stage / 'host.log'),
@@ -28,6 +28,7 @@ def job_spec(stage, python, arguments):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--finish', type=Path, help='boot out a completed test job; retain its log directory')
+    parser.add_argument('--diagnose', action='store_true', help='system client/console diagnostics without SE keys or logout')
     parser.add_argument('arguments', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if sys.platform != 'darwin' or os.geteuid() != 0:
@@ -67,7 +68,7 @@ def main():
                 raise ValueError('unexpected acceptance source file')
             (stage / source.name).write_bytes(source.read_bytes())
             (stage / source.name).chmod(0o644)
-        spec = job_spec(stage, Path(sys.executable).resolve(), arguments)
+        spec = job_spec(stage, Path(sys.executable).resolve(), arguments, diagnostic=args.diagnose)
         (stage / 'job.plist').write_bytes(plistlib.dumps(spec))
         (stage / 'job.plist').chmod(0o644)
         # The log contains public fixture data only, and must be readable after relogin.
@@ -78,7 +79,8 @@ def main():
         subprocess.run(['/bin/launchctl', 'bootstrap', 'system', str(stage / 'job.plist')],
                        check=True, timeout=15)
         print('Read before logout and after relogin: tail -f ' + str(stage / 'host.log'), flush=True)
-        print('Wait for READY FOR MANUAL LOGOUT before logging out.', flush=True)
+        print('Diagnostic only: do not log out.' if args.diagnose else
+              'Wait for READY FOR MANUAL LOGOUT before logging out.', flush=True)
         print('When completed, remove job: sudo /usr/bin/python3 ' + str(Path(__file__).resolve())
               + ' --finish ' + str(stage), flush=True)
     finally:

@@ -77,7 +77,11 @@ def main():
     parser.add_argument('--claude-binary', type=Path, help='reviewed standalone Claude Code binary; enables complete framework/tool execution with a local API fixture')
     parser.add_argument('--claude-sha256', help='SHA-256 of the reviewed framework binary')
     parser.add_argument('--container-regression', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--logout-diagnostics', action='store_true',
+                        help='system-runner client/console diagnostics only; no SE fixture, UI or logout')
     args = parser.parse_args()
+    if args.logout_diagnostics and args.se_ending != 'logout':
+        raise ValueError('--logout-diagnostics requires the system logout runner')
     if args.se_ending == 'logout':
         if os.getppid() != 1 or os.geteuid() != 0:
             raise ValueError('logout mode requires the temporary system launchd runner')
@@ -226,7 +230,7 @@ print(json.dumps({'uid':os.getuid(),'euid':os.geteuid(),'gid':os.getgid(),'kerne
                 raise ValueError('SE joint service has unexpected build flags')
         print('PASS service executable admission: ' + info.stdout.strip(), flush=True)
         # Do not create persistent hardware objects before this no-hardware gate.
-        if args.signing_helper:
+        if args.signing_helper and not args.logout_diagnostics:
             import acceptance_signing
             fixture = acceptance_signing.prepare(base, config, args, admin, service, run)
             path.write_text(json.dumps(config))
@@ -237,11 +241,13 @@ print(json.dumps({'uid':os.getuid(),'euid':os.geteuid(),'gid':os.getgid(),'kerne
             import acceptance_migration
             acceptance_migration.install(base, config, path, args, fixture)
         process = None
+        daemon_log = base / 'daemon-output.log'
         def start():
             print('CHECK starting temporary daemon', flush=True)
-            proc = subprocess.Popen([str(args.binary), 'serve-protected', '--config', str(path)],
-                                    **credentials(service), env=env, cwd="/",
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with daemon_log.open('a') as output:
+                proc = subprocess.Popen([str(args.binary), 'serve-protected', '--config', str(path)],
+                                        **credentials(service), env=env, cwd="/",
+                                        stdout=output, stderr=output)
             try:
                 wait_ready(proc, lambda: cli(admin, 'status'), config['instance_id'])
                 return proc
@@ -270,6 +276,20 @@ print(json.dumps({'uid':os.getuid(),'euid':os.geteuid(),'gid':os.getgid(),'kerne
             print('PASS administrator authenticated temporary daemon', flush=True)
             first = json.loads(result.stdout)
             assert first['instance_id'] == config['instance_id'] and not first['protected_supported']
+            if args.logout_diagnostics:
+                import acceptance_signing
+                checks = acceptance_signing.Checks(base, config, path, args, None, admin, agent,
+                    credentials, env, cli)
+                for index in range(3):
+                    print(f'CHECK nondisruptive system console/client round {index + 1}', flush=True)
+                    session = acceptance_graphical.relogin_session(admin)
+                    print(f'PASS native graphical audit session {session}', flush=True)
+                    result = cli(admin, 'status')
+                    require_success(result, 'post-console management subprocess')
+                    reply = checks.request_as(agent, {'operation': 'LIST_AUTHORIZED_KEYS'})
+                    assert reply['code'] == 'OK' and reply['data']['keys'] == [], reply
+                print('PASS system console/client diagnostics; no SE fixture, UI, logout, sleep or reboot', flush=True)
+                return
             if args.ui_preflight_only:
                 print('UI PREFLIGHT: if a window appears, click Cancel only; no password or existing key is used.', flush=True)
                 command = [str(args.binary), 'admin', '--config', str(path), 'unlock', '--native-ui',
@@ -380,8 +400,12 @@ print('task_for_pid denied')
                 print('PASS forged socket owner/mode cannot impersonate daemon; no request/secret sent', flush=True)
             print('PASS temporary runtime checks; installed launchd instance was not modified', flush=True)
         finally:
-            if process is not None and process.poll() is None:
-                stop(process)
+            try:
+                if process is not None and process.poll() is None:
+                    stop(process)
+            finally:
+                if args.se_ending == 'logout' and daemon_log.exists():
+                    print('TEMPORARY_DAEMON_LOG_TAIL\n' + daemon_log.read_text()[-16384:], flush=True)
 
 
 if __name__ == '__main__':

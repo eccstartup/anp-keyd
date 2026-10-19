@@ -60,6 +60,12 @@ class Logout(unittest.TestCase):
 
 
 class SystemJob(unittest.TestCase):
+    def test_diagnostic_job_selects_no_logout_diagnostic_branch(self):
+        spec = launcher.job_spec(Path('/Library/ANPKeydLogoutChecks-test'),
+            Path('/usr/bin/python3'), [], diagnostic=True)
+        self.assertIn('--logout-diagnostics', spec['ProgramArguments'])
+        self.assertFalse(spec['KeepAlive'])
+
     def test_one_shot_root_system_job_has_no_restart_or_boot_install(self):
         stage = Path('/Library/ANPKeydLogoutChecks-example')
         job = launcher.job_spec(stage, Path('/usr/bin/python3'), ['--candidate-binary', '/fixture'])
