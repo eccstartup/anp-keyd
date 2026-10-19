@@ -73,25 +73,34 @@ class SystemJob(unittest.TestCase):
 
 
 class GraphicalBridge(unittest.TestCase):
-    def test_bootstrap_session_bound_to_requested_uid(self):
-        output = 'gui/501 = {\n security context = {\n uid = 501\n asid = 105541\n }\n}'
-        self.assertEqual(graphical.domain_session(output, 501), 105541)
-        for text in (output.replace('uid = 501', 'uid = 504'),
-                     output.replace('105541', '0'), 'handle = 105541'):
-            with self.assertRaises(ValueError):
-                graphical.domain_session(text, 501)
+    def state(self):
+        return {'UID':501, 'SessionInfo':[{'kCGSSessionUserIDKey':501,
+            'kCGSSessionOnConsoleKey':True, 'kCGSessionLoginDoneKey':True,
+            'kCGSSessionAuditIDKey':105604, 'kSCSecuritySessionID':105604}]}
 
-    def test_bootstrap_readiness_does_not_spawn_asuser(self):
-        ready = SimpleNamespace(returncode=0,
-            stdout='security context = {\n uid = 501\n asid = 105541\n}')
-        with patch.object(graphical.subprocess, 'run', side_effect=[
-                SimpleNamespace(returncode=1, stderr='not ready'), ready]) as run, \
-             patch.object(graphical, 'current_session', return_value=105541) as validate, \
+    def test_native_console_requires_unique_active_completed_exact_user(self):
+        import copy
+        state = self.state()
+        self.assertEqual(graphical.console_session_id(state, 501), 105604)
+        bad = []
+        wrong = copy.deepcopy(state); wrong['UID'] = 504; bad.append(wrong)
+        duplicate = copy.deepcopy(state); duplicate['SessionInfo'] *= 2; bad.append(duplicate)
+        for field, value in [('kCGSSessionUserIDKey',504), ('kCGSSessionOnConsoleKey',False),
+                ('kCGSessionLoginDoneKey',False), ('kSCSecuritySessionID',100),
+                ('kCGSSessionAuditIDKey',0), ('kCGSSessionAuditIDKey',True)]:
+            wrong = copy.deepcopy(state); wrong['SessionInfo'][0][field] = value; bad.append(wrong)
+        for item in bad:
+            with self.assertRaises(ValueError):
+                graphical.console_session_id(item, 501)
+
+    def test_native_readiness_does_not_spawn_any_subprocess(self):
+        with patch.object(graphical, 'console_state', side_effect=[ValueError('not ready'),self.state()]), \
+             patch.object(graphical, 'current_session', return_value=105604) as validate, \
+             patch.object(graphical.subprocess, 'run') as run, \
              patch.object(graphical.time, 'sleep'):
-            self.assertEqual(graphical.relogin_session(SimpleNamespace(pw_uid=501)), 105541)
-        validate.assert_called_once_with(105541)
-        for args in run.call_args_list:
-            self.assertEqual(args.args[0], ['/bin/launchctl', 'print', 'gui/501'])
+            self.assertEqual(graphical.relogin_session(SimpleNamespace(pw_uid=501)),105604)
+        validate.assert_called_once_with(105604)
+        run.assert_not_called()
 
     def test_bootstrap_readiness_deadline_is_bounded(self):
         with patch.object(graphical.time, 'monotonic', side_effect=[0, 21]):

@@ -132,6 +132,8 @@ def main():
         if console_uid() != admin.pw_uid:
             raise ValueError('logout test must start on the configured administrator desktop')
         graphical = acceptance_graphical.session(admin, args.config)
+        if acceptance_graphical.relogin_session(admin) != graphical:
+            raise ValueError('native console audit session does not match graphical bridge')
         print(f'PASS system runner pid={os.getpid()} ppid=1; graphical audit bridge session={graphical}; no SE key created yet', flush=True)
     env = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'RUST_LOG': 'info'}
     def credentials(user, extra_admin_group=False):

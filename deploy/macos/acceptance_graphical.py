@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 import pwd
-import re
+import plistlib
 import subprocess
 import sys
 import time
@@ -30,32 +30,71 @@ def current_session(requested=0xffffffff):
     return actual.value
 
 
-def domain_session(output, uid):
-    context = re.search(r'^\s*security context = \{\s*uid = (\d+)\s*asid = (\d+)\s*\}', output, re.M)
-    if not context or int(context[1]) != uid:
-        raise ValueError('graphical bootstrap security context missing or wrong UID')
-    value = int(context[2])
-    if value in (0, 0xffffffff):
-        raise ValueError('invalid graphical bootstrap audit session')
-    return value
-
-
 def relogin_session(user, timeout=20):
-    """Read-only readiness probe; never enter a GUI context or restart a helper."""
+    """Native read-only readiness probe; no subprocess or helper restart."""
     deadline = time.monotonic() + timeout
     last = 'graphical bootstrap not ready'
     while time.monotonic() < deadline:
         try:
-            result = subprocess.run(['/bin/launchctl', 'print', f'gui/{user.pw_uid}'],
-                capture_output=True, text=True, timeout=min(3, max(.01, deadline - time.monotonic())))
-            if result.returncode:
-                raise ValueError('graphical bootstrap unavailable: ' + result.stderr)
-            value = domain_session(result.stdout, user.pw_uid)
+            value = console_session_id(console_state(), user.pw_uid)
             return current_session(value)
         except (ValueError, subprocess.TimeoutExpired) as error:
             last = str(error)
             time.sleep(.2)
     raise ValueError('relogin graphical session readiness timed out: ' + last)
+
+
+def console_session_id(state, uid):
+    if state.get('UID') != uid:
+        raise ValueError('console state UID does not match administrator')
+    matches = [entry for entry in state.get('SessionInfo', [])
+        if entry.get('kCGSSessionUserIDKey') == uid
+        and entry.get('kCGSSessionOnConsoleKey') is True
+        and entry.get('kCGSessionLoginDoneKey') is True]
+    if len(matches) != 1:
+        raise ValueError('exactly one completed on-console graphical session required')
+    value = matches[0].get('kCGSSessionAuditIDKey')
+    if type(value) is not int or not 0 < value < 0xffffffff or matches[0].get('kSCSecuritySessionID') != value:
+        raise ValueError('console audit session fields missing or inconsistent')
+    return value
+
+
+def console_state():
+    """Copy native SystemConfiguration state; no launchctl/scutil subprocess."""
+    system = ctypes.CDLL('/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration')
+    core = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+    core.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+    core.CFStringCreateWithCString.restype = ctypes.c_void_p
+    core.CFRelease.argtypes = [ctypes.c_void_p]
+    core.CFRelease.restype = None
+    system.SCDynamicStoreCopyValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    system.SCDynamicStoreCopyValue.restype = ctypes.c_void_p
+    core.CFPropertyListCreateData.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                            ctypes.c_long, ctypes.c_ulong, ctypes.c_void_p]
+    core.CFPropertyListCreateData.restype = ctypes.c_void_p
+    core.CFDataGetLength.argtypes = [ctypes.c_void_p]
+    core.CFDataGetLength.restype = ctypes.c_long
+    core.CFDataGetBytePtr.argtypes = [ctypes.c_void_p]
+    core.CFDataGetBytePtr.restype = ctypes.c_void_p
+    key = core.CFStringCreateWithCString(None, b'State:/Users/ConsoleUser', 0x08000100)
+    value = data = None
+    try:
+        if not key:
+            raise ValueError('console state key allocation failed')
+        value = system.SCDynamicStoreCopyValue(None, key)
+        if not value:
+            raise ValueError('native console state unavailable')
+        data = core.CFPropertyListCreateData(None, value, 100, 0, None)
+        if not data:
+            raise ValueError('native console state serialization failed')
+        size = core.CFDataGetLength(data)
+        if not 0 < size <= 1024 * 1024:
+            raise ValueError('native console state exceeds bound')
+        return plistlib.loads(ctypes.string_at(core.CFDataGetBytePtr(data), size))
+    finally:
+        for item in (data, value, key):
+            if item:
+                core.CFRelease(item)
 
 
 def session(user, config):
