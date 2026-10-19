@@ -90,8 +90,10 @@ A long sleep expires the heartbeat on wake; the original 900-second deadlines
 also continue across sleep. Screen lock alone is not promised to revoke all
 already loaded keys: OS keychain restrictions may deny new unsealing, while an
 existing live lease can continue signing until a loss condition or original
-deadline. Fast user switching ends the old lease on observation. Full multi-user,
-logout/relogin, lock, sleep and reboot behavior still needs host acceptance.
+deadline. Fast user switching ends the old lease on observation. User switch,
+logout/relogin, sleep, whole-machine reboot and helper upgrade have been
+exercised against temporary fixtures; physical Secure Enclave failure has not.
+Raw keychain isolation between UIDs is not established (see below).
 
 ## Build and controlled use
 
@@ -220,14 +222,32 @@ session/console checks, the management stream, KDF, upstream-verified hot-key
 signing and changed-target rejection, then actual disconnect/lock/revocation and
 cached-result suppression. Passing it is bridge evidence, not hardware evidence.
 
-Remaining formal acceptance requires the actual signed helper and temporary SE
-keys: persistent create/open in independent processes; Agent/other-UID keychain
-denial; forged daemon rejection before prompt/secret; UI cancel/timeout; helper
-crash/hang; logout/relogin of the same UID; user switch; lock/sleep; wall rollback;
-actual whole-machine reboot; upgrade with the same authorized identity/profile;
-and missing-key/device-failure recovery. Record exact hashes, feature flags,
-profile/team/application identity and failures separately for each environment.
-Certificate/profile setup and interactive logout/reboot require the operator.
+The following have been exercised with the development-signed helper and a
+separate-UID service against temporary SE keys: persistent create/open in
+independent processes; forged daemon rejection; UI cancel/timeout; helper
+crash and hang; user switch; logout/relogin; short and long sleep; whole-machine
+reboot; helper upgrade; missing-key recovery; signing-identity change; and
+keychain permission change. Each run recorded exact hashes, feature flags,
+profile/team/application identity and failures separately.
+
+Still open before any formal protection claim:
+
+- **Raw keychain isolation between UIDs failed.** A probe carrying the same
+  signature and access group re-derived HS under the Agent UID, including in a
+  fresh SessionCreate audit session. The software login-identity policy is not
+  a substitute for an OS keychain boundary; this counterexample stands.
+- **Physical Secure Enclave or device failure was not induced.** Only the
+  software-visible refusal paths were observed: the probe reports the root
+  unusable when a persistent key cannot be created, and a deleted key yields
+  "no key with that label".
+- **Formal distribution is unaccepted.** The test helper uses a short-lived
+  Apple Development identity/profile. Developer ID signing, notarization and a
+  long-lived deployment identity remain outstanding.
+- Screen lock revokes nothing by itself; the lease and deadline rules above are
+  the actual behavior.
+
+Certificate/profile setup and interactive lifecycle transitions require the
+operator.
 
 References: [Apple TN3137](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains),
 [primary console information](https://developer.apple.com/documentation/systemconfiguration/scdynamicstorecopyconsoleuser(_:_:_:)).
