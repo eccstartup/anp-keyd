@@ -1,9 +1,12 @@
 # TODO
 
-当前受保护改造的进度以本地 `docs/plan-security-v4.md` 为准；此处列未完成的发行工作。
+当前受保护改造的进度以本地 `docs/plan-security-v5.md` 为准；此处列未完成的发行工作。
 
 - [x] Linux systemd 真实主机验收已完成；仅正式 Linux release 且显式受保护模式声明支持。
-- [ ] macOS 受保护运行环境、可信管理 UI、SE 正式签名分发和持久化。发布包与跨进程持久化工具已备（`se-release.py`、`se-persistence.py`，验收特性默认关）；仍缺 Apple 签发身份/配置文件、真机登录会话与生命周期验收、分发审核。
+- [x] macOS 持久 SE 与主机生命周期验收：真实 SE＋开发签名助手＋独立 UID 服务通过；用户切换、注销/重新登录、短/长休眠、整机重启、升级、密钥丢失、签名身份与钥匙串权限变化均已验收，临时密钥均按精确标签删除并复查。保护声明仍为 `macos-boundary-preview`、`protected_supported=false`。
+- [ ] macOS 原始钥匙串跨 UID 隔离：同签名、同访问组的探针仍能在 Agent UID 重算 HS（含新 SessionCreate 会话），反例保留；需解决该 OS 层隔离问题或重述产品边界。软件登录身份拒绝不能替代 OS 隔离。
+- [ ] macOS 物理 Secure Enclave/设备故障路径：本机无法诱发，仅验证了软件可见拒绝（探测报告 NOT USABLE、删除密钥后报“no key with that label”）。
+- [ ] macOS SE 正式分发：当前只有本机 Apple Development 身份与短期 profile；需 Developer ID 证书、公证、长期安装身份、正式发行产物与分发审核。
 - [ ] macOS 本机预览的一条命令初始化（`install.sh --bootstrap`）：在预览模式下生成身份、登记主体、创建 grant 并解锁；当前该参数只支持 Linux 受保护部署，macOS 按 `deploy/macos/AGENT.md` 手动完成。
 - [x] TPM 部署范围验收（Docker + 内核 `tpm_vtpm_proxy`）：安装、设备权限、systemd 沙箱、服务 UID、跨进程封存/打开、跨 UID 拒绝、删除后拒绝全部通过；`acceptance_scope_complete=true`，报告仍记录 `virtualization=docker`、`physical_tpm_acceptance_complete=false`。
 - [ ] 实体 TPM 硬件保护声明（可选）：用真芯片复跑并覆盖句柄/设备丢失、权限变化、设备故障、升级与恢复、换机复制；不作该声明前保持 physical=false，`swtpm` 结果不得当作物理验收。
