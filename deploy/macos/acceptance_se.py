@@ -515,6 +515,58 @@ class Checks(acceptance_signing.Checks):
         final = self.grant()
         self.expect_locked(final)
 
+    def exercise_key_loss(self, label, helper_command):
+        cleanup = self.args.key_loss_cleanup
+        binary = cleanup / 'Contents/MacOS/anp-keyd'
+        if not binary.is_file() or binary.is_symlink():
+            raise ValueError('key-loss cleanup is not a signed app bundle')
+        if hashlib.sha256(binary.read_bytes()).hexdigest() != self.args.key_loss_cleanup_sha256:
+            raise ValueError('key-loss cleanup digest mismatch')
+
+        def delete():
+            return subprocess.run([str(binary), '--delete', label], capture_output=True,
+                                  text=True, timeout=30, **self.credentials(self.admin),
+                                  env=self.env, cwd='/')
+        deleted = delete()
+        if deleted.returncode != 0:
+            raise ValueError('key-loss cleanup failed: ' + deleted.stderr)
+        for part in ('private', 'public'):
+            if f'FOUND {label} {part} count=1' not in deleted.stdout:
+                raise ValueError('key-loss cleanup did not find exactly one ' + part + ' key')
+        if deleted.stdout.count('ABSENT_AFTER_DELETE') != 2:
+            raise ValueError('key-loss cleanup did not confirm deletion')
+        absent = delete()
+        if absent.returncode != 0:
+            raise ValueError('key-loss absence recheck failed: ' + absent.stderr)
+        for part in ('private', 'public'):
+            if f'FOUND {label} {part} count=0' not in absent.stdout:
+                raise ValueError('key-loss absence was not confirmed by a new process')
+        print('PASS disposable SE private/public key deleted by exact label', flush=True)
+
+        log = self.base / 'se-key-loss-helper.log'
+        with log.open('w+') as output:
+            helper = subprocess.Popen(helper_command, stdin=subprocess.DEVNULL,
+                                      stdout=output, stderr=output,
+                                      **self.credentials(self.admin), env=self.env, cwd='/')
+            try:
+                helper.wait(timeout=45)
+            except subprocess.TimeoutExpired:
+                helper.kill()
+                helper.wait(timeout=10)
+                raise ValueError('helper stayed alive after its SE key was deleted: '
+                                 + log.read_text(errors='replace'))
+        text = log.read_text(errors='replace')
+        if helper.returncode == 0:
+            raise ValueError('helper reported success after its SE key was deleted: ' + text)
+        if 'SE session active for exact key' in text:
+            raise ValueError('helper established an SE session after its key was deleted')
+        if not text.strip():
+            raise ValueError('helper produced no refusal after its SE key was deleted')
+        print('PASS signed helper cannot establish an SE session after key loss', flush=True)
+
+        self.expect_locked(self.grant())
+        print('PASS signing stays locked after key loss; no automatic key re-creation', flush=True)
+
     def exercise_signing(self):
         manifest = self.fixture['manifest']
         assert manifest.get('fixture_only') is True
@@ -557,6 +609,9 @@ class Checks(acceptance_signing.Checks):
         denied = subprocess.run(command, capture_output=True, text=True, timeout=15,
                                 **self.credentials(self.agent), env=self.env, cwd='/')
         assert denied.returncode != 0 and 'ADMIN_REQUIRED' in denied.stderr, denied.stderr
+        if ending == 'key-loss':
+            self.exercise_key_loss(hardware['tag'], command)
+            return
         print('UI: check the temporary exact key and enter ONLY the public test password: '
               + acceptance_signing.PASSWORD, flush=True)
         helper_credentials = self.credentials(self.admin)
