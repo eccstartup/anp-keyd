@@ -395,7 +395,7 @@ EINVAL remains an observation with unknown root cause. Only Agents actually
 running under the independent Agent UID receive this isolation boundary.
 
 
-## One-command preview bootstrap (implementation, 2026-10-19)
+## One-command preview bootstrap (implementation and acceptance, 2026-10-19)
 
 `install.sh --bootstrap` now works on macOS in addition to Linux. On macOS it
 runs `deploy/macos/setup-local.sh` and then `deploy/macos/bootstrap.py`, which
@@ -410,11 +410,43 @@ anp-keyd from the human terminal.
 
 Verified in this change: 12 pure policy/command-construction unit tests
 (`deploy/macos/test_bootstrap.py`), the Python syntax check and `bash -n
-install.sh`. **The full interactive bootstrap has not yet run on a fresh macOS
-host**: this machine already has a preview installation, and `--bootstrap`
-accepts only empty state. The pending acceptance is one human-terminal run of
-`./install.sh --bootstrap --did-host HOST --target https://...` on a fresh
-installation, confirming the four password stages, `signing_available=true` and
-`protected_supported=false`. This is preview convenience only and does not change
-the macOS protection claim.
+install.sh`.
+
+The interactive flow was then run end to end on this Mac on 2026-10-19. The
+existing empty-state preview installation was first archived intact to
+`/private/var/root/anp-keyd-reinstall-20261019-211724` (binary, config, launchd
+plist and state); the dedicated `_anpkeyd`/`_anpagent` accounts and their groups
+were kept. Because `provision-accounts.py` deliberately refuses to adopt existing
+accounts, the rerun invoked `deploy/macos/install.py`, `launchctl bootstrap` and
+`deploy/macos/bootstrap.py` directly instead of `setup-local.sh`; account
+creation was not re-exercised. The installed binary was the rebuilt
+`c57ff641f29ecf90d3d2d62ba46d2d5e5f85c75cfd61558f638ab19a457bebde`.
+
+The run completed in 18 seconds with all five passphrase-bearing commands driven
+through a PTY (keygen, publish, rotate-hot-key, migration verification twice, and
+unlock); no prompt timed out. Independent checks with the installed binary
+reported `signing_available=true`, `protected_supported=false`, `boot_epoch=2`
+and a healthy audit projection; `catalog` showed the active vault
+`fe6cc2d5-4d1a-402f-8332-823fea8e6b34`, one confirmed `root` and one confirmed
+`hot` key, and the published policy; `service.json` recorded the same vault id.
+The grant id was `b46aaf01d316c3150f3277382cdb1d6852f3d7d8b5ac981f8367cc192bf716a8`.
+Recovery material is under
+`/private/var/root/anp-keyd-recovery-20261019-132014`.
+
+The acceptance exposed and this change fixes three real defects:
+
+- a fresh install did not create `/Library/ANPKeyd/state/vaults` (now created,
+  with a layout unit test in `test_install.py`);
+- migration rejected `/var/root` because `/var` is a symlink, so the bootstrap
+  staging root is now `/private/var/root`;
+- `admin unlock` aborted with `EINTR` while changing terminal echo under a
+  PTY/sudo wrapper; `src/tty.rs` now retries `tcgetattr`/`tcsetattr` on `EINTR`
+  instead of reporting a transient signal as a broken terminal.
+
+Scope: this was an empty installation, not a machine with no dedicated accounts.
+A literal fresh-host run of `install.sh --bootstrap` still requires removing and
+recreating `_anpkeyd`, `_anpagent`, `_anpkeyd_sign` and `_anpkeyd_admin`; that
+destructive step was not performed here and remains noted in `TODO.md`. This is
+preview convenience only and does not change the macOS protection claim.
+
 

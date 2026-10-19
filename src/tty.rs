@@ -144,7 +144,7 @@ struct EchoOff {
 
 impl EchoOff {
     fn new(tty: &File) -> Result<Self> {
-        let saved = termios::tcgetattr(tty).map_err(termios_error)?;
+        let saved = termios_retry(|| termios::tcgetattr(tty)).map_err(termios_error)?;
         let mut quiet = saved.clone();
         quiet.local_flags.remove(termios::LocalFlags::ECHO);
 
@@ -164,7 +164,8 @@ impl EchoOff {
         // 抹不掉屏幕上已经显示过的东西,只能抹掉人刚打进去的输入。
         //
         // 所以 flush 换不来任何安全性,只换来"你打的字不见了"。
-        termios::tcsetattr(tty, SetArg::TCSANOW, &quiet).map_err(termios_error)?;
+        termios_retry(|| termios::tcsetattr(tty, SetArg::TCSANOW, &quiet))
+            .map_err(termios_error)?;
         Ok(Self { tty: tty.try_clone().map_err(KeydError::Io)?, saved })
     }
 }
@@ -181,7 +182,23 @@ impl Drop for EchoOff {
         //
         // 这里**不能**失败到影响调用方:回显恢复不了是环境坏了,而调用方
         // 此时手上有一个好端端的口令。尽力恢复,失败就算了。
-        let _ = termios::tcsetattr(&self.tty, SetArg::TCSANOW, &self.saved);
+        let _ = termios_retry(|| termios::tcsetattr(&self.tty, SetArg::TCSANOW, &self.saved));
+    }
+}
+
+/// `EINTR` 不是"终端不能用",只是调用被信号打断、设置没有生效。
+///
+/// 没有外层终端时不会遇到;经过 `sudo` 或 PTY 包装时,窗口大小变化一类的
+/// 信号可以正好落在 `tcgetattr`/`tcsetattr` 中间。这时报错等于让一次完全
+/// 正常的管理操作失败,唯一正确的处理是重试。
+fn termios_retry<T>(
+    mut call: impl FnMut() -> std::result::Result<T, nix::errno::Errno>,
+) -> std::result::Result<T, nix::errno::Errno> {
+    loop {
+        match call() {
+            Err(nix::errno::Errno::EINTR) => continue,
+            result => return result,
+        }
     }
 }
 

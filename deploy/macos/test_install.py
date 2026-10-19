@@ -57,6 +57,19 @@ class Policy(unittest.TestCase):
         with self.assertRaises(ValueError): self.config()
 
 
+class Layout(unittest.TestCase):
+    def test_state_layout_includes_vaults(self):
+        service = NS(pw_uid=501, pw_gid=601)
+        config = {'agent_gid': 610, 'admin_gid': 611}
+        calls = []
+        with patch.object(module, 'directory', side_effect=lambda *args: calls.append(args)):
+            module.create_directories(Path('/base'), service, config)
+        self.assertIn((Path('/base/state'), 501, 601, 0o700), calls)
+        self.assertIn((Path('/base/state/vaults'), 501, 601, 0o700), calls)
+        self.assertIn((Path('/base/sign'), 501, 610, 0o750), calls)
+        self.assertIn((Path('/base/admin'), 501, 611, 0o750), calls)
+
+
 class ChildCredentials(unittest.TestCase):
     def test_runtime_failure_preserves_signal_and_output(self):
         spec = importlib.util.spec_from_file_location('runtime_failure', Path(__file__).with_name('test-runtime.py'))

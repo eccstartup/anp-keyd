@@ -103,6 +103,15 @@ def directory(path, uid, gid, mode):
     os.chmod(path, mode)
 
 
+def create_directories(base, service, config):
+    directory(base, 0, 0, 0o755)
+    directory(base / 'bin', 0, 0, 0o755)
+    directory(base / 'state', service.pw_uid, service.pw_gid, 0o700)
+    directory(base / 'state' / 'vaults', service.pw_uid, service.pw_gid, 0o700)
+    directory(base / 'sign', service.pw_uid, config['agent_gid'], 0o750)
+    directory(base / 'admin', service.pw_uid, config['admin_gid'], 0o750)
+
+
 def write_new(path, data, mode=0o644):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
     with os.fdopen(fd, 'wb') as handle:
@@ -150,11 +159,7 @@ def main():
     if os.geteuid() != 0:
         raise ValueError('--apply requires root')
     os.umask(0o077)
-    directory(BASE, 0, 0, 0o755)
-    directory(BASE / 'bin', 0, 0, 0o755)
-    directory(BASE / 'state', service.pw_uid, service.pw_gid, 0o700)
-    directory(BASE / 'sign', service.pw_uid, config['agent_gid'], 0o750)
-    directory(BASE / 'admin', service.pw_uid, config['admin_gid'], 0o750)
+    create_directories(BASE, service, config)
     write_new(BINARY, binary, 0o755)
     write_new(CONFIG, json.dumps(config, indent=2).encode())
     env = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}
