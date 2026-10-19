@@ -71,8 +71,8 @@ def main():
     parser.add_argument('--helper-sha256')
     parser.add_argument('--se-login-bundle', type=Path, help='profile-embedded full signed helper; enables real SE joint acceptance with a signed generate-se fixture helper')
     parser.add_argument('--se-login-sha256')
-    parser.add_argument('--se-ending', choices=('kill', 'hang', 'sleep', 'long-sleep', 'user-switch', 'logout', 'reboot', 'upgrade', 'key-loss', 'restart', 'crash'), default='kill',
-                        help='real SE lease loss: helper kill/hang, operator sleep/user switch/logout/reboot, in-place helper upgrade, key loss, or isolated service restart/crash')
+    parser.add_argument('--se-ending', choices=('kill', 'hang', 'sleep', 'long-sleep', 'user-switch', 'logout', 'reboot', 'upgrade', 'key-loss', 'foreign-identity', 'keychain-permission', 'restart', 'crash'), default='kill',
+                        help='real SE lease loss: helper kill/hang, operator sleep/user switch/logout/reboot, in-place helper upgrade, key loss, a differently-signed or differently-permissioned helper copy, or isolated service restart/crash')
     parser.add_argument('--upgrade-bundle', type=Path,
                         help='different real build with the same signing identity; replaces the installed helper in place')
     parser.add_argument('--upgrade-sha256')

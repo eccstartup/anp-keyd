@@ -396,6 +396,83 @@ def helper_digest(bundle):
     return hashlib.sha256((Path(bundle) / 'Contents/MacOS/anp-keyd').read_bytes()).hexdigest()
 
 
+def parse_entitlements(output):
+    text = output.decode(errors='replace') if isinstance(output, bytes) else output
+    start = text.find('<?xml')
+    end = text.find('</plist>', start)
+    if start < 0 or end < 0:
+        raise ValueError('the helper has no readable entitlements: ' + text.strip())
+    value = plistlib.loads(text[start:end + len('</plist>')].encode())
+    if not isinstance(value, dict) or not value:
+        raise ValueError('the helper entitlements are empty or not a dictionary')
+    return value
+
+
+def with_application_identifier(entitlements, identifier):
+    key = 'com.apple.application-identifier'
+    old = entitlements.get(key)
+    if not isinstance(old, str) or not old:
+        raise ValueError('the helper has no application identifier entitlement')
+    changed = dict(entitlements)
+    changed[key] = identifier
+    groups = entitlements.get('keychain-access-groups')
+    if groups is None:
+        changed['keychain-access-groups'] = [identifier]
+    else:
+        changed['keychain-access-groups'] = [identifier if group == old else group for group in groups]
+    return changed
+
+
+def require_refused_helper(kind, returncode, text):
+    # An ad-hoc copy loses the entitlements: creating a persistent SE key fails
+    # with errSecMissingEntitlement, while reading an existing label only sees
+    # an invisible key group and surfaces errSecItemNotFound. Both are refused
+    # by the OS before any session; the probe carries the entitlement evidence.
+    expected = {'foreign-identity': 'the keychain has no key with that label',
+                'keychain-permission': 'the keychain has no key with that label'}
+    if kind not in expected:
+        raise ValueError('unknown helper identity probe: ' + kind)
+    if returncode == 0:
+        raise ValueError(f'the {kind} helper reported success: ' + text)
+    if 'SE session active for exact key' in text:
+        raise ValueError(f'the {kind} helper established an SE session: ' + text)
+    if expected[kind] not in text:
+        raise ValueError(f'the {kind} helper refusal did not name {expected[kind]!r}: ' + text)
+
+
+def require_unavailable_probe(text):
+    if 'macOS Secure Enclave ... NOT USABLE' not in text:
+        raise ValueError('the foreign-signed helper did not report an unavailable SE root: ' + text)
+    # The persistence half is what the Apple signature unlocks; without it the
+    # keychain write is refused for the missing entitlement.
+    if 'errSecMissingEntitlement' not in text:
+        raise ValueError('the unavailable SE root did not name the missing entitlement: ' + text)
+
+
+def codesign_output(arguments):
+    result = subprocess.run(['/usr/bin/codesign', *map(str, arguments)], capture_output=True,
+                            timeout=60, env={'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}, cwd='/')
+    return result, (result.stdout + result.stderr).decode(errors='replace')
+
+
+def helper_entitlements(bundle):
+    _, text = codesign_output(['-d', '--entitlements', ':-', str(bundle)])
+    return parse_entitlements(text)
+
+
+def helper_is_adhoc(bundle):
+    _, text = codesign_output(['-d', '--verbose=2', str(bundle)])
+    return 'Signature=adhoc' in text
+
+
+def helper_authority(bundle):
+    _, text = codesign_output(['-d', '--verbose=2', str(bundle)])
+    for line in text.splitlines():
+        if line.startswith('Authority='):
+            return line[len('Authority='):].strip()
+    raise ValueError('cannot determine the helper signing identity: ' + text.strip())
+
+
 class Checks(acceptance_signing.Checks):
     def approval_seconds(self, ending):
         # The fixture policy's duration bound and the approval expiry must come
@@ -567,6 +644,82 @@ class Checks(acceptance_signing.Checks):
         self.expect_locked(self.grant())
         print('PASS signing stays locked after key loss; no automatic key re-creation', flush=True)
 
+    def exercise_modified_helper(self, kind, destination):
+        """Re-sign a copy and require it to fail before any SE session exists."""
+        names = {'foreign-identity': 'ForeignHelper.app',
+                 'keychain-permission': 'ChangedPermission.app'}
+        if kind not in names:
+            raise ValueError('unknown helper identity probe: ' + kind)
+        copy = self.base / names[kind]
+        shutil.copytree(destination, copy)
+        owner = f'{self.admin.pw_uid}:{self.admin.pw_gid}'
+        chowned = subprocess.run(['/usr/sbin/chown', '-R', owner, str(copy)],
+                                 capture_output=True, text=True, timeout=60, env=self.env, cwd='/')
+        if chowned.returncode:
+            raise ValueError('cannot hand the probe bundle to the signing user: ' + chowned.stderr)
+        # The signing identity lives in the administrator's login keychain;
+        # the acceptance process itself is root and has a different keychain.
+        env = {**self.env, 'HOME': self.admin.pw_dir}
+        if kind == 'foreign-identity':
+            command = ['/usr/bin/codesign', '--force', '--options', 'runtime',
+                       '--sign', '-', str(copy)]
+        elif kind == 'keychain-permission':
+            original = helper_entitlements(destination)
+            identifier = original.get('com.apple.application-identifier', '') + '.other'
+            changed = with_application_identifier(original, identifier)
+            entitlement_path = self.base / 'changed.entitlements'
+            entitlement_path.write_bytes(plistlib.dumps(changed))
+            command = ['/usr/bin/codesign', '--force', '--options', 'runtime',
+                       '--entitlements', str(entitlement_path),
+                       '--sign', helper_authority(destination), str(copy)]
+        signed = subprocess.run(command, capture_output=True, text=True, timeout=300,
+                                **self.credentials(self.admin), env=env, cwd='/')
+        if signed.returncode:
+            raise ValueError('the modified helper could not be re-signed: ' + signed.stderr)
+        restored = subprocess.run(['/usr/sbin/chown', '-R', '0:0', str(copy)],
+                                  capture_output=True, text=True, timeout=60, env=self.env, cwd='/')
+        if restored.returncode:
+            raise ValueError('cannot restore the probe bundle ownership: ' + restored.stderr)
+        if kind == 'foreign-identity':
+            if not helper_is_adhoc(copy):
+                raise ValueError('the probe helper did not lose its signing identity')
+        else:
+            if helper_entitlements(copy)['com.apple.application-identifier'] != identifier:
+                raise ValueError('the probe helper kept its former keychain permission')
+        print(f'PASS prepared {kind} helper copy', flush=True)
+
+        binary = copy / 'Contents/MacOS/anp-keyd'
+        if kind == 'foreign-identity':
+            # The same probe that is usable under the original signature must
+            # report the SE root unavailable once the identity is gone.
+            probe = subprocess.run([str(binary), 'probe'], capture_output=True, text=True,
+                                   timeout=120, **self.credentials(self.admin),
+                                   env={**self.env, 'HOME': self.admin.pw_dir}, cwd='/')
+            require_unavailable_probe(probe.stdout + probe.stderr)
+            print('FOREIGN_SIGNED_PROBE ' + (probe.stdout + probe.stderr).strip(), flush=True)
+            print('PASS foreign-signed helper reports the SE root unavailable', flush=True)
+
+        command = [str(binary), 'admin', '--config', str(self.path), 'se-session',
+                   '--vault-id', self.fixture['vault_id'], '--did', self.key['did'],
+                   '--kid', self.key['kid']]
+        log = self.base / f'se-{kind}-helper.log'
+        with log.open('w+') as output:
+            helper = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output,
+                                      stderr=output, **self.credentials(self.admin),
+                                      env=self.env, cwd='/')
+            try:
+                helper.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                helper.kill()
+                helper.wait(timeout=10)
+                raise ValueError(f'the {kind} helper stayed alive: ' + log.read_text(errors='replace'))
+        require_refused_helper(kind, helper.returncode, log.read_text(errors='replace'))
+        print(f'{kind} helper refusal: ' + log.read_text(errors='replace').strip(), flush=True)
+        print(f'PASS {kind} helper cannot establish an SE session', flush=True)
+
+        self.expect_locked(self.grant())
+        print(f'PASS signing stays locked after {kind} refusal; no automatic key re-creation', flush=True)
+
     def exercise_signing(self):
         manifest = self.fixture['manifest']
         assert manifest.get('fixture_only') is True
@@ -612,6 +765,13 @@ class Checks(acceptance_signing.Checks):
         if ending == 'key-loss':
             self.exercise_key_loss(hardware['tag'], command)
             return
+        refusal = None
+        if ending in ('foreign-identity', 'keychain-permission'):
+            self.exercise_modified_helper(ending, destination)
+            refusal = ending
+            # The original helper must still recover once the modified copy is
+            # refused; the rest of the run is the ordinary kill ending.
+            ending = 'kill'
         print('UI: check the temporary exact key and enter ONLY the public test password: '
               + acceptance_signing.PASSWORD, flush=True)
         helper_credentials = self.credentials(self.admin)
@@ -769,6 +929,8 @@ class Checks(acceptance_signing.Checks):
                              else 'revocation and stale-approval refusal')
                 if ending == 'upgrade':
                     authority += ', failed-upgrade recovery and upgraded-helper signing'
+                if refusal:
+                    authority += f', {refusal} refusal and original-helper recovery'
                 print(f'PASS independently verified SE hot-key signature, retry, changed-target refusal, helper {ending}, cache suppression, {authority} and fresh-grant locked key', flush=True)
             finally:
                 if helper.poll() is None:
