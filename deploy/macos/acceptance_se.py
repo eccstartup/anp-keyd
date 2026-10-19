@@ -3,12 +3,16 @@ The public fixture password is not a production secret. No automatic UI consent.
 """
 import hashlib
 import json
+import os
+import plistlib
 import re
 from pathlib import Path
 import shutil
+import shlex
 import signal
 import stat
 import subprocess
+import sys
 import time
 
 import acceptance_signing
@@ -104,6 +108,154 @@ def operator_sleep_transition(long_sleep=False):
     wait_for_sleep_transition(before, started, long_sleep=long_sleep, observe=observe)
 
 
+def probe_result(label, action, timeout):
+    started = time.monotonic()
+    try:
+        result = action()
+        elapsed = time.monotonic() - started
+        ok = result.returncode == 0
+        print(f'{"PASS" if ok else "FAIL"} post-relogin probe {label} '
+              f'elapsed={elapsed:.3f}s exit={result.returncode} '
+              f'stdout={(result.stdout or "").strip()[:120]!r} '
+              f'stderr={(result.stderr or "").strip()[:240]!r}', flush=True)
+        return ok
+    except subprocess.TimeoutExpired:
+        print(f'FAIL post-relogin probe {label} timeout={timeout}s '
+              f'elapsed={time.monotonic() - started:.3f}s', flush=True)
+    except Exception as error:
+        print(f'FAIL post-relogin probe {label} elapsed={time.monotonic() - started:.3f}s '
+              f'{type(error).__name__}: {error}', flush=True)
+    return False
+
+
+def fresh_job_probe(base):
+    """One-shot launchd job created after relogin; never authority or retries."""
+    label = 'org.anp-keyd.logout-check.probe.' + str(os.getpid())
+    marker = base / 'post-relogin-probe.marker'
+    spec_path = base / 'post-relogin-probe.plist'
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        pass
+    spec = {'Label': label, 'ProgramArguments': ['/bin/sh', '-c', 'echo fresh-job-ok > ' + str(marker)],
+            'RunAtLoad': True, 'KeepAlive': False, 'LaunchOnlyOnce': True, 'SessionCreate': True,
+            'ProcessType': 'Background', 'WorkingDirectory': '/',
+            'StandardOutPath': str(base / 'post-relogin-probe.log'),
+            'StandardErrorPath': str(base / 'post-relogin-probe.log')}
+    spec_path.write_bytes(plistlib.dumps(spec))
+    spec_path.chmod(0o644)
+    try:
+        bootstrap = subprocess.run(['/bin/launchctl', 'bootstrap', 'system', str(spec_path)],
+                                   capture_output=True, text=True, timeout=6, cwd='/')
+        if bootstrap.returncode:
+            return bootstrap
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline and not marker.exists():
+            time.sleep(.1)
+        text = marker.read_text() if marker.exists() else ''
+        return subprocess.CompletedProcess([], 0 if text.strip() == 'fresh-job-ok' else 1, text, '')
+    finally:
+        try:
+            subprocess.run(['/bin/launchctl', 'bootout', 'system/' + label],
+                           capture_output=True, text=True, timeout=6, cwd='/')
+        except subprocess.SubprocessError:
+            pass
+
+
+def log_post_relogin_probes(checks):
+    """Bounded layer probes after relogin. Evidence only; never unlocks or signs."""
+    python = str(Path(sys.executable).resolve())
+    survivor = lambda *command: subprocess.run(list(command), capture_output=True, text=True,
+                                               timeout=6, env=checks.env, cwd='/')
+    probe_result('survivor-true', lambda: survivor('/usr/bin/true'), 5)
+    probe_result('survivor-python', lambda: survivor(python, '-I', '-c', 'print("probe-ok")'), 5)
+    broker = getattr(checks.args, 'process_broker', None)
+    if not broker:
+        return
+    # After any broker timeout the late reply stays in the pipe; later broker
+    # requests would read stale replies and produce bogus fast results, so stop
+    # the broker layer there. The launchd layer does not use the broker.
+    broker_ok = probe_result('broker-root-true', lambda: broker.run(['/usr/bin/true'], {}, checks.env, timeout=2), 2)
+    if broker_ok:
+        for name, user in (('admin', checks.admin), ('agent', checks.agent)):
+            if not probe_result('broker-' + name + '-python', lambda user=user: broker.run(
+                    [python, '-I', '-c', 'print("probe-ok")'],
+                    checks.credentials(user), checks.env, timeout=4), 4):
+                break
+    probe_result('launchd-fresh-job', lambda: fresh_job_probe(checks.base), 20)
+
+
+POST_RELOGIN_LAUNCHER = Path('/Library/ANPKeydLogoutChecks-post-relogin.sh')
+
+
+def write_post_relogin_state(checks, request, pending):
+    """Serialize only what the new-session checker needs; root-owned, 0600."""
+    base = checks.base
+    result = base / 'post-relogin-result.json'
+    try:
+        result.unlink()
+    except FileNotFoundError:
+        pass
+    state = {
+        'config': checks.config,
+        'path': str(checks.path),
+        'base': str(base),
+        'binary': str(Path(checks.args.binary).resolve()),
+        'admin_uid': checks.admin.pw_uid,
+        'agent_uid': checks.agent.pw_uid,
+        'key': checks.key,
+        'policy_id': checks.policy_id,
+        'request': request,
+        'pending': pending,
+        'env': checks.env,
+        'admin_credentials': checks.credentials(checks.admin),
+        'agent_credentials': checks.credentials(checks.agent),
+    }
+    state_path = base / 'post-relogin-state.json'
+    state_path.write_text(json.dumps(state))
+    state_path.chmod(0o600)
+    return state_path
+
+
+def write_post_relogin_launcher(state_path):
+    """Fixed root-only entry point so the operator does not type stage paths."""
+    launcher = POST_RELOGIN_LAUNCHER
+    if launcher.is_symlink() or launcher.exists():
+        meta = launcher.lstat()
+        if not stat.S_ISREG(meta.st_mode) or meta.st_uid != 0:
+            raise ValueError('refusing to replace untrusted post-relogin launcher')
+    # The state lives in the temporary service directory; the checker script
+    # lives beside this module in the retained stage directory.
+    module = Path(__file__).resolve().parent / 'post-relogin.py'
+    script = ('#!/bin/sh\n'
+              'state=' + shlex.quote(str(state_path)) + '\n'
+              'if [ ! -f "$state" ]; then\n'
+              '  echo "no pending logout acceptance at $state; start a new run" >&2\n'
+              '  exit 1\n'
+              'fi\n'
+              'exec /usr/bin/python3 ' + shlex.quote(str(module)) + ' "$state"\n')
+    launcher.write_text(script)
+    launcher.chmod(0o700)
+    return launcher
+
+
+def wait_for_post_relogin_result(base, timeout=600):
+    result_path = base / 'post-relogin-result.json'
+    deadline = time.monotonic() + timeout
+    while not result_path.exists():
+        if time.monotonic() >= deadline:
+            raise ValueError('post-relogin checker did not run within '
+                             f'{timeout} seconds; run: sudo sh {POST_RELOGIN_LAUNCHER}')
+        time.sleep(.5)
+    meta = result_path.lstat()
+    if not stat.S_ISREG(meta.st_mode) or meta.st_uid != 0 or meta.st_mode & 0o022:
+        raise ValueError('post-relogin result is not a root-owned regular file')
+    outcome = json.loads(result_path.read_text())
+    if not outcome.get('ok'):
+        raise ValueError('post-relogin checker failed: ' + str(outcome.get('error')))
+    return outcome
+
+
 def validate_bundle(bundle):
     """Bound a privileged copy and refuse links, including the bundle itself."""
     if bundle.suffix != '.app' or bundle.is_symlink():
@@ -124,6 +276,11 @@ def validate_bundle(bundle):
 
 
 class Checks(acceptance_signing.Checks):
+    def approval_seconds(self, ending):
+        # The fixture policy's duration bound and the approval expiry must come
+        # from one source; a longer approval is refused as ADMIN_OPERATION_INVALID.
+        return self.grant_limit() if ending == 'logout' else 240
+
     def exercise_signing(self):
         manifest = self.fixture['manifest']
         assert manifest.get('fixture_only') is True
@@ -188,16 +345,20 @@ class Checks(acceptance_signing.Checks):
                 assert self.request_as(self.agent, request)['data'] == reply['data']
                 # Prepare an approval before lease loss; it must not recreate
                 # authority after teardown advances the management epoch.
+                ending = getattr(self.args, 'se_ending', 'kill')
                 change = self.base / 'stale-grant.json'
                 change.write_text(json.dumps({'kind': 'Grant', 'change': {'action': 'Create',
                     'principal_id': self.config['principals'][0]['principal_id'],
                     'key_id': self.key['key_id'], 'policy_id': self.policy_id,
-                    'policy_version': 1, 'expiry': int(time.time()) + 240, 'max_uses': 1}}))
+                    'policy_version': 1,
+                    # Logout covers operator time away and back; other endings
+                    # keep the short window that bounds the check itself.
+                    'expiry': int(time.time()) + self.approval_seconds(ending),
+                    'max_uses': 1}}))
                 change.chmod(0o644)
                 prepared = self.cli(self.admin, 'prepare', '--file', change)
                 assert prepared.returncode == 0, prepared.stderr
                 pending = json.loads(prepared.stdout)['prepared']
-                ending = getattr(self.args, 'se_ending', 'kill')
                 if ending in ('restart', 'crash'):
                     self.restart_service(ending == 'crash')
                 elif ending in ('sleep', 'long-sleep'):
@@ -213,6 +374,11 @@ class Checks(acceptance_signing.Checks):
                     operator_user_switch(self.admin.pw_uid, check_away)
                 elif ending == 'logout':
                     from acceptance_console import operator_logout
+                    # Serialization must happen before logout; the surviving
+                    # runner cannot start Python after relogin.
+                    state_path = write_post_relogin_state(self, request, pending)
+                    launcher = write_post_relogin_launcher(state_path)
+                    print('ACTION REQUIRED after you log back in: sudo sh ' + str(launcher), flush=True)
                     def check_logged_out():
                         cached = self.request_as(self.agent, request)
                         assert cached['code'] != 'OK' or 'result' not in cached.get('data', {}), cached
@@ -224,41 +390,58 @@ class Checks(acceptance_signing.Checks):
                     context = acceptance_graphical.require_runner_session(
                         acceptance_graphical.relogin_session(self.admin), self.args.runner_audit_context)
                     print('PASS unchanged independent system runner audit context ' + json.dumps(context), flush=True)
+                    if getattr(self.args, 'post_relogin_probes', False):
+                        started = time.monotonic()
+                        log_post_relogin_probes(self)
+                        print(f'POST_RELOGIN_PROBE_SECONDS {time.monotonic() - started:.3f}', flush=True)
+                    outcome = wait_for_post_relogin_result(self.base)
+                    print('PASS post-relogin fresh-session checker ' + json.dumps(outcome['result']), flush=True)
+                    if helper.poll() is None:
+                        print('SE_HELPER_STATE running_after_relogin; terminating by signal', flush=True)
+                        helper.terminate()
+                        try:
+                            helper.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            helper.kill()
+                            helper.wait(timeout=10)
+                    else:
+                        print('SE_HELPER_STATE exited_after_relogin', flush=True)
                 else:
                     helper.send_signal(signal.SIGSTOP if ending == 'hang' else signal.SIGKILL)
-                if ending == 'kill':
-                    helper.wait(timeout=10)
-                # Allow the documented observation deadline; then require both
-                # cached-result suppression and no authorized keys.
-                deadline = time.monotonic() + 10
-                while True:
-                    replay = self.request_as(self.agent, request)
-                    if replay['code'] != 'OK' or 'result' not in replay.get('data', {}):
-                        break
-                    if time.monotonic() >= deadline:
-                        raise ValueError('SE session loss did not suppress cached signature')
-                    time.sleep(.2)
-                keys = self.request_as(self.agent, {'operation': 'LIST_AUTHORIZED_KEYS'})
-                assert keys['code'] == 'OK' and keys['data']['keys'] == [], keys
-                if ending != 'long-sleep':
-                    assert time.time() + 5 < pending['expires_at'], 'approval expired before teardown check'
-                else:
-                    assert time.time() > pending['expires_at'], 'long-sleep approval should have expired'
-                    print('NOTE old approval and original grant naturally expire during long sleep; '
-                          'their rejection alone does not prove session-loss revocation.', flush=True)
-                stale = self.cli(self.admin, 'commit', '--operation-id', pending['operation_id'],
-                                 '--digest', pending['digest'])
-                assert stale.returncode != 0, 'old approval survived SE session loss'
-                if ending == 'hang':
-                    assert helper.poll() is None, 'hang test requires a live stopped helper'
-                    helper.send_signal(signal.SIGCONT)
-                    helper.wait(timeout=10)
-                    replay = self.request_as(self.agent, request)
-                    assert replay['code'] != 'OK' or 'result' not in replay.get('data', {}), replay
-                if ending in ('sleep', 'long-sleep', 'user-switch', 'logout', 'restart', 'crash'):
-                    helper.wait(timeout=10)
-                fresh = self.grant()
-                self.expect_locked(fresh)
+                if ending != 'logout':
+                    if ending == 'kill':
+                        helper.wait(timeout=10)
+                    # Allow the documented observation deadline; then require both
+                    # cached-result suppression and no authorized keys.
+                    deadline = time.monotonic() + 10
+                    while True:
+                        replay = self.request_as(self.agent, request)
+                        if replay['code'] != 'OK' or 'result' not in replay.get('data', {}):
+                            break
+                        if time.monotonic() >= deadline:
+                            raise ValueError('SE session loss did not suppress cached signature')
+                        time.sleep(.2)
+                    keys = self.request_as(self.agent, {'operation': 'LIST_AUTHORIZED_KEYS'})
+                    assert keys['code'] == 'OK' and keys['data']['keys'] == [], keys
+                    if ending != 'long-sleep':
+                        assert time.time() + 5 < pending['expires_at'], 'approval expired before teardown check'
+                    else:
+                        assert time.time() > pending['expires_at'], 'long-sleep approval should have expired'
+                        print('NOTE old approval and original grant naturally expire during long sleep; '
+                              'their rejection alone does not prove session-loss revocation.', flush=True)
+                    stale = self.cli(self.admin, 'commit', '--operation-id', pending['operation_id'],
+                                     '--digest', pending['digest'])
+                    assert stale.returncode != 0, 'old approval survived SE session loss'
+                    if ending == 'hang':
+                        assert helper.poll() is None, 'hang test requires a live stopped helper'
+                        helper.send_signal(signal.SIGCONT)
+                        helper.wait(timeout=10)
+                        replay = self.request_as(self.agent, request)
+                        assert replay['code'] != 'OK' or 'result' not in replay.get('data', {}), replay
+                    if ending in ('sleep', 'long-sleep', 'user-switch', 'restart', 'crash'):
+                        helper.wait(timeout=10)
+                    fresh = self.grant()
+                    self.expect_locked(fresh)
                 authority = ('expired authority remains unusable' if ending == 'long-sleep'
                              else 'revocation and stale-approval refusal')
                 print(f'PASS independently verified SE hot-key signature, retry, changed-target refusal, helper {ending}, cache suppression, {authority} and fresh-grant locked key', flush=True)

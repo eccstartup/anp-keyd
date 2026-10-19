@@ -14,10 +14,11 @@ import sys
 import tempfile
 
 
-def job_spec(stage, python, arguments, diagnostic=False):
+def job_spec(stage, python, arguments, diagnostic=False, post_relogin_probes=False):
     return {'Label': 'org.anp-keyd.logout-check.' + stage.name,
         'ProgramArguments': [str(python), '-u', str(stage / 'test-runtime.py'),
-                             '--se-ending', 'logout', *(['--logout-diagnostics'] if diagnostic else []), *arguments],
+                             '--se-ending', 'logout', *(['--logout-diagnostics'] if diagnostic else []),
+                             *(['--post-relogin-probes'] if post_relogin_probes else []), *arguments],
         'RunAtLoad': True, 'KeepAlive': False, 'LaunchOnlyOnce': True,
         'SessionCreate': True,
         'ProcessType': 'Background', 'WorkingDirectory': '/',
@@ -30,10 +31,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--finish', type=Path, help='boot out a completed test job; retain its log directory')
     parser.add_argument('--diagnose', action='store_true', help='system client/console diagnostics without SE keys or logout')
+    parser.add_argument('--post-relogin-probes', action='store_true',
+                        help='also run evidence-only spawn-layer probes from the surviving runner after relogin')
     parser.add_argument('arguments', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if sys.platform != 'darwin' or os.geteuid() != 0:
         raise ValueError('requires macOS root; run with sudo in your own terminal')
+    if args.post_relogin_probes and args.diagnose:
+        raise ValueError('--post-relogin-probes requires a logout run, not --diagnose')
     if args.finish:
         stage = args.finish.absolute()
         if stage.parent != Path('/Library') or not stage.name.startswith('ANPKeydLogoutChecks-'):
@@ -69,7 +74,8 @@ def main():
                 raise ValueError('unexpected acceptance source file')
             (stage / source.name).write_bytes(source.read_bytes())
             (stage / source.name).chmod(0o644)
-        spec = job_spec(stage, Path(sys.executable).resolve(), arguments, diagnostic=args.diagnose)
+        spec = job_spec(stage, Path(sys.executable).resolve(), arguments, diagnostic=args.diagnose,
+                        post_relogin_probes=args.post_relogin_probes)
         (stage / 'job.plist').write_bytes(plistlib.dumps(spec))
         (stage / 'job.plist').chmod(0o644)
         # The log contains public fixture data only, and must be readable after relogin.

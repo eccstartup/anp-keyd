@@ -174,6 +174,18 @@ class Checks:
             'vault_id': self.fixture['vault_id'], 'did': self.key['did'], 'kid': self.key['kid']}, True, True)
         assert result['code'] == 'OK', result
 
+    def grant_limit(self):
+        # A logout approval must stay valid while the operator logs out, waits
+        # at the login window and returns; every other ending is bounded by the
+        # check itself.
+        return 900 if getattr(self.args, 'se_ending', 'kill') == 'logout' else 300
+
+    def policy_content(self):
+        return {'schema_version': 1, 'name': 'local-temporary-test', 'purpose': 'http-authentication',
+            'origin': 'https://example.com', 'methods': ['GET'], 'paths': ['/test'],
+            'query': {'mode': 'none'}, 'body': {'mode': 'empty', 'max_bytes': 0}, 'signature_profile': 'anp-http-v2',
+            'grant_limits': {'max_duration_seconds': self.grant_limit(), 'max_uses': 20}}
+
     def grant(self):
         pending = self.change({'kind': 'Grant', 'change': {'action': 'Create',
             'principal_id': self.config['principals'][0]['principal_id'], 'key_id': self.key['key_id'],
@@ -206,10 +218,7 @@ class Checks:
         self.change({'kind': 'Catalog', 'change': {'action': 'ConfirmRole', 'key_id': self.key['key_id'], 'role': 'hot'}})
         self.policy_id = str(uuid.uuid4())
         self.change({'kind': 'Catalog', 'change': {'action': 'PublishPolicy', 'policy_id': self.policy_id, 'version': 1,
-            'content': {'schema_version': 1, 'name': 'local-temporary-test', 'purpose': 'http-authentication',
-            'origin': 'https://example.com', 'methods': ['GET'], 'paths': ['/test'],
-            'query': {'mode': 'none'}, 'body': {'mode': 'empty', 'max_bytes': 0}, 'signature_profile': 'anp-http-v2',
-            'grant_limits': {'max_duration_seconds': 300, 'max_uses': 20}}}})
+            'content': self.policy_content()}})
         self.grant_id = self.grant()
         denied = self.request_as(self.agent, {'operation': 'GET_CAPABILITIES'}, True, extra_admin_group=True)
         assert denied['code'] == 'ADMIN_REQUIRED', denied

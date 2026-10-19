@@ -79,7 +79,11 @@ def main():
     parser.add_argument('--container-regression', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--logout-diagnostics', action='store_true',
                         help='system-runner client/console diagnostics only; no SE fixture, UI or logout')
+    parser.add_argument('--post-relogin-probes', action='store_true',
+                        help='after logout, run bounded spawn-layer probes from the surviving runner (evidence only; requires --se-ending logout)')
     args = parser.parse_args()
+    if args.post_relogin_probes and args.se_ending != 'logout':
+        raise ValueError('--post-relogin-probes requires --se-ending logout')
     if args.logout_diagnostics and args.se_ending != 'logout':
         raise ValueError('--logout-diagnostics requires the system logout runner')
     if args.se_ending == 'logout':

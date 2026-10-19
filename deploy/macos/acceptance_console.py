@@ -89,8 +89,14 @@ def wait_logout(actor, old_session, check_away, read_session, read_uid=console_u
         if now < previous:
             raise ValueError('wall clock moved backwards during logout')
         previous = now
-        if now - started > 90:
-            raise ValueError('logout and relogin must complete within 90 seconds')
+        if since is None:
+            # Saving work before logging out is not part of the relogin window,
+            # but the approval and SE session are bounded at 900 seconds, so the
+            # pre-logout wait stays well inside that budget.
+            if now - started > 300:
+                raise ValueError('logout did not start within 300 seconds')
+        elif now - since > 90:
+            raise ValueError('relogin from the login window must complete within 90 seconds')
         uid = read_uid()
         if uid != last_uid:
             if observe:
@@ -108,8 +114,8 @@ def wait_logout(actor, old_session, check_away, read_session, read_uid=console_u
                     raise ValueError('login window must remain active for at least six seconds')
                 new_session = read_session()
                 finished = clock()
-                if finished < now or finished - started > 90:
-                    raise ValueError('logout session readiness exceeded acceptance interval')
+                if finished < now or finished - since > 90:
+                    raise ValueError('relogin from the login window exceeded acceptance interval')
                 if new_session in (0, 0xffffffff, old_session):
                     raise ValueError('graphical audit session did not change; logout not proven')
                 return new_session
@@ -121,10 +127,14 @@ def wait_logout(actor, old_session, check_away, read_session, read_uid=console_u
 def operator_logout(actor, old_session, check_away, read_session):
     from acceptance_se import kernel_sleep_times
     before = kernel_sleep_times()
-    print('READY FOR MANUAL LOGOUT: save your work before starting this test. '
-          'Use Apple menu Log Out; stay at the login window for 10 seconds, then '
-          'log back into the SAME account within 90 seconds. Do not switch users, '
-          'sleep or reboot. The system test runner continues without this terminal.', flush=True)
+    print('READY FOR MANUAL LOGOUT: save your work before starting this test; you have '
+          'up to 5 minutes to log out from now. Use Apple menu Log Out; stay at the login '
+          'window for 10 seconds, then log back into the SAME account within 90 seconds of '
+          'the login window appearing. Do not switch users, '
+          'sleep or reboot. The system test runner continues without this terminal. '
+          'After logging back in, open Terminal and run: '
+          'sudo sh /Library/ANPKeydLogoutChecks-post-relogin.sh '
+          '(the runner waits up to 10 minutes for its result).', flush=True)
     new_session = wait_logout(actor, old_session, check_away, read_session,
         observe=lambda evidence: print('LOGOUT_EVIDENCE ' + json.dumps(evidence), flush=True))
     if kernel_sleep_times() != before:
