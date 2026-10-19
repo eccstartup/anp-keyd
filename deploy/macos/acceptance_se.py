@@ -35,19 +35,26 @@ def kernel_sleep_times():
     return sleep_times(result.stdout)
 
 
-def verify_sleep_transition(before, after, started, finished):
+def verify_sleep_transition(before, after, started, finished, long_sleep=False):
     sleep, wake = after['sleeptime'], after['waketime']
     if sleep <= before['sleeptime'] or wake <= before['waketime']:
         raise ValueError('no new kernel sleep/wake pair')
     if not started <= sleep < wake <= finished:
         raise ValueError('sleep/wake pair outside acceptance interval')
+    if long_sleep:
+        if wake - sleep <= 900:
+            raise ValueError('long sleep must cross the original 900-second session limit')
+        if finished - started > 2100:
+            raise ValueError('long sleep exceeded the 2100-second acceptance window')
+        return
     if wake - sleep < 6:
         raise ValueError('sleep must exceed the five-second heartbeat window')
     if finished - started > 90:
         raise ValueError('transition exceeded short acceptance window; approval expiry could confound evidence')
 
 
-def wait_for_sleep_transition(before, started, read_times=None, clock=None, pause=None):
+def wait_for_sleep_transition(before, started, read_times=None, clock=None, pause=None,
+                              long_sleep=False):
     read_times = read_times or kernel_sleep_times
     clock = clock or time.time
     pause = pause or time.sleep
@@ -56,21 +63,24 @@ def wait_for_sleep_transition(before, started, read_times=None, clock=None, paus
         finished = clock()
         if finished < started:
             raise ValueError('wall clock moved backwards during sleep acceptance')
-        if finished - started > 90:
-            raise ValueError('no valid sleep/wake pair within 90 seconds')
+        limit = 2100 if long_sleep else 90
+        if finished - started > limit:
+            raise ValueError(f'no valid sleep/wake pair within {limit} seconds')
         if after['sleeptime'] > before['sleeptime'] and after['waketime'] > before['waketime']:
-            verify_sleep_transition(before, after, started, finished)
+            verify_sleep_transition(before, after, started, finished, long_sleep=long_sleep)
             return after, finished
         pause(.5)
 
 
-def operator_sleep_transition():
+def operator_sleep_transition(long_sleep=False):
     before = kernel_sleep_times()
     started = time.time()
-    print('READY FOR MANUAL SLEEP: use Apple menu Sleep now; wait at least 6 seconds, '
-          'then wake within 90 seconds. Wake detection is automatic; DO NOT press Enter. '
+    timing = ('leave asleep for 16 minutes, then wake within 35 minutes. '
+              if long_sleep else 'wait at least 6 seconds, then wake within 90 seconds. ')
+    print('READY FOR MANUAL SLEEP: use Apple menu Sleep now; ' + timing +
+          'Wake detection is automatic; DO NOT press Enter. '
           'This script does not trigger sleep.', flush=True)
-    after, finished = wait_for_sleep_transition(before, started)
+    after, finished = wait_for_sleep_transition(before, started, long_sleep=long_sleep)
     print('KERNEL_SLEEP_EVIDENCE ' + json.dumps({'before': before, 'after': after,
           'started': started, 'finished': finished}), flush=True)
 
@@ -164,8 +174,8 @@ class Checks(acceptance_signing.Checks):
                 ending = getattr(self.args, 'se_ending', 'kill')
                 if ending in ('restart', 'crash'):
                     self.restart_service(ending == 'crash')
-                elif ending == 'sleep':
-                    operator_sleep_transition()
+                elif ending in ('sleep', 'long-sleep'):
+                    operator_sleep_transition(long_sleep=ending == 'long-sleep')
                 else:
                     helper.send_signal(signal.SIGSTOP if ending == 'hang' else signal.SIGKILL)
                 if ending == 'kill':
@@ -182,7 +192,12 @@ class Checks(acceptance_signing.Checks):
                     time.sleep(.2)
                 keys = self.request_as(self.agent, {'operation': 'LIST_AUTHORIZED_KEYS'})
                 assert keys['code'] == 'OK' and keys['data']['keys'] == [], keys
-                assert time.time() + 5 < pending['expires_at'], 'approval expired before teardown check'
+                if ending != 'long-sleep':
+                    assert time.time() + 5 < pending['expires_at'], 'approval expired before teardown check'
+                else:
+                    assert time.time() > pending['expires_at'], 'long-sleep approval should have expired'
+                    print('NOTE old approval and original grant naturally expire during long sleep; '
+                          'their rejection alone does not prove session-loss revocation.', flush=True)
                 stale = self.cli(self.admin, 'commit', '--operation-id', pending['operation_id'],
                                  '--digest', pending['digest'])
                 assert stale.returncode != 0, 'old approval survived SE session loss'
@@ -192,11 +207,13 @@ class Checks(acceptance_signing.Checks):
                     helper.wait(timeout=10)
                     replay = self.request_as(self.agent, request)
                     assert replay['code'] != 'OK' or 'result' not in replay.get('data', {}), replay
-                if ending in ('sleep', 'restart', 'crash'):
+                if ending in ('sleep', 'long-sleep', 'restart', 'crash'):
                     helper.wait(timeout=10)
                 fresh = self.grant()
                 self.expect_locked(fresh)
-                print(f'PASS independently verified SE hot-key signature, retry, changed-target refusal, helper {ending}, cache suppression, revocation, stale-approval refusal and locked key', flush=True)
+                authority = ('expired authority remains unusable' if ending == 'long-sleep'
+                             else 'revocation and stale-approval refusal')
+                print(f'PASS independently verified SE hot-key signature, retry, changed-target refusal, helper {ending}, cache suppression, {authority} and fresh-grant locked key', flush=True)
             finally:
                 if helper.poll() is None:
                     helper.kill()

@@ -94,6 +94,36 @@ class SleepEvidence(unittest.TestCase):
 
 
 class AutomaticWakeDetection(unittest.TestCase):
+    def test_long_sleep_requires_kernel_sleep_beyond_original_deadline(self):
+        before = {'sleeptime': 10, 'waketime': 20}
+        verify_sleep_transition(before, {'sleeptime': 102, 'waketime': 1062},
+                                100, 1065, long_sleep=True)
+        for after, end in [
+            ({'sleeptime': 102, 'waketime': 1002}, 1005),
+            # Long elapsed wall time with only short kernel sleep is insufficient.
+            ({'sleeptime': 102, 'waketime': 110}, 1065),
+            ({'sleeptime': 102, 'waketime': 1062}, 2201),
+            ({'sleeptime': 99, 'waketime': 1062}, 1065),
+            (before, 1065),
+        ]:
+            with self.assertRaises(ValueError):
+                verify_sleep_transition(before, after, 100, end, long_sleep=True)
+
+    def test_long_sleep_wait_uses_extended_window(self):
+        before = {'sleeptime': 10, 'waketime': 20}
+        after = {'sleeptime': 102, 'waketime': 1062}
+        reads = iter([before, after])
+        ticks = iter([200, 1065])
+        self.assertEqual(wait_for_sleep_transition(before, 100,
+            read_times=lambda: next(reads), clock=lambda: next(ticks),
+            pause=lambda _: None, long_sleep=True), (after, 1065))
+
+    def test_long_sleep_timeout_is_bounded(self):
+        before = {'sleeptime': 10, 'waketime': 20}
+        with self.assertRaisesRegex(ValueError, 'within 2100 seconds'):
+            wait_for_sleep_transition(before, 100, read_times=lambda: before,
+                clock=lambda: 2201, pause=lambda _: None, long_sleep=True)
+
     def test_wake_resumes_checks_without_terminal_input(self):
         before = {'sleeptime': 10, 'waketime': 20}
         after = {'sleeptime': 102, 'waketime': 110}
