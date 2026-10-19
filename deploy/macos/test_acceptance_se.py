@@ -94,6 +94,33 @@ class SleepEvidence(unittest.TestCase):
 
 
 class AutomaticWakeDetection(unittest.TestCase):
+    def test_maintenance_wake_is_logged_and_does_not_end_long_observation(self):
+        before = {'sleeptime': 10, 'waketime': 20}
+        short = {'sleeptime': 102, 'waketime': 150}
+        long = {'sleeptime': 200, 'waketime': 1160}
+        reads = iter([short, short, long])
+        ticks = iter([151, 152, 1161])
+        observations = []
+        self.assertEqual(wait_for_sleep_transition(before, 100,
+            read_times=lambda: next(reads), clock=lambda: next(ticks),
+            pause=lambda _: None, long_sleep=True,
+            observe=lambda pair, end: observations.append((pair, end))), (long, 1161))
+        self.assertEqual(observations, [(short, 151), (long, 1161)])
+
+    def test_short_sleep_cannot_pass_by_waiting_past_deadline(self):
+        before = {'sleeptime': 10, 'waketime': 20}
+        short = {'sleeptime': 102, 'waketime': 150}
+        ticks = iter([1100, 2201])
+        with self.assertRaisesRegex(ValueError, 'within 2100 seconds'):
+            wait_for_sleep_transition(before, 100, read_times=lambda: short,
+                clock=lambda: next(ticks), pause=lambda _: None, long_sleep=True)
+
+    def test_invalid_short_pair_fails_in_long_mode(self):
+        with self.assertRaisesRegex(ValueError, 'outside acceptance interval'):
+            wait_for_sleep_transition({'sleeptime': 10, 'waketime': 20}, 100,
+                read_times=lambda: {'sleeptime': 99, 'waketime': 150},
+                clock=lambda: 151, pause=lambda _: None, long_sleep=True)
+
     def test_long_sleep_requires_kernel_sleep_beyond_original_deadline(self):
         before = {'sleeptime': 10, 'waketime': 20}
         verify_sleep_transition(before, {'sleeptime': 102, 'waketime': 1062},

@@ -54,10 +54,11 @@ def verify_sleep_transition(before, after, started, finished, long_sleep=False):
 
 
 def wait_for_sleep_transition(before, started, read_times=None, clock=None, pause=None,
-                              long_sleep=False):
+                              long_sleep=False, observe=None):
     read_times = read_times or kernel_sleep_times
     clock = clock or time.time
     pause = pause or time.sleep
+    last_pair = None
     while True:
         after = read_times()
         finished = clock()
@@ -67,6 +68,18 @@ def wait_for_sleep_transition(before, started, read_times=None, clock=None, paus
         if finished - started > limit:
             raise ValueError(f'no valid sleep/wake pair within {limit} seconds')
         if after['sleeptime'] > before['sleeptime'] and after['waketime'] > before['waketime']:
+            pair = (after['sleeptime'], after['waketime'])
+            if pair != last_pair:
+                if observe:
+                    observe(after, finished)
+                last_pair = pair
+            if long_sleep and after['waketime'] - after['sleeptime'] <= 900:
+                if not started <= after['sleeptime'] < after['waketime'] <= finished:
+                    raise ValueError('sleep/wake pair outside acceptance interval')
+                # Maintenance wakes can expose short pairs before the operator
+                # wakes the display. Keep observing; never sum separate sleeps.
+                pause(.5)
+                continue
             verify_sleep_transition(before, after, started, finished, long_sleep=long_sleep)
             return after, finished
         pause(.5)
@@ -80,9 +93,15 @@ def operator_sleep_transition(long_sleep=False):
     print('READY FOR MANUAL SLEEP: use Apple menu Sleep now; ' + timing +
           'Wake detection is automatic; DO NOT press Enter. '
           'This script does not trigger sleep.', flush=True)
-    after, finished = wait_for_sleep_transition(before, started, long_sleep=long_sleep)
-    print('KERNEL_SLEEP_EVIDENCE ' + json.dumps({'before': before, 'after': after,
-          'started': started, 'finished': finished}), flush=True)
+    def observe(after, finished):
+        print('KERNEL_SLEEP_EVIDENCE ' + json.dumps({'before': before, 'after': after,
+              'started': started, 'finished': finished,
+              'sleep_seconds': after['waketime'] - after['sleeptime']}), flush=True)
+        if long_sleep and after['waketime'] - after['sleeptime'] <= 900:
+            print('WAIT short sleep/wake pair; possibly a maintenance wake. '
+                  'Still require one kernel sleep longer than 900 seconds within 35 minutes; '
+                  'separate sleeps are not added together.', flush=True)
+    wait_for_sleep_transition(before, started, long_sleep=long_sleep, observe=observe)
 
 
 def validate_bundle(bundle):
